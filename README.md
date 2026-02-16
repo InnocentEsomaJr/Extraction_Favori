@@ -72,11 +72,10 @@ Créer le fichier `Extraction_Favori/.streamlit/secrets.toml`:
 
 ```toml
 DHIS2_URL = "https://votre-instance-dhis2"
-DHIS2_USER = "votre_utilisateur"
-DHIS2_PASS = "votre_mot_de_passe"
 ```
 
-Le projet lit ces clés via `st.secrets`.
+Le projet lit `DHIS2_URL` via `st.secrets`.
+Le **nom d'utilisateur** et le **mot de passe** sont saisis par chaque utilisateur dans la barre latérale (`🔐 Connexion DHIS2`).
 
 ## 6. Lancement
 
@@ -107,7 +106,8 @@ Extraction_Favori/
   - vérifier `kaleido` et `matplotlib` dans l’environnement
 
 - **Erreur de connexion DHIS2**
-  - vérifier `DHIS2_URL`, `DHIS2_USER`, `DHIS2_PASS` dans `secrets.toml`
+  - vérifier `DHIS2_URL` dans `secrets.toml`
+  - vérifier les identifiants saisis dans `🔐 Connexion DHIS2`
 
 - **Pas de données**
   - vérifier l’ID du favori DHIS2
@@ -121,6 +121,7 @@ Extraction_Favori/
 - `pandas`
 - `numpy`
 - `plotly`
+- `requests`
 - `openhexa.toolbox`
 - `xlsxwriter`
 - `python-docx`

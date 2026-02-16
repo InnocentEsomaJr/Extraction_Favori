@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from openhexa.toolbox.dhis2 import DHIS2
 import plotly.express as px
+import requests
 import io
 import os
 from datetime import datetime
@@ -330,32 +331,52 @@ def _read_config_value(key):
         value = os.getenv(key)
     return str(value).strip() if value is not None else None
 
+def test_dhis2_credentials(base_url, username, password):
+    """Teste les identifiants utilisateur DHIS2 sur /api/me."""
+    try:
+        response = requests.get(
+            f"{base_url.rstrip('/')}/api/me",
+            auth=(username, password),
+            timeout=10
+        )
+    except Exception as e:
+        return False, f"Erreur de connexion : {e}"
+
+    if response.status_code == 200:
+        return True, None
+    if response.status_code in (401, 403):
+        return False, "Identifiants incorrects. Veuillez réessayer."
+    return False, f"Connexion DHIS2 échouée (HTTP {response.status_code})."
+
 @st.cache_resource
+def _build_dhis2_client(url, username, password):
+    return DHIS2(url=url, username=username, password=password)
+
 def get_dhis2_client():
     dhis2_url = _read_config_value("DHIS2_URL")
-    dhis2_user = _read_config_value("DHIS2_USER")
-    dhis2_pass = _read_config_value("DHIS2_PASS")
+    dhis2_user = str(st.session_state.get("dhis2_user", "")).strip()
+    dhis2_pass = str(st.session_state.get("dhis2_pass", "")).strip()
 
-    missing_keys = [
-        key for key, val in {
-            "DHIS2_URL": dhis2_url,
-            "DHIS2_USER": dhis2_user,
-            "DHIS2_PASS": dhis2_pass
-        }.items()
-        if not val
-    ]
+    missing_keys = []
+    if not dhis2_url:
+        missing_keys.append("DHIS2_URL")
+    if not dhis2_user:
+        missing_keys.append("Nom d'utilisateur DHIS2")
+    if not dhis2_pass:
+        missing_keys.append("Mot de passe DHIS2")
     if missing_keys:
         missing_text = ", ".join(missing_keys)
         raise RuntimeError(
             f"Configuration DHIS2 manquante: {missing_text}. "
-            "Ajoute ces clés dans Streamlit Cloud (App settings > Secrets) "
-            "ou définis-les comme variables d'environnement."
+            "Ajoute DHIS2_URL dans Streamlit Cloud (App settings > Secrets), "
+            "puis connecte-toi via la barre latérale."
         )
 
-    return DHIS2(url=dhis2_url, username=dhis2_user, password=dhis2_pass)
+    return _build_dhis2_client(dhis2_url, dhis2_user, dhis2_pass)
 
 @st.cache_data(ttl=3600)
-def get_data(favori_id, period=None):
+def get_data(favori_id, period=None, cache_user=None):
+    _ = cache_user
     if not favori_id: return None
     try:
         dhis = get_dhis2_client()
@@ -372,14 +393,16 @@ def get_data(favori_id, period=None):
         return None
 
 @st.cache_data(ttl=3600)
-def get_validation_groups():
+def get_validation_groups(cache_user=None):
+    _ = cache_user
     try:
         dhis = get_dhis2_client()
         return dhis.api.get("validationRuleGroups", params={"fields": "id,displayName", "paging": "false"})['validationRuleGroups']
     except: return []
 
 @st.cache_data(ttl=3600)
-def get_validation_results(ou_id, period_list, group_id):
+def get_validation_results(ou_id, period_list, group_id, cache_user=None):
+    _ = cache_user
     # Sécurité anti-Erreur 409 : si l'ID n'est pas un ID système DHIS2, on bloque.
     if not ou_id or ou_id == "USER_ORGUNIT" or len(str(ou_id)) < 5:
         return pd.DataFrame()
@@ -403,7 +426,8 @@ def get_validation_results(ou_id, period_list, group_id):
     return pd.DataFrame(all_results)
 
 @st.cache_data(ttl=3600)
-def get_children_org_units_details(parent_id):
+def get_children_org_units_details(parent_id, cache_user=None):
+    _ = cache_user
     """Récupère les enfants directs (id + nom) d'une unité d'organisation."""
     if not parent_id:
         return []
@@ -421,6 +445,58 @@ def get_children_org_units_details(parent_id):
 with st.sidebar:
     st.image("https://snisrdc.com/dhis-web-commons/security/logo_front.png", width=150)
     st.title("⚙️ Configuration")
+
+    st.subheader("🔐 Connexion DHIS2")
+    base_url = _read_config_value("DHIS2_URL")
+    if not base_url:
+        st.error("DHIS2_URL manquant. Ajoute-le dans les secrets Streamlit Cloud.")
+        st.stop()
+
+    user_input = st.text_input(
+        "Nom d'utilisateur",
+        value=str(st.session_state.get("dhis2_user", "")),
+        key="dhis2_user_input"
+    )
+    password_input = st.text_input(
+        "Mot de passe",
+        type="password",
+        key="dhis2_password_input"
+    )
+
+    col_conn, col_disc = st.columns(2)
+    login_button = col_conn.button("Se connecter", use_container_width=True)
+    logout_button = col_disc.button("Se déconnecter", use_container_width=True)
+
+    if logout_button:
+        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input"]:
+            st.session_state.pop(key, None)
+        st.cache_resource.clear()
+        st.rerun()
+
+    if login_button:
+        if not user_input or not password_input:
+            st.session_state["connected"] = False
+            st.warning("Renseigne le nom d'utilisateur et le mot de passe.")
+        else:
+            ok, error_msg = test_dhis2_credentials(base_url, user_input, password_input)
+            if ok:
+                st.cache_resource.clear()
+                st.session_state["connected"] = True
+                st.session_state["dhis2_user"] = user_input
+                st.session_state["dhis2_pass"] = password_input
+                st.success(f"Connecté en tant que : {user_input}")
+                st.rerun()
+            else:
+                st.session_state["connected"] = False
+                st.error(error_msg)
+
+    if st.session_state.get("connected"):
+        st.success(f"Connecté en tant que : {st.session_state.get('dhis2_user')}")
+    else:
+        st.info("Veuillez vous connecter via la barre latérale pour accéder aux données.")
+        st.stop()
+
+    st.divider()
 
     dict_favoris = {
         "Performance Globale (ROzCY14OLTE)": "ROzCY14OLTE",
@@ -457,7 +533,8 @@ with st.sidebar:
         st.error("Le mois de début doit être avant le mois de fin.")
 
 # --- 4. CHARGEMENT & FILTRAGE DES DONNÉES ---
-df_raw = get_data(id_final, period=period_id)
+current_user_for_cache = st.session_state.get("dhis2_user", "")
+df_raw = get_data(id_final, period=period_id, cache_user=current_user_for_cache)
 
 if df_raw is not None:
     # Récupération dynamique de l'ID de l'unité d'organisation (OrgUnit ID)
@@ -716,7 +793,7 @@ if df_raw is not None:
     with tab5:
         st.header("🩺 Éléments de catégorisation interactifs")
 
-        vr_groups = get_validation_groups()
+        vr_groups = get_validation_groups(cache_user=current_user_for_cache)
         if vr_groups:
             group_mapping = {g['displayName']: g['id'] for g in vr_groups}
             options_regles = ["Toutes les règles (Global)"] + list(group_mapping.keys())
@@ -734,7 +811,7 @@ if df_raw is not None:
                         if selected_zone != "Toutes les zones":
                             zones_cibles = [selected_zone]
                         else:
-                            children_info = get_children_org_units_details(current_id_systeme)
+                            children_info = get_children_org_units_details(current_id_systeme, cache_user=current_user_for_cache)
                             zones_cibles = [c['displayName'] for c in children_info if c.get('displayName') and c.get('id')]
                             for child in children_info:
                                 zone_id_mapping[child['displayName']] = child['id']
@@ -860,8 +937,8 @@ if df_raw is not None:
                                 })
                                 continue
 
-                            df_val_zone = get_validation_results(zone_id, selection_mois, target_group_id)
-                            df_val_prev_zone = get_validation_results(zone_id, selection_mois_prev, target_group_id)
+                            df_val_zone = get_validation_results(zone_id, selection_mois, target_group_id, cache_user=current_user_for_cache)
+                            df_val_prev_zone = get_validation_results(zone_id, selection_mois_prev, target_group_id, cache_user=current_user_for_cache)
 
                             # Comparaison des mêmes erreurs entre T-1 et T
                             sig_now = build_violation_signature_set(df_val_zone)
