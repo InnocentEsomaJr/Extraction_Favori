@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+plotly
+openhexa.toolbox
+xlsxwriter
+python-docx
+python-pptx
+matplotlib
+kaleido
