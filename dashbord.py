@@ -4,6 +4,7 @@ import numpy as np
 from openhexa.toolbox.dhis2 import DHIS2
 import plotly.express as px
 import io
+import os
 from datetime import datetime
 
 # --- 1. CONFIGURATION ---
@@ -318,9 +319,40 @@ plotly_config = {
 }
 
 # --- 2. FONCTIONS API DHIS2 ---
+def _read_config_value(key):
+    """Lit une valeur de config depuis Streamlit secrets, sinon variables d'environnement."""
+    value = None
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        value = None
+    if value is None or str(value).strip() == "":
+        value = os.getenv(key)
+    return str(value).strip() if value is not None else None
+
 @st.cache_resource
 def get_dhis2_client():
-    return DHIS2(url=st.secrets["DHIS2_URL"], username=st.secrets["DHIS2_USER"], password=st.secrets["DHIS2_PASS"])
+    dhis2_url = _read_config_value("DHIS2_URL")
+    dhis2_user = _read_config_value("DHIS2_USER")
+    dhis2_pass = _read_config_value("DHIS2_PASS")
+
+    missing_keys = [
+        key for key, val in {
+            "DHIS2_URL": dhis2_url,
+            "DHIS2_USER": dhis2_user,
+            "DHIS2_PASS": dhis2_pass
+        }.items()
+        if not val
+    ]
+    if missing_keys:
+        missing_text = ", ".join(missing_keys)
+        raise RuntimeError(
+            f"Configuration DHIS2 manquante: {missing_text}. "
+            "Ajoute ces clés dans Streamlit Cloud (App settings > Secrets) "
+            "ou définis-les comme variables d'environnement."
+        )
+
+    return DHIS2(url=dhis2_url, username=dhis2_user, password=dhis2_pass)
 
 @st.cache_data(ttl=3600)
 def get_data(favori_id, period=None):
@@ -353,7 +385,11 @@ def get_validation_results(ou_id, period_list, group_id):
         return pd.DataFrame()
 
     all_results = []
-    dhis = get_dhis2_client()
+    try:
+        dhis = get_dhis2_client()
+    except Exception as e:
+        st.error(f"Erreur de connexion DHIS2 : {e}")
+        return pd.DataFrame()
     for pe in period_list:
         try:
             params = {"ou": ou_id, "pe": pe, "ouMode": "DESCENDANTS"}
