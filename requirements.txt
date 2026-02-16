@@ -3,7 +3,6 @@ pandas
 numpy
 plotly
 requests
-openhexa.toolbox
 xlsxwriter
 python-docx
 python-pptx

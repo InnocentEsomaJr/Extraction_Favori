@@ -4,6 +4,7 @@ Application Streamlit pour analyser la performance SNIS (DHIS2) avec:
 - complétude
 - promptitude
 - comparaison entre zones/aires de santé
+- filtrage hiérarchique `Synthèse pays` / `Province` / `Zone de santé`
 - analyse des violations de règles de validation
 - export commenté en **Excel / Word / PowerPoint**
 
@@ -50,7 +51,8 @@ Depuis la **sidebar**:
 
 Le rapport exporté inclut:
 - tableaux principaux
-- commentaires automatiques
+- commentaires automatiques (lecture des graphiques et tableaux)
+- conservation des colorations conditionnelles du dashboard dans les tableaux exportés
 - (PowerPoint) images des graphiques et tableaux
 
 ## 3. Prérequis
@@ -72,6 +74,10 @@ Créer le fichier `Extraction_Favori/.streamlit/secrets.toml`:
 
 ```toml
 DHIS2_URL = "https://votre-instance-dhis2"
+# Optionnel (connexion lente):
+# DHIS2_TIMEOUT_CONNECT = 10
+# DHIS2_TIMEOUT_READ = 120
+# DHIS2_HTTP_RETRIES = 2
 ```
 
 Le projet lit `DHIS2_URL` via `st.secrets`.
@@ -122,7 +128,6 @@ Extraction_Favori/
 - `numpy`
 - `plotly`
 - `requests`
-- `openhexa.toolbox`
 - `xlsxwriter`
 - `python-docx`
 - `python-pptx`

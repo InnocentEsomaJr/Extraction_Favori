@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from openhexa.toolbox.dhis2 import DHIS2
 import plotly.express as px
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import io
 import os
 from datetime import datetime
@@ -83,8 +84,78 @@ def to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Performance')
     return output.getvalue()
 
-def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone, df_tab4_fusion=None):
-    """Prépare des commentaires d'interprétation pour les tableaux et graphiques."""
+def _build_styler(
+    df,
+    taux_cols=None,
+    score_cols=None,
+    int_cols=None,
+    decimals=2,
+    highlight_max_cols=None,
+    ratio_alert_col=None,
+    ratio_alert_threshold=10.0
+):
+    """Construit un Styler pandas avec les mêmes règles de couleurs que le dashboard."""
+    if df is None or df.empty:
+        return None
+
+    taux_cols = [c for c in (taux_cols or []) if c in df.columns]
+    score_cols = [c for c in (score_cols or []) if c in df.columns]
+    int_cols = [c for c in (int_cols or []) if c in df.columns]
+    highlight_max_cols = [c for c in (highlight_max_cols or []) if c in df.columns]
+
+    styler = df.style
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    format_map = {c: f"{{:.{int(decimals)}f}}" for c in numeric_cols}
+    for c in int_cols:
+        format_map[c] = "{:.0f}"
+    if format_map:
+        styler = styler.format(format_map, na_rep="")
+
+    if taux_cols:
+        styler = styler.map(style_taux, subset=taux_cols)
+    if score_cols:
+        styler = styler.map(style_score, subset=score_cols)
+    if highlight_max_cols:
+        styler = styler.highlight_max(subset=highlight_max_cols, color="#ffcccc")
+    if ratio_alert_col and ratio_alert_col in df.columns:
+        styler = styler.map(
+            lambda x: (
+                "color: red; font-weight: bold"
+                if pd.notna(x) and pd.to_numeric(x, errors="coerce") > ratio_alert_threshold
+                else ""
+            ),
+            subset=[ratio_alert_col]
+        )
+
+    return styler
+
+def _extract_css_values(css_text):
+    """Extrait couleur texte/fond/gras depuis une chaîne CSS."""
+    default_text = "#000000"
+    default_bg = "#FFFFFF"
+    bold = False
+    if not css_text:
+        return default_text, default_bg, bold
+
+    text_color = default_text
+    bg_color = default_bg
+    for item in str(css_text).split(";"):
+        if ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "color" and value:
+            text_color = value
+        elif key == "background-color" and value:
+            bg_color = value
+        elif key == "font-weight" and "bold" in value.lower():
+            bold = True
+    return text_color, bg_color, bold
+
+def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone, df_tab4_fusion=None, df_tab5=None):
+    """Prépare des commentaires clairs pour graphiques et tableaux exportés."""
     zone_label = selected_zone if selected_zone != "Toutes les zones" else "Toutes les zones"
     comp_avg = float(df_synth['Complétude_Globale (%)'].mean()) if not df_synth.empty else 0.0
     prom_avg = float(df_synth['Promptitude_Globale (%)'].mean()) if not df_synth.empty else 0.0
@@ -93,28 +164,60 @@ def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone,
 
     rows = [
         {
+            "Element": "Légende des couleurs",
+            "Commentaire": (
+                "Taux: <50 rouge vif, 50-69 bordeaux, 70-79 jaune, 80-95 vert clair, >95 vert foncé. "
+                "Score datasets: <5 bordeaux, 5 rose, 6-9 vert clair, 10 vert, >10 vert foncé."
+            )
+        },
+        {
             "Element": "Onglet 2 - Tableau Complétude",
-            "Commentaire": f"Complétude moyenne {comp_avg:.2f}%. Le tableau identifie les unités avec meilleure couverture des rapports."
+            "Commentaire": (
+                f"Complétude moyenne {comp_avg:.2f}%. Les cellules colorées reprennent strictement la logique du dashboard. "
+                "Priorité: unités en rouge/bordeaux."
+            )
         },
         {
             "Element": "Onglet 2 - Graphique Classement",
-            "Commentaire": f"Classement visuel par complétude globale. Meilleure unité observée: {top_comp}."
+            "Commentaire": (
+                f"Classement horizontal par complétude globale. L'unité la plus performante observée est '{top_comp}'. "
+                "Lire du bas vers le haut pour la progression."
+            )
         },
         {
             "Element": "Onglet 3 - Tableau Promptitude",
-            "Commentaire": f"Promptitude moyenne {prom_avg:.2f}%. Le tableau met en évidence le respect des délais de soumission."
+            "Commentaire": (
+                f"Promptitude moyenne {prom_avg:.2f}%. Les couleurs suivent la même échelle que l'onglet 3 "
+                "pour identifier rapidement les retards de notification."
+            )
         },
         {
             "Element": "Onglet 4 - Quadrant Comparatif",
-            "Commentaire": "Le quadrant compare simultanément complétude et promptitude autour du seuil de 80%."
+            "Commentaire": (
+                "Le quadrant croise complétude (axe X) et promptitude (axe Y). "
+                "Les lignes à 80% séparent les unités à renforcer des unités performantes."
+            )
+        },
+        {
+            "Element": "Onglet 4 - Tableau comparatif",
+            "Commentaire": (
+                "Le tableau comparatif présente, par unité, la complétude et la promptitude "
+                "avec les compteurs de datasets >=95% pour prioriser les actions."
+            )
         },
         {
             "Element": "Onglet 4 - Top/Flop",
-            "Commentaire": f"Top complétude: {top_comp}. Flop promptitude: {flop_prom}. Prioriser les unités en bas de promptitude."
+            "Commentaire": (
+                f"Top complétude: {top_comp}. Flop promptitude: {flop_prom}. "
+                "Action recommandée: cibler d'abord les unités du flop promptitude."
+            )
         },
         {
             "Element": "Onglet 5 - Tableau Catégorisation",
-            "Commentaire": "Le tableau compare M-1 et M sur les violations, les règles corrigées et le ratio sur 100 rapports."
+            "Commentaire": (
+                "Le tableau compare M-1 et M: règles violées, règles corrigées et ratio /100 rapports. "
+                "Le ratio élevé (texte rouge) signale un risque qualité prioritaire."
+            )
         },
     ]
 
@@ -122,21 +225,72 @@ def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone,
         rows.append(
             {
                 "Element": "Onglet 4 - Tableau fusionné (zone filtrée)",
-                "Commentaire": f"Pour la zone '{zone_label}', ce tableau fusionne indicateurs dataset, complétude, promptitude et scores >=95%."
+                "Commentaire": (
+                    f"Pour '{zone_label}', ce tableau aligne indicateurs dataset Reporting/Actual avec "
+                    "complétude, promptitude et compteurs >=95%."
+                )
+            }
+        )
+    if df_tab5 is not None and not df_tab5.empty:
+        rows.append(
+            {
+                "Element": "Onglet 5 - Lecture décisionnelle",
+                "Commentaire": (
+                    "Comparer d'abord 'Règles violées (M)' puis 'Règles corrigées (M-1 -> M)'. "
+                    "Un ratio qui baisse avec des règles corrigées en hausse indique une amélioration."
+                )
             }
         )
 
     return pd.DataFrame(rows)
 
-def to_excel_dashboard_report(df_final_c, df_final_p, df_synth, comments_df, df_tab4_fusion=None):
-    """Exporte un rapport Excel commenté."""
+def to_excel_dashboard_report(
+    df_final_c,
+    df_final_p,
+    df_synth,
+    comments_df,
+    df_tab4_fusion=None,
+    df_comparatif=None,
+    df_tab5=None,
+    style_context=None
+):
+    """Exporte un rapport Excel commenté avec colorations conditionnelles."""
+    style_context = style_context or {}
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_final_c.to_excel(writer, index=False, sheet_name='Onglet2_Completude')
-        df_final_p.to_excel(writer, index=False, sheet_name='Onglet3_Promptitude')
-        df_synth.to_excel(writer, index=False, sheet_name='Onglet4_Comparatif')
+        sty_comp = _build_styler(df_final_c, **style_context.get("completude", {}))
+        (sty_comp if sty_comp is not None else df_final_c).to_excel(
+            writer, index=False, sheet_name='Onglet2_Completude'
+        )
+
+        sty_prom = _build_styler(df_final_p, **style_context.get("promptitude", {}))
+        (sty_prom if sty_prom is not None else df_final_p).to_excel(
+            writer, index=False, sheet_name='Onglet3_Promptitude'
+        )
+
+        sty_synth = _build_styler(df_synth, **style_context.get("synthese", {}))
+        (sty_synth if sty_synth is not None else df_synth).to_excel(
+            writer, index=False, sheet_name='Onglet4_Comparatif'
+        )
+
+        if df_comparatif is not None and not df_comparatif.empty:
+            sty_compa = _build_styler(df_comparatif, **style_context.get("comparatif", {}))
+            (sty_compa if sty_compa is not None else df_comparatif).to_excel(
+                writer, index=False, sheet_name='Onglet4_Tab_Comp'
+            )
+
         if df_tab4_fusion is not None and not df_tab4_fusion.empty:
-            df_tab4_fusion.to_excel(writer, index=False, sheet_name='Onglet4_Fusion_Zone')
+            sty_fusion = _build_styler(df_tab4_fusion, **style_context.get("fusion", {}))
+            (sty_fusion if sty_fusion is not None else df_tab4_fusion).to_excel(
+                writer, index=False, sheet_name='Onglet4_Fusion_Zone'
+            )
+
+        if df_tab5 is not None and not df_tab5.empty:
+            sty_tab5 = _build_styler(df_tab5, **style_context.get("tab5", {}))
+            (sty_tab5 if sty_tab5 is not None else df_tab5).to_excel(
+                writer, index=False, sheet_name='Onglet5_Categorisation'
+            )
+
         comments_df.to_excel(writer, index=False, sheet_name='Commentaires')
     return output.getvalue()
 
@@ -159,33 +313,118 @@ def _add_dataframe_to_docx(doc, title, df, max_rows=20):
             else:
                 cells[i].text = str(val)
 
-def to_word_dashboard_report(df_final_c, df_final_p, df_synth, comments_df, df_tab4_fusion=None):
-    """Exporte un rapport Word commenté (retourne bytes, error)."""
+def _add_dataframe_image_to_docx(doc, title, df, style_ctx=None, comment=None, max_rows=20):
+    """Ajoute un tableau en image (avec couleurs) dans Word."""
+    from docx.shared import Inches
+
+    doc.add_heading(title, level=2)
+    if comment:
+        doc.add_paragraph(comment)
+
+    img_bytes, img_error = dataframe_to_png_bytes(
+        df,
+        title=title,
+        max_rows=max_rows,
+        style_context=style_ctx
+    )
+    if img_bytes is not None:
+        doc.add_picture(io.BytesIO(img_bytes), width=Inches(6.7))
+    else:
+        doc.add_paragraph(f"Image indisponible: {img_error}")
+        _add_dataframe_to_docx(doc, title, df, max_rows=max_rows)
+
+def to_word_dashboard_report(
+    df_final_c,
+    df_final_p,
+    df_synth,
+    comments_df,
+    df_tab4_fusion=None,
+    fig_comp=None,
+    fig_quad=None,
+    df_comparatif=None,
+    df_tab5=None,
+    style_context=None
+):
+    """Exporte un rapport Word commenté avec tableaux colorés et explications."""
     try:
         from docx import Document
+        from docx.shared import Inches
     except Exception:
         return None, "python-docx non installé (pip install python-docx)."
 
+    style_context = style_context or {}
     doc = Document()
     doc.add_heading("Rapport Dashboard SNIS RDC", level=1)
     doc.add_paragraph(f"Généré le {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    doc.add_heading("Commentaires", level=2)
+    doc.add_heading("Commentaires d'interprétation", level=2)
     for _, row in comments_df.iterrows():
         doc.add_paragraph(f"{row['Element']}: {row['Commentaire']}")
 
-    _add_dataframe_to_docx(doc, "Onglet 2 - Complétude", df_final_c)
-    _add_dataframe_to_docx(doc, "Onglet 3 - Promptitude", df_final_p)
-    _add_dataframe_to_docx(doc, "Onglet 4 - Comparatif", df_synth)
+    img_comp, _ = figure_to_png_bytes(fig_comp)
+    if img_comp is not None:
+        doc.add_heading("Graphique - Classement Complétude", level=2)
+        doc.add_paragraph(_comment_for(comments_df, "Graphique Classement", "Classement par complétude globale."))
+        doc.add_picture(io.BytesIO(img_comp), width=Inches(6.7))
+
+    img_quad, _ = figure_to_png_bytes(fig_quad)
+    if img_quad is not None:
+        doc.add_heading("Graphique - Quadrant Comparatif", level=2)
+        doc.add_paragraph(_comment_for(comments_df, "Quadrant", "Comparaison complétude/promptitude."))
+        doc.add_picture(io.BytesIO(img_quad), width=Inches(6.7))
+
+    _add_dataframe_image_to_docx(
+        doc,
+        "Tableau - Complétude",
+        df_final_c,
+        style_ctx=style_context.get("completude", {}),
+        comment=_comment_for(comments_df, "Tableau Complétude", "")
+    )
+    _add_dataframe_image_to_docx(
+        doc,
+        "Tableau - Promptitude",
+        df_final_p,
+        style_ctx=style_context.get("promptitude", {}),
+        comment=_comment_for(comments_df, "Tableau Promptitude", "")
+    )
+    _add_dataframe_image_to_docx(
+        doc,
+        "Tableau - Comparatif",
+        df_synth,
+        style_ctx=style_context.get("synthese", {}),
+        comment=_comment_for(comments_df, "Top/Flop", "")
+    )
+    if df_comparatif is not None and not df_comparatif.empty:
+        _add_dataframe_image_to_docx(
+            doc,
+            "Tableau comparatif Complétude / Promptitude",
+            df_comparatif,
+            style_ctx=style_context.get("comparatif", {}),
+            comment=_comment_for(comments_df, "Tableau comparatif", "")
+        )
     if df_tab4_fusion is not None and not df_tab4_fusion.empty:
-        _add_dataframe_to_docx(doc, "Onglet 4 - Fusion zone filtrée", df_tab4_fusion)
+        _add_dataframe_image_to_docx(
+            doc,
+            "Tableau fusionné zone filtrée",
+            df_tab4_fusion,
+            style_ctx=style_context.get("fusion", {}),
+            comment=_comment_for(comments_df, "fusionné", "")
+        )
+    if df_tab5 is not None and not df_tab5.empty:
+        _add_dataframe_image_to_docx(
+            doc,
+            "Tableau catégorisation (M-1 vs M)",
+            df_tab5,
+            style_ctx=style_context.get("tab5", {}),
+            comment=_comment_for(comments_df, "Catégorisation", "")
+        )
 
     output = io.BytesIO()
     doc.save(output)
     return output.getvalue(), None
 
-def dataframe_to_png_bytes(df, title="Tableau", max_rows=20):
-    """Convertit un DataFrame en image PNG (retourne bytes, error)."""
+def dataframe_to_png_bytes(df, title="Tableau", max_rows=20, style_context=None):
+    """Convertit un DataFrame en image PNG avec colorations conditionnelles."""
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -194,14 +433,44 @@ def dataframe_to_png_bytes(df, title="Tableau", max_rows=20):
     if df is None or df.empty:
         return None, "Aucune donnée à convertir en image."
 
+    style_context = style_context or {}
+    taux_cols = [c for c in style_context.get("taux_cols", []) if c in df.columns]
+    score_cols = [c for c in style_context.get("score_cols", []) if c in df.columns]
+    int_cols = [c for c in style_context.get("int_cols", []) if c in df.columns]
+    highlight_max_cols = [c for c in style_context.get("highlight_max_cols", []) if c in df.columns]
+    ratio_alert_col = style_context.get("ratio_alert_col")
+    ratio_alert_threshold = float(style_context.get("ratio_alert_threshold", 10.0))
+    decimals = int(style_context.get("decimals", 2))
+
     df_show = df.head(max_rows).copy()
+    max_values = {}
+    for c in highlight_max_cols:
+        s = pd.to_numeric(df_show[c], errors='coerce')
+        max_values[c] = s.max() if not s.isna().all() else np.nan
+
+    cell_text = []
+    for _, row in df_show.iterrows():
+        row_text = []
+        for col in df_show.columns:
+            val = row[col]
+            if pd.isna(val):
+                row_text.append("")
+            elif col in int_cols:
+                row_text.append(f"{pd.to_numeric(val, errors='coerce'):.0f}")
+            elif isinstance(val, (float, np.floating, int, np.integer)):
+                row_text.append(f"{float(val):.{decimals}f}")
+            else:
+                row_text.append(str(val))
+        cell_text.append(row_text)
+
     fig_h = max(2.8, 0.45 * (len(df_show) + 2))
     fig_w = max(10, 1.5 * len(df_show.columns))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis('off')
     ax.set_title(title, fontsize=11, pad=8)
+
     table = ax.table(
-        cellText=df_show.astype(str).values,
+        cellText=cell_text,
         colLabels=df_show.columns,
         cellLoc='center',
         loc='center'
@@ -209,8 +478,49 @@ def dataframe_to_png_bytes(df, title="Tableau", max_rows=20):
     table.auto_set_font_size(False)
     table.set_fontsize(8)
     table.scale(1, 1.2)
-    fig.tight_layout()
 
+    # Style entête
+    for j in range(len(df_show.columns)):
+        header_cell = table[(0, j)]
+        header_cell.set_facecolor("#1F4E78")
+        header_cell.set_edgecolor("#FFFFFF")
+        header_cell.get_text().set_color("white")
+        header_cell.get_text().set_weight("bold")
+
+    # Style cellules data
+    for i in range(len(df_show)):
+        for j, col in enumerate(df_show.columns):
+            val = df_show.iloc[i, j]
+            cell = table[(i + 1, j)]
+            cell.set_edgecolor("#D9D9D9")
+            text_color = "#000000"
+            bg_color = "#FFFFFF"
+            bold = False
+
+            if col in taux_cols:
+                text_color, bg_color, bold_taux = _extract_css_values(style_taux(val))
+                bold = bold or bold_taux
+            if col in score_cols:
+                text_color, bg_color, bold_score = _extract_css_values(style_score(val))
+                bold = bold or bold_score
+
+            if col in highlight_max_cols and pd.notna(max_values.get(col)):
+                val_num = pd.to_numeric(val, errors='coerce')
+                if pd.notna(val_num) and np.isclose(float(val_num), float(max_values[col])):
+                    bg_color = "#ffcccc"
+
+            if ratio_alert_col and col == ratio_alert_col:
+                val_num = pd.to_numeric(val, errors='coerce')
+                if pd.notna(val_num) and float(val_num) > ratio_alert_threshold:
+                    text_color = "red"
+                    bold = True
+
+            cell.set_facecolor(bg_color)
+            cell.get_text().set_color(text_color)
+            if bold:
+                cell.get_text().set_weight("bold")
+
+    fig.tight_layout()
     output = io.BytesIO()
     fig.savefig(output, format='png', dpi=180, bbox_inches='tight')
     plt.close(fig)
@@ -239,21 +549,34 @@ def _add_image_slide(prs, title, comment, image_bytes):
     slide = prs.slides.add_slide(prs.slide_layouts[5])  # Title only
     slide.shapes.title.text = title
 
-    tx_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.7), Inches(12.3), Inches(0.8))
+    tx_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.7), Inches(12.3), Inches(1.2))
     tx_frame = tx_box.text_frame
     tx_frame.text = comment
-    tx_frame.paragraphs[0].font.size = Pt(14)
+    tx_frame.word_wrap = True
+    tx_frame.paragraphs[0].font.size = Pt(12)
 
     if image_bytes is not None:
-        slide.shapes.add_picture(io.BytesIO(image_bytes), Inches(0.5), Inches(1.5), width=Inches(12.3))
+        slide.shapes.add_picture(io.BytesIO(image_bytes), Inches(0.5), Inches(1.9), width=Inches(12.3))
 
-def to_powerpoint_dashboard_report(df_synth, comments_df, fig_comp=None, fig_quad=None, df_comparatif=None, df_tab4_fusion=None):
-    """Exporte un rapport PowerPoint commenté avec images (retourne bytes, error)."""
+def to_powerpoint_dashboard_report(
+    df_synth,
+    comments_df,
+    fig_comp=None,
+    fig_quad=None,
+    df_comparatif=None,
+    df_tab4_fusion=None,
+    df_final_c=None,
+    df_final_p=None,
+    df_tab5=None,
+    style_context=None
+):
+    """Exporte un PowerPoint avec graphiques + tableaux colorés + commentaires clairs."""
     try:
         from pptx import Presentation
     except Exception:
         return None, "python-pptx non installé (pip install python-pptx)."
 
+    style_context = style_context or {}
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     slide.shapes.title.text = "Rapport Dashboard SNIS RDC"
@@ -268,6 +591,20 @@ def to_powerpoint_dashboard_report(df_synth, comments_df, fig_comp=None, fig_qua
         img_comp
     )
 
+    # 1-bis) Tableau complétude coloré
+    if df_final_c is not None and not df_final_c.empty:
+        img_tab_comp, _ = dataframe_to_png_bytes(
+            df_final_c,
+            title="Tableau Complétude",
+            style_context=style_context.get("completude", {})
+        )
+        _add_image_slide(
+            prs,
+            "Tableau Complétude (coloré)",
+            _comment_for(comments_df, "Tableau Complétude", "Lecture détaillée de la complétude par unité."),
+            img_tab_comp
+        )
+
     # 2) Quadrant comparatif
     img_quad, _ = figure_to_png_bytes(fig_quad)
     _add_image_slide(
@@ -277,23 +614,59 @@ def to_powerpoint_dashboard_report(df_synth, comments_df, fig_comp=None, fig_qua
         img_quad
     )
 
+    # 2-bis) Tableau promptitude coloré
+    if df_final_p is not None and not df_final_p.empty:
+        img_tab_prom, _ = dataframe_to_png_bytes(
+            df_final_p,
+            title="Tableau Promptitude",
+            style_context=style_context.get("promptitude", {})
+        )
+        _add_image_slide(
+            prs,
+            "Tableau Promptitude (coloré)",
+            _comment_for(comments_df, "Tableau Promptitude", "Lecture détaillée de la promptitude par unité."),
+            img_tab_prom
+        )
+
     # 3) Tableau comparatif complétude/promptitude
-    img_comp_table, _ = dataframe_to_png_bytes(df_comparatif, title="Tableau comparatif Complétude / Promptitude")
+    img_comp_table, _ = dataframe_to_png_bytes(
+        df_comparatif,
+        title="Tableau comparatif Complétude / Promptitude",
+        style_context=style_context.get("comparatif", {})
+    )
     _add_image_slide(
         prs,
         "Tableau comparatif",
-        _comment_for(comments_df, "Onglet 4 - Top/Flop", "Lecture comparative par unité."),
+        _comment_for(comments_df, "Tableau comparatif", "Lecture comparative par unité."),
         img_comp_table
     )
 
     # 4) Tableau fusionné zone filtrée (si disponible)
     if df_tab4_fusion is not None and not df_tab4_fusion.empty:
-        img_fusion, _ = dataframe_to_png_bytes(df_tab4_fusion, title="Tableau fusionné indicateurs dataset")
+        img_fusion, _ = dataframe_to_png_bytes(
+            df_tab4_fusion,
+            title="Tableau fusionné indicateurs dataset",
+            style_context=style_context.get("fusion", {})
+        )
         _add_image_slide(
             prs,
             "Tableau fusionné zone filtrée",
             _comment_for(comments_df, "fusionné", "Vue détaillée des indicateurs dataset en zone filtrée."),
             img_fusion
+        )
+
+    # 5) Tableau catégorisation (si disponible)
+    if df_tab5 is not None and not df_tab5.empty:
+        img_tab5, _ = dataframe_to_png_bytes(
+            df_tab5,
+            title="Tableau Catégorisation (M-1 vs M)",
+            style_context=style_context.get("tab5", {})
+        )
+        _add_image_slide(
+            prs,
+            "Tableau Catégorisation (coloré)",
+            _comment_for(comments_df, "Catégorisation", "Lecture des violations, corrections et ratio /100 rapports."),
+            img_tab5
         )
 
     s = prs.slides.add_slide(prs.slide_layouts[1])
@@ -331,6 +704,17 @@ def _read_config_value(key):
         value = os.getenv(key)
     return str(value).strip() if value is not None else None
 
+def _read_int_config_value(key, default_value):
+    """Lit un entier de config; retourne default_value si absent/invalide."""
+    raw_value = _read_config_value(key)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default_value
+    try:
+        parsed = int(str(raw_value).strip())
+        return parsed if parsed > 0 else default_value
+    except Exception:
+        return default_value
+
 def test_dhis2_credentials(base_url, username, password):
     """Teste les identifiants utilisateur DHIS2 sur /api/me."""
     try:
@@ -349,13 +733,52 @@ def test_dhis2_credentials(base_url, username, password):
     return False, f"Connexion DHIS2 échouée (HTTP {response.status_code})."
 
 @st.cache_resource
-def _build_dhis2_client(url, username, password):
-    return DHIS2(url=url, username=username, password=password)
+def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0):
+    class SimpleDHIS2Client:
+        """Client DHIS2 minimal sans dépendance openhexa."""
+        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0):
+            self.base_url = str(base_url).rstrip("/")
+            self.timeout = (timeout_connect_sec, timeout_read_sec)
+            self.session = requests.Session()
+            self.session.auth = (user, pwd)
+            self.session.headers.update({"Accept": "application/json"})
+
+            retry_strategy = Retry(
+                total=retries_count,
+                connect=retries_count,
+                read=retries_count,
+                status=retries_count,
+                backoff_factor=backoff_factor,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "HEAD", "OPTIONS"],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+
+        def get(self, endpoint, params=None):
+            clean_endpoint = str(endpoint).lstrip("/")
+            if not clean_endpoint.startswith("api/"):
+                clean_endpoint = f"api/{clean_endpoint}"
+            url = f"{self.base_url}/{clean_endpoint}"
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            if response.status_code in (401, 403):
+                raise RuntimeError("Accès DHIS2 refusé (vérifie les identifiants et permissions).")
+            response.raise_for_status()
+            if not response.text:
+                return {}
+            return response.json()
+
+    return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff)
 
 def get_dhis2_client():
     dhis2_url = _read_config_value("DHIS2_URL")
     dhis2_user = str(st.session_state.get("dhis2_user", "")).strip()
     dhis2_pass = str(st.session_state.get("dhis2_pass", "")).strip()
+    dhis2_timeout_connect = _read_int_config_value("DHIS2_TIMEOUT_CONNECT", 10)
+    dhis2_timeout_read = _read_int_config_value("DHIS2_TIMEOUT_READ", 90)
+    dhis2_retries = _read_int_config_value("DHIS2_HTTP_RETRIES", 2)
 
     missing_keys = []
     if not dhis2_url:
@@ -372,7 +795,15 @@ def get_dhis2_client():
             "puis connecte-toi via la barre latérale."
         )
 
-    return _build_dhis2_client(dhis2_url, dhis2_user, dhis2_pass)
+    return _build_dhis2_client(
+        dhis2_url,
+        dhis2_user,
+        dhis2_pass,
+        timeout_connect=dhis2_timeout_connect,
+        timeout_read=dhis2_timeout_read,
+        retries=dhis2_retries,
+        backoff=1.0,
+    )
 
 @st.cache_data(ttl=3600)
 def get_data(favori_id, period=None, cache_user=None):
@@ -384,10 +815,23 @@ def get_data(favori_id, period=None, cache_user=None):
         if period:
             endpoint += f"?dimension=pe:{period}"
 
-        response = dhis.api.get(endpoint)
+        response = dhis.get(endpoint)
         headers, rows = response.get("headers", []), response.get("rows", [])
         columns = [h.get("name", h.get("column")) for h in headers]
         return pd.DataFrame(rows, columns=columns)
+    except requests.exceptions.ReadTimeout:
+        st.error(
+            "Erreur de connexion : délai de lecture dépassé sur DHIS2. "
+            "Essaie une période plus courte (ex. 1-2 mois) ou augmente "
+            "DHIS2_TIMEOUT_READ dans les secrets Streamlit."
+        )
+        return None
+    except requests.exceptions.Timeout:
+        st.error(
+            "Erreur de connexion : timeout réseau DHIS2. "
+            "Vérifie la connectivité et réessaie."
+        )
+        return None
     except Exception as e:
         st.error(f"Erreur de connexion : {e}")
         return None
@@ -397,7 +841,7 @@ def get_validation_groups(cache_user=None):
     _ = cache_user
     try:
         dhis = get_dhis2_client()
-        return dhis.api.get("validationRuleGroups", params={"fields": "id,displayName", "paging": "false"})['validationRuleGroups']
+        return dhis.get("validationRuleGroups", params={"fields": "id,displayName", "paging": "false"})['validationRuleGroups']
     except: return []
 
 @st.cache_data(ttl=3600)
@@ -418,7 +862,7 @@ def get_validation_results(ou_id, period_list, group_id, cache_user=None):
             params = {"ou": ou_id, "pe": pe, "ouMode": "DESCENDANTS"}
             if group_id:
                 params["vrg"] = group_id
-            res = dhis.api.get("validationResults", params=params)
+            res = dhis.get("validationResults", params=params)
             if 'validationResults' in res:
                 all_results.extend(res['validationResults'])
         except Exception:
@@ -433,13 +877,95 @@ def get_children_org_units_details(parent_id, cache_user=None):
         return []
     try:
         dhis = get_dhis2_client()
-        response = dhis.api.get(
+        response = dhis.get(
             f"organisationUnits/{parent_id}",
             params={"fields": "children[id,displayName]", "paging": "false"}
         )
         return response.get("children", []) or []
     except Exception:
         return []
+
+@st.cache_data(ttl=3600)
+def get_org_units_hierarchy(org_unit_ids, cache_user=None):
+    """
+    Récupère la hiérarchie organisationnelle (pays/province/zone) pour une liste d'IDs.
+    Retour: dict[ou_id] -> {
+        country_name, country_id, province_name, province_id, zone_name, zone_id, level
+    }
+    """
+    _ = cache_user
+    cleaned_ids = []
+    for ou_id in (org_unit_ids or []):
+        if ou_id is None:
+            continue
+        ou_value = str(ou_id).strip()
+        if not ou_value or ou_value.lower() in {"nan", "none", "null"}:
+            continue
+        cleaned_ids.append(ou_value)
+    unique_ids = sorted(set(cleaned_ids))
+    if not unique_ids:
+        return {}
+
+    try:
+        dhis = get_dhis2_client()
+    except Exception:
+        return {}
+
+    hierarchy = {}
+    chunk_size = 60
+    for i in range(0, len(unique_ids), chunk_size):
+        chunk = unique_ids[i:i + chunk_size]
+        try:
+            params = {
+                "fields": "id,displayName,level,ancestors[id,displayName,level]",
+                "filter": f"id:in:[{','.join(chunk)}]",
+                "paging": "false",
+            }
+            response = dhis.get("organisationUnits", params=params)
+            units = response.get("organisationUnits", [])
+        except Exception:
+            units = []
+
+        for ou in units:
+            ou_id = str(ou.get("id", "")).strip()
+            if not ou_id:
+                continue
+            ou_name = str(ou.get("displayName", "")).strip()
+            ou_level = ou.get("level")
+
+            ancestors = ou.get("ancestors", []) or []
+            ancestors_sorted = sorted(
+                [a for a in ancestors if isinstance(a, dict) and a.get("id")],
+                key=lambda a: int(a.get("level") or 0)
+            )
+
+            chain = []
+            seen = set()
+            for item in ancestors_sorted + [{"id": ou_id, "displayName": ou_name, "level": ou_level}]:
+                item_id = str(item.get("id", "")).strip()
+                if not item_id or item_id in seen:
+                    continue
+                seen.add(item_id)
+                chain.append(item)
+
+            if not chain:
+                continue
+
+            country = chain[0]
+            province = chain[1] if len(chain) > 1 else chain[0]
+            zone = chain[2] if len(chain) > 2 else (chain[1] if len(chain) > 1 else chain[0])
+
+            hierarchy[ou_id] = {
+                "country_name": str(country.get("displayName", "")).strip(),
+                "country_id": str(country.get("id", "")).strip(),
+                "province_name": str(province.get("displayName", "")).strip(),
+                "province_id": str(province.get("id", "")).strip(),
+                "zone_name": str(zone.get("displayName", "")).strip(),
+                "zone_id": str(zone.get("id", "")).strip(),
+                "level": int(ou_level) if ou_level is not None else None,
+            }
+
+    return hierarchy
 
 # --- 3. SIDEBAR & FILTRES ---
 with st.sidebar:
@@ -559,33 +1085,133 @@ if df_raw is not None:
     if cols_existing: target_df_all.drop(columns=cols_existing, inplace=True)
 
     st.sidebar.subheader("🔍 Filtrage")
-    zones = ["Toutes les zones"] + sorted(target_df_all['Organisation unit'].unique().tolist())
-    selected_zone = st.sidebar.selectbox("Filtrer par Zone ou Aire de Santé :", zones)
-
-    # Détermination de l'ID à utiliser pour l'onglet 5
-    if selected_zone != "Toutes les zones":
-        target_df = target_df_all[target_df_all['Organisation unit'] == selected_zone].copy()
-        current_id_systeme = mapping_ou_id.get(selected_zone)
+    scope_df = pd.DataFrame({"Organisation unit": df_raw.get("Organisation unit", pd.Series(dtype=str))})
+    if "Organisation unit ID" in df_raw.columns:
+        scope_df["Organisation unit ID"] = df_raw["Organisation unit ID"].astype(str)
     else:
-        target_df = target_df_all.copy()
-        # Si possible on prend l'ID de la ligne parent (province), sinon premier ID.
-        if 'Organisation unit is parent' in df_raw.columns:
-            parent_mask = df_raw['Organisation unit is parent'].astype(str).str.lower().isin(['true', '1'])
-            parent_rows = df_raw[parent_mask]
-            if not parent_rows.empty and 'Organisation unit ID' in parent_rows.columns:
-                current_id_systeme = parent_rows['Organisation unit ID'].iloc[0]
-            else:
-                current_id_systeme = df_raw['Organisation unit ID'].iloc[0] if 'Organisation unit ID' in df_raw.columns else None
-        else:
-            current_id_systeme = df_raw['Organisation unit ID'].iloc[0] if 'Organisation unit ID' in df_raw.columns else None
+        scope_df["Organisation unit ID"] = ""
 
-    st.title(f"📊 SNIS RDC - Performance {selected_zone if selected_zone != 'Toutes les zones' else 'Haut-Uele'}")
+    hierarchy_by_id = get_org_units_hierarchy(
+        scope_df["Organisation unit ID"].dropna().tolist(),
+        cache_user=current_user_for_cache
+    )
+
+    scope_df["Pays"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("country_name", "")
+    )
+    scope_df["Pays_ID"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("country_id", "")
+    )
+    scope_df["Province"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("province_name", "")
+    )
+    scope_df["Province_ID"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("province_id", "")
+    )
+    scope_df["Zone"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("zone_name", "")
+    )
+    scope_df["Zone_ID"] = scope_df["Organisation unit ID"].map(
+        lambda x: hierarchy_by_id.get(str(x), {}).get("zone_id", "")
+    )
+
+    scope_df["Pays"] = scope_df["Pays"].replace("", np.nan).fillna("Pays")
+    scope_df["Province"] = scope_df["Province"].replace("", np.nan).fillna(scope_df["Organisation unit"])
+    scope_df["Zone"] = scope_df["Zone"].replace("", np.nan).fillna(scope_df["Organisation unit"])
+
+    province_to_id = (
+        scope_df[scope_df["Province_ID"].astype(str).str.strip() != ""]
+        .drop_duplicates("Province")
+        .set_index("Province")["Province_ID"]
+        .to_dict()
+    )
+    zone_to_id = (
+        scope_df[scope_df["Zone_ID"].astype(str).str.strip() != ""]
+        .drop_duplicates("Zone")
+        .set_index("Zone")["Zone_ID"]
+        .to_dict()
+    )
+
+    scope_df["is_zone_candidate"] = scope_df["Zone"].astype(str) != scope_df["Province"].astype(str)
+    if not scope_df["is_zone_candidate"].any() and is_parent_by_ou:
+        scope_df["is_zone_candidate"] = ~scope_df["Organisation unit"].map(is_parent_by_ou).fillna(False)
+    if not scope_df["is_zone_candidate"].any():
+        scope_df["is_zone_candidate"] = True
+
+    filter_level = st.sidebar.selectbox(
+        "Niveau d'analyse :",
+        ["Synthèse pays", "Province", "Zone de santé"],
+        key="filter_level_main"
+    )
+
+    selected_province = "Toutes les provinces"
+    selected_zone = "Toutes les zones"
+    selected_scope_label = "Synthèse pays"
+    current_id_systeme = None
+
+    provinces = sorted(scope_df["Province"].dropna().unique().tolist())
+    country_names = sorted(scope_df["Pays"].dropna().unique().tolist())
+    country_label = country_names[0] if country_names else "Pays"
+
+    if filter_level == "Synthèse pays":
+        target_df = target_df_all.copy()
+        selected_scope_label = f"Synthèse {country_label}"
+        country_ids = [cid for cid in scope_df["Pays_ID"].dropna().astype(str).tolist() if cid.strip()]
+        current_id_systeme = country_ids[0] if country_ids else None
+
+    elif filter_level == "Province":
+        if not provinces:
+            st.warning("Aucune province détectée dans les données.")
+            target_df = target_df_all.copy()
+            selected_scope_label = "Province indisponible"
+        else:
+            selected_province = st.sidebar.selectbox("Province :", provinces, key="filter_province_main")
+            mask_province = scope_df["Province"] == selected_province
+            target_df = target_df_all[mask_province.values].copy()
+            current_id_systeme = province_to_id.get(selected_province)
+            selected_scope_label = f"Province {selected_province}"
+
+    else:
+        province_options = ["Toutes les provinces"] + provinces if provinces else ["Toutes les provinces"]
+        selected_province = st.sidebar.selectbox("Province :", province_options, key="filter_zone_province_main")
+
+        zone_pool = scope_df.copy()
+        if selected_province != "Toutes les provinces":
+            zone_pool = zone_pool[zone_pool["Province"] == selected_province]
+
+        zone_options = sorted(
+            zone_pool[zone_pool["is_zone_candidate"]]["Zone"].dropna().unique().tolist()
+        )
+        if not zone_options:
+            zone_options = sorted(zone_pool["Organisation unit"].dropna().unique().tolist())
+
+        if not zone_options:
+            st.warning("Aucune zone de santé détectée pour ce filtre.")
+            target_df = target_df_all.iloc[0:0].copy()
+            selected_scope_label = "Zone indisponible"
+        else:
+            selected_zone = st.sidebar.selectbox("Zone de santé :", zone_options, key="filter_zone_main")
+            mask_exact = target_df_all["Organisation unit"] == selected_zone
+            if mask_exact.any():
+                target_df = target_df_all[mask_exact].copy()
+            else:
+                target_df = target_df_all[(scope_df["Zone"] == selected_zone).values].copy()
+            current_id_systeme = zone_to_id.get(selected_zone) or mapping_ou_id.get(selected_zone)
+            selected_scope_label = f"Zone {selected_zone}"
+
+    if target_df.empty:
+        st.warning("Aucune donnée trouvée avec ce niveau de filtre.")
+
+    is_zone_focus = filter_level == "Zone de santé" and selected_zone != "Toutes les zones"
+
+    st.title(f"📊 SNIS RDC - Performance {selected_scope_label}")
 
     # Variables partagées pour export hors onglets.
     fig_comp = None
     fig_quad = None
     df_tab4_fusion = pd.DataFrame()
     df_comparatif = pd.DataFrame()
+    df_tab5_export = pd.DataFrame()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📁 Base de données", "✅ Complétude", "⏱️ Promptitude", "⚖️ Analyse Comparative", "🩺 Éléments de catégorisation"])
 
@@ -728,7 +1354,7 @@ if df_raw is not None:
         )
 
         # TABLEAU FUSIONNE (zone filtrée): reporting + actual + scores dataset
-        if selected_zone != "Toutes les zones":
+        if is_zone_focus:
             st.divider()
             st.subheader(f"📋 Tableau fusionné des indicateurs dataset : {selected_zone}")
 
@@ -801,27 +1427,50 @@ if df_raw is not None:
             selected_vr_name = st.selectbox("Sélectionner le Groupe de Règles de Validation :", options_regles)
 
             if st.button("Lancer l'analyse des violations"):
-                if current_id_systeme and len(str(current_id_systeme)) > 5:
+                can_run_validation = True
+                if is_zone_focus and (not current_id_systeme or len(str(current_id_systeme)) <= 5):
+                    can_run_validation = False
+
+                if can_run_validation:
                     with st.spinner('Analyse des violations en cours...'):
 
                         target_group_id = group_mapping.get(selected_vr_name) if selected_vr_name != "Toutes les règles (Global)" else None
 
-                        # 1) Construire la liste des zones de santé (pas la province)
-                        zone_id_mapping = mapping_ou_id.copy()
-                        if selected_zone != "Toutes les zones":
-                            zones_cibles = [selected_zone]
-                        else:
-                            children_info = get_children_org_units_details(current_id_systeme, cache_user=current_user_for_cache)
-                            zones_cibles = [c['displayName'] for c in children_info if c.get('displayName') and c.get('id')]
-                            for child in children_info:
-                                zone_id_mapping[child['displayName']] = child['id']
+                        # 1) Construire la liste des zones selon le niveau de filtre
+                        zone_id_mapping = {
+                            str(k).strip(): str(v).strip()
+                            for k, v in zone_to_id.items()
+                            if str(k).strip() and str(v).strip()
+                        }
 
-                            # Fallback si l'API enfants ne renvoie rien
-                            if not zones_cibles:
-                                zones_cibles = sorted(target_df_all['Organisation unit'].dropna().unique().tolist())
-                                province_name = next((nom for nom, ou_id in mapping_ou_id.items() if ou_id == current_id_systeme), None)
-                                if province_name in zones_cibles and len(zones_cibles) > 1:
-                                    zones_cibles = [z for z in zones_cibles if z != province_name]
+                        if is_zone_focus:
+                            zones_cibles = [selected_zone]
+                            if selected_zone not in zone_id_mapping:
+                                zid = mapping_ou_id.get(selected_zone)
+                                if zid:
+                                    zone_id_mapping[selected_zone] = str(zid)
+                        else:
+                            if filter_level == "Province" and selected_province != "Toutes les provinces":
+                                zone_source_df = scope_df[
+                                    (scope_df["Province"] == selected_province) &
+                                    (scope_df["is_zone_candidate"])
+                                ]
+                            else:
+                                zone_source_df = scope_df[scope_df["is_zone_candidate"]]
+
+                            zones_cibles = sorted(zone_source_df["Zone"].dropna().unique().tolist())
+
+                            for _, row_meta in zone_source_df.iterrows():
+                                zone_name = str(row_meta.get("Zone", "")).strip()
+                                zone_id = str(row_meta.get("Zone_ID", "")).strip()
+                                if zone_name and zone_id:
+                                    zone_id_mapping[zone_name] = zone_id
+
+                            if not zones_cibles and current_id_systeme:
+                                children_info = get_children_org_units_details(current_id_systeme, cache_user=current_user_for_cache)
+                                zones_cibles = [c['displayName'] for c in children_info if c.get('displayName') and c.get('id')]
+                                for child in children_info:
+                                    zone_id_mapping[str(child['displayName']).strip()] = str(child['id']).strip()
 
                         zones_cibles = [z for z in zones_cibles if zone_id_mapping.get(z)]
                         zones_cibles = list(dict.fromkeys(zones_cibles))
@@ -845,84 +1494,98 @@ if df_raw is not None:
                             st.warning("Aucune zone de santé valide trouvée.")
                             st.stop()
 
-                        # 2) Reports_Actual provenant directement de l'onglet 2 (df_synthese)
-                        actual_map_by_id = {}
-                        actual_map_by_name = {}
-                        if 'Organisation unit' in df_synthese.columns and 'Reports_Actual' in df_synthese.columns:
-                            df_actual_map = df_synthese[['Organisation unit', 'Reports_Actual']].copy()
-                            df_actual_map['Reports_Actual'] = pd.to_numeric(df_actual_map['Reports_Actual'], errors='coerce').fillna(0)
-                            df_actual_map['ou_id'] = df_actual_map['Organisation unit'].map(mapping_ou_id)
-                            df_actual_map['ou_id'] = df_actual_map['ou_id'].where(
-                                df_actual_map['ou_id'].notna(),
-                                df_actual_map['Organisation unit'].map(lambda x: zone_id_mapping_norm.get(normalize_org_name(x)))
-                            )
-                            actual_map_by_id = (
-                                df_actual_map.dropna(subset=['ou_id'])
-                                .groupby('ou_id')['Reports_Actual']
-                                .mean()
-                                .to_dict()
-                            )
-                            actual_map_by_name = (
-                                df_actual_map.assign(_k=df_actual_map['Organisation unit'].map(normalize_org_name))
-                                .groupby('_k')['Reports_Actual']
-                                .mean()
-                                .to_dict()
-                            )
+                        # 2) Recalcul des métriques au niveau "Zone de santé" (évite les zéros dus aux différences de niveaux)
+                        actual_zone_by_id = {}
+                        actual_zone_by_name = {}
+                        comp_zone_by_id = {}
+                        comp_zone_by_name = {}
+                        prompt_zone_by_id = {}
+                        prompt_zone_by_name = {}
 
-                        # 2-bis) Prendre les valeurs déjà calculées:
-                        # Complétude depuis l'onglet 2 (df_synthese),
-                        # Promptitude depuis l'onglet 3 (df_final_p)
-                        comp_map_by_id = {}
-                        comp_map_by_name = {}
-                        prompt_map_by_id = {}
-                        prompt_map_by_name = {}
-                        if 'Organisation unit' in df_synthese.columns and 'Complétude_Globale (%)' in df_synthese.columns:
-                            df_comp_map = df_synthese[['Organisation unit', 'Complétude_Globale (%)']].copy()
-                            df_comp_map['ou_id'] = df_comp_map['Organisation unit'].map(mapping_ou_id)
-                            df_comp_map['ou_id'] = df_comp_map['ou_id'].where(
-                                df_comp_map['ou_id'].notna(),
-                                df_comp_map['Organisation unit'].map(lambda x: zone_id_mapping_norm.get(normalize_org_name(x)))
+                        scope_meta = scope_df[['Organisation unit', 'Organisation unit ID', 'Zone', 'Zone_ID']].copy()
+                        scope_meta['Organisation unit'] = scope_meta['Organisation unit'].astype(str)
+                        scope_meta['Organisation unit ID'] = scope_meta['Organisation unit ID'].astype(str)
+                        scope_meta['Zone'] = scope_meta['Zone'].astype(str)
+                        scope_meta['Zone_ID'] = scope_meta['Zone_ID'].astype(str)
+                        scope_meta['_ou_key'] = scope_meta['Organisation unit'].map(normalize_org_name)
+                        scope_meta = scope_meta.drop_duplicates(subset=['_ou_key', 'Organisation unit ID'])
+
+                        def _attach_zone_meta(df_source):
+                            if df_source is None or df_source.empty or 'Organisation unit' not in df_source.columns:
+                                return pd.DataFrame()
+                            tmp = df_source.copy()
+                            tmp['Organisation unit'] = tmp['Organisation unit'].astype(str)
+                            tmp['_ou_key'] = tmp['Organisation unit'].map(normalize_org_name)
+                            tmp = tmp.merge(
+                                scope_meta[['_ou_key', 'Organisation unit ID', 'Zone', 'Zone_ID']],
+                                on='_ou_key',
+                                how='left'
                             )
-                            comp_map_by_id = (
-                                df_comp_map.dropna(subset=['ou_id'])
-                                .groupby('ou_id')['Complétude_Globale (%)']
-                                .mean()
-                                .to_dict()
+                            tmp['ou_id'] = tmp['Organisation unit'].map(mapping_ou_id)
+                            tmp['ou_id'] = tmp['ou_id'].where(
+                                tmp['ou_id'].notna() & (tmp['ou_id'].astype(str).str.strip() != ""),
+                                tmp['Organisation unit ID']
                             )
-                            comp_map_by_name = (
-                                df_comp_map.assign(_k=df_comp_map['Organisation unit'].map(normalize_org_name))
-                                .groupby('_k')['Complétude_Globale (%)']
-                                .mean()
-                                .to_dict()
+                            tmp['Zone_ID'] = tmp['Zone_ID'].where(
+                                tmp['Zone_ID'].notna() & (tmp['Zone_ID'].astype(str).str.strip() != ""),
+                                tmp['ou_id']
                             )
-                        if 'Organisation unit' in df_final_p.columns and 'Promptitude_Globale (%)' in df_final_p.columns:
-                            df_prompt_map = df_final_p[['Organisation unit', 'Promptitude_Globale (%)']].copy()
-                            df_prompt_map['ou_id'] = df_prompt_map['Organisation unit'].map(mapping_ou_id)
-                            df_prompt_map['ou_id'] = df_prompt_map['ou_id'].where(
-                                df_prompt_map['ou_id'].notna(),
-                                df_prompt_map['Organisation unit'].map(lambda x: zone_id_mapping_norm.get(normalize_org_name(x)))
+                            tmp['Zone'] = tmp['Zone'].where(
+                                tmp['Zone'].notna() & (tmp['Zone'].astype(str).str.strip() != ""),
+                                tmp['Organisation unit']
                             )
-                            prompt_map_by_id = (
-                                df_prompt_map.dropna(subset=['ou_id'])
-                                .groupby('ou_id')['Promptitude_Globale (%)']
-                                .mean()
-                                .to_dict()
+                            return tmp
+
+                        if {'Organisation unit', 'Reports_Actual', 'Reports_Attendu'}.issubset(df_synthese.columns):
+                            df_comp_zone = _attach_zone_meta(
+                                df_synthese[['Organisation unit', 'Reports_Actual', 'Reports_Attendu']]
                             )
-                            prompt_map_by_name = (
-                                df_prompt_map.assign(_k=df_prompt_map['Organisation unit'].map(normalize_org_name))
-                                .groupby('_k')['Promptitude_Globale (%)']
-                                .mean()
-                                .to_dict()
+                            if not df_comp_zone.empty:
+                                df_comp_zone['Reports_Actual'] = pd.to_numeric(df_comp_zone['Reports_Actual'], errors='coerce').fillna(0)
+                                df_comp_zone['Reports_Attendu'] = pd.to_numeric(df_comp_zone['Reports_Attendu'], errors='coerce').fillna(0)
+                                grouped_comp = (
+                                    df_comp_zone
+                                    .groupby(['Zone_ID', 'Zone'], as_index=False)[['Reports_Actual', 'Reports_Attendu']]
+                                    .sum()
+                                )
+                                grouped_comp['Complétude_Globale'] = (
+                                    grouped_comp['Reports_Actual'] / grouped_comp['Reports_Attendu'].replace(0, np.nan) * 100
+                                ).fillna(0).round(2)
+
+                                actual_zone_by_id = grouped_comp.set_index('Zone_ID')['Reports_Actual'].to_dict()
+                                comp_zone_by_id = grouped_comp.set_index('Zone_ID')['Complétude_Globale'].to_dict()
+                                grouped_comp['_zone_key'] = grouped_comp['Zone'].map(normalize_org_name)
+                                actual_zone_by_name = grouped_comp.set_index('_zone_key')['Reports_Actual'].to_dict()
+                                comp_zone_by_name = grouped_comp.set_index('_zone_key')['Complétude_Globale'].to_dict()
+
+                        if {'Organisation unit', 'Reports_Actual_On_Time', 'Reports_Attendu'}.issubset(df_final_p.columns):
+                            df_prompt_zone = _attach_zone_meta(
+                                df_final_p[['Organisation unit', 'Reports_Actual_On_Time', 'Reports_Attendu']]
                             )
+                            if not df_prompt_zone.empty:
+                                df_prompt_zone['Reports_Actual_On_Time'] = pd.to_numeric(df_prompt_zone['Reports_Actual_On_Time'], errors='coerce').fillna(0)
+                                df_prompt_zone['Reports_Attendu'] = pd.to_numeric(df_prompt_zone['Reports_Attendu'], errors='coerce').fillna(0)
+                                grouped_prompt = (
+                                    df_prompt_zone
+                                    .groupby(['Zone_ID', 'Zone'], as_index=False)[['Reports_Actual_On_Time', 'Reports_Attendu']]
+                                    .sum()
+                                )
+                                grouped_prompt['Promptitude_Globale'] = (
+                                    grouped_prompt['Reports_Actual_On_Time'] / grouped_prompt['Reports_Attendu'].replace(0, np.nan) * 100
+                                ).fillna(0).round(2)
+
+                                prompt_zone_by_id = grouped_prompt.set_index('Zone_ID')['Promptitude_Globale'].to_dict()
+                                grouped_prompt['_zone_key'] = grouped_prompt['Zone'].map(normalize_org_name)
+                                prompt_zone_by_name = grouped_prompt.set_index('_zone_key')['Promptitude_Globale'].to_dict()
 
                         # 3) Violations par zone + ratio /100 + corrigées T vs T-1
                         rows_cat = []
                         for zone_name in zones_cibles:
                             zone_id = zone_id_mapping.get(zone_name) or zone_id_mapping_norm.get(normalize_org_name(zone_name))
                             zone_key = normalize_org_name(zone_name)
-                            comp_val = float(comp_map_by_id.get(zone_id, comp_map_by_name.get(zone_key, 0)))
-                            prompt_val = float(prompt_map_by_id.get(zone_id, prompt_map_by_name.get(zone_key, 0)))
-                            actual_val = float(actual_map_by_id.get(zone_id, actual_map_by_name.get(zone_key, 0)))
+                            comp_val = float(comp_zone_by_id.get(zone_id, comp_zone_by_name.get(zone_key, 0)))
+                            prompt_val = float(prompt_zone_by_id.get(zone_id, prompt_zone_by_name.get(zone_key, 0)))
+                            actual_val = float(actual_zone_by_id.get(zone_id, actual_zone_by_name.get(zone_key, 0)))
                             score_qualite = round((comp_val + prompt_val) / 2, 1)
                             if not zone_id or len(str(zone_id)) < 5:
                                 rows_cat.append({
@@ -983,6 +1646,7 @@ if df_raw is not None:
                             'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
                             'Score_Qualite': 'Score de qualité'
                         })
+                        df_tab5_export = df_display.copy()
 
                         st.dataframe(
                             df_display.style.format({
@@ -1003,7 +1667,7 @@ if df_raw is not None:
                         col_res2.metric("Total règles corrigées", int(df_cat['Violations_Corrigees'].sum()), delta=f"{int(df_cat['Violations_Corrigees'].sum())}")
 
                 else:
-                    st.error("L'ID de l'unité d'organisation est manquant dans les données sources.")
+                    st.error("L'ID de la zone de santé sélectionnée est manquant dans les données sources.")
         else:
             st.warning("⚠️ Impossible de charger les groupes de règles.")
 
@@ -1017,12 +1681,52 @@ if df_raw is not None:
             key="report_type_selector"
         )
 
+        export_style_context = {
+            "completude": {
+                "taux_cols": (col_rate_uniquement if 'col_rate_uniquement' in locals() else []) + ['Complétude_Globale (%)'],
+                "score_cols": ['Nombre des data set complétude >/=95%'],
+                "int_cols": ['Nombre des data set complétude >/=95%'],
+                "decimals": 2,
+            },
+            "promptitude": {
+                "taux_cols": (col_rate_ot if 'col_rate_ot' in locals() else []) + ['Promptitude_Globale (%)'],
+                "score_cols": [nom_col_score_p] if 'nom_col_score_p' in locals() else [],
+                "int_cols": [nom_col_score_p] if 'nom_col_score_p' in locals() else [],
+                "decimals": 2,
+            },
+            "synthese": {
+                "taux_cols": ['Complétude_Globale (%)', 'Promptitude_Globale (%)'],
+                "decimals": 2,
+            },
+            "comparatif": {
+                "taux_cols": ['Complétude_Globale (%)', 'Promptitude_Globale (%)'],
+                "score_cols": ['Nombre de dataset complétude >/= 95%', 'Nombre de dataset promptitude >/= 95%'],
+                "int_cols": ['Nombre de dataset complétude >/= 95%', 'Nombre de dataset promptitude >/= 95%'],
+                "decimals": 2,
+            },
+            "fusion": {
+                "taux_cols": ['Complétude', 'Promptitude'],
+                "score_cols": ['Nombre de dataset complétude >/= 95%', 'Nombre de dataset promptitude >/= 95%'],
+                "int_cols": ['Nombre de dataset complétude >/= 95%', 'Nombre de dataset promptitude >/= 95%'],
+                "decimals": 2,
+            },
+            "tab5": {
+                "taux_cols": ['Complétude globale (%)', 'Promptitude globale (%)', 'Score de qualité'],
+                "highlight_max_cols": ['Règles violées (M)'],
+                "ratio_alert_col": 'Ratio / 100 rapports',
+                "ratio_alert_threshold": 10.0,
+                "int_cols": ['Règles violées (M-1)', 'Règles corrigées (M-1 -> M)', 'Règles violées (M)'],
+                "decimals": 2,
+            },
+        }
+
         comments_df = build_dashboard_comments_df(
             df_final_c=df_final_c,
             df_final_p=df_final_p,
             df_synth=df_synth,
-            selected_zone=selected_zone,
-            df_tab4_fusion=df_tab4_fusion
+            selected_zone=selected_scope_label,
+            df_tab4_fusion=df_tab4_fusion,
+            df_tab5=df_tab5_export
         )
 
         export_bytes = None
@@ -1036,7 +1740,10 @@ if df_raw is not None:
                 df_final_p=df_final_p,
                 df_synth=df_synth,
                 comments_df=comments_df,
-                df_tab4_fusion=df_tab4_fusion
+                df_tab4_fusion=df_tab4_fusion,
+                df_comparatif=df_comparatif,
+                df_tab5=df_tab5_export,
+                style_context=export_style_context
             )
             export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -1046,7 +1753,12 @@ if df_raw is not None:
                 df_final_p=df_final_p,
                 df_synth=df_synth,
                 comments_df=comments_df,
-                df_tab4_fusion=df_tab4_fusion
+                df_tab4_fusion=df_tab4_fusion,
+                fig_comp=fig_comp,
+                fig_quad=fig_quad,
+                df_comparatif=df_comparatif,
+                df_tab5=df_tab5_export,
+                style_context=export_style_context
             )
             export_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
@@ -1057,7 +1769,11 @@ if df_raw is not None:
                 fig_comp=fig_comp,
                 fig_quad=fig_quad,
                 df_comparatif=df_comparatif,
-                df_tab4_fusion=df_tab4_fusion
+                df_tab4_fusion=df_tab4_fusion,
+                df_final_c=df_final_c,
+                df_final_p=df_final_p,
+                df_tab5=df_tab5_export,
+                style_context=export_style_context
             )
             export_mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.pptx"
