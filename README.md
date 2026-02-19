@@ -6,7 +6,7 @@ Application Streamlit pour analyser la performance SNIS (DHIS2) avec:
 - comparaison entre zones/aires de santé
 - filtrage hiérarchique `Synthèse pays` / `Province` / `Zone de santé`
 - analyse des violations de règles de validation
-- export commenté en **Excel / Word / PowerPoint**
+- export commenté en **Excel / PowerPoint**
 
 Le script principal est: `dashbord.py`.
 
@@ -46,14 +46,16 @@ Le dashboard est organisé en 5 onglets:
 ## 2. Export de rapport
 
 Depuis la **sidebar**:
-- Choix du type de téléchargement: `Excel`, `Word`, `PowerPoint`
+- Choix du type de téléchargement: `Excel`, `PowerPoint`
 - Bouton de téléchargement dynamique selon le type choisi
+- Bouton `Visualiser le rapport` pour consulter l'aperçu complet sans télécharger
 
 Le rapport exporté inclut:
 - tableaux principaux
 - commentaires automatiques (lecture des graphiques et tableaux)
 - conservation des colorations conditionnelles du dashboard dans les tableaux exportés
 - (PowerPoint) images des graphiques et tableaux
+- feuilles/slides dédiées: base de données, rapports détaillés (réels/attendus), performance finale, promptitude, comparatif, top/flop, résultats des règles
 
 ## 3. Prérequis
 

@@ -39,6 +39,113 @@ def normalize_org_name(name):
         return ""
     return " ".join(str(name).strip().lower().split())
 
+def _find_best_column(columns, exact_names=None, include_terms=None, exclude_terms=None):
+    """
+    Trouve la meilleure colonne selon noms exacts ou termes inclus/exclus.
+    Retourne None si non trouvée.
+    """
+    cols = list(columns)
+    exact_names = exact_names or []
+    include_terms = include_terms or []
+    exclude_terms = exclude_terms or []
+
+    for name in exact_names:
+        if name in cols:
+            return name
+
+    for col in cols:
+        col_l = str(col).strip().lower()
+        if include_terms and not all(term in col_l for term in include_terms):
+            continue
+        if exclude_terms and any(term in col_l for term in exclude_terms):
+            continue
+        return col
+    return None
+
+def normalize_orgunit_columns(df):
+    """
+    Normalise les colonnes organisationnelles vers:
+    - Organisation unit
+    - Organisation unit ID (si disponible)
+    - Organisation unit is parent (si disponible)
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+
+    out = df.copy()
+    cols = out.columns.tolist()
+
+    # Colonne nom d'unité
+    org_col = _find_best_column(
+        cols,
+        exact_names=["Organisation unit", "Organisation Unit", "Org unit", "Org Unit"],
+        include_terms=["organisation", "unit"],
+        exclude_terms=["id", "uid", "code", "description", "parameter", "is parent"]
+    )
+    if org_col is None:
+        org_col = _find_best_column(
+            cols,
+            include_terms=["org", "unit"],
+            exclude_terms=["id", "uid", "code", "description", "parameter", "is parent"]
+        )
+    if org_col is None and len(cols) > 0:
+        # Fallback: première colonne non métrique
+        metric_terms = ["reporting rate", "actual reports", "expected reports", "ratio", "score"]
+        fallback_cols = [c for c in cols if not any(t in str(c).lower() for t in metric_terms)]
+        org_col = fallback_cols[0] if fallback_cols else cols[0]
+
+    # Colonne ID d'unité
+    id_col = _find_best_column(
+        cols,
+        exact_names=["Organisation unit ID", "Organisation Unit ID", "Org unit ID", "Organisation unit UID", "ou"],
+        include_terms=["organisation", "unit", "id"]
+    )
+    if id_col is None:
+        id_col = _find_best_column(
+            cols,
+            include_terms=["org", "unit", "id"]
+        )
+    if id_col is None:
+        id_col = _find_best_column(
+            cols,
+            include_terms=["organisation", "unit", "uid"]
+        )
+    if id_col is None:
+        id_col = _find_best_column(
+            cols,
+            include_terms=["org", "unit", "uid"]
+        )
+    if id_col is None and "ou" in cols:
+        id_col = "ou"
+
+    # Colonne parent (optionnelle)
+    parent_col = _find_best_column(
+        cols,
+        exact_names=["Organisation unit is parent"],
+        include_terms=["is parent"]
+    )
+    if parent_col is None:
+        parent_col = _find_best_column(
+            cols,
+            include_terms=["organisation", "unit", "parent"]
+        )
+
+    rename_map = {}
+    if org_col and org_col != "Organisation unit":
+        rename_map[org_col] = "Organisation unit"
+    if id_col and id_col != "Organisation unit ID":
+        rename_map[id_col] = "Organisation unit ID"
+    if parent_col and parent_col != "Organisation unit is parent":
+        rename_map[parent_col] = "Organisation unit is parent"
+    if rename_map:
+        out = out.rename(columns=rename_map)
+
+    # Garantir l'existence de la colonne organisation unit pour éviter les KeyError
+    if "Organisation unit" not in out.columns:
+        out["Organisation unit"] = "Unité non renseignée"
+
+    return out
+
 def _extract_identifier(value):
     """Extrait un identifiant stable depuis un champ DHIS2 (dict ou string)."""
     if isinstance(value, dict):
@@ -154,7 +261,20 @@ def _extract_css_values(css_text):
             bold = True
     return text_color, bg_color, bold
 
-def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone, df_tab4_fusion=None, df_tab5=None):
+def build_dashboard_comments_df(
+    df_final_c,
+    df_final_p,
+    df_synth,
+    selected_zone,
+    df_tab4_fusion=None,
+    df_tab5=None,
+    df_base=None,
+    df_actual_detail=None,
+    df_expected_detail=None,
+    df_comparatif=None,
+    df_top5=None,
+    df_flop5=None,
+):
     """Prépare des commentaires clairs pour graphiques et tableaux exportés."""
     zone_label = selected_zone if selected_zone != "Toutes les zones" else "Toutes les zones"
     comp_avg = float(df_synth['Complétude_Globale (%)'].mean()) if not df_synth.empty else 0.0
@@ -175,6 +295,27 @@ def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone,
             "Commentaire": (
                 f"Complétude moyenne {comp_avg:.2f}%. Les cellules colorées reprennent strictement la logique du dashboard. "
                 "Priorité: unités en rouge/bordeaux."
+            )
+        },
+        {
+            "Element": "Base de données",
+            "Commentaire": (
+                "Cette feuille reprend les données sources filtrées (niveau, période, zone). "
+                "Elle sert de référence brute pour toutes les analyses."
+            )
+        },
+        {
+            "Element": "Rapports détaillés - Données réelles",
+            "Commentaire": (
+                "Ce tableau détaille les 'Actual reports' par indicateur et la somme Reports_Actual. "
+                "Il reflète le volume réel des notifications."
+            )
+        },
+        {
+            "Element": "Rapports détaillés - Participants/Attendus",
+            "Commentaire": (
+                "Ce tableau présente les 'Expected reports' et la somme Reports_Attendu. "
+                "Il représente le dénominateur attendu pour les taux."
             )
         },
         {
@@ -213,6 +354,14 @@ def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone,
             )
         },
         {
+            "Element": "Top 5 Complétude",
+            "Commentaire": "Classement des 5 unités avec les meilleurs taux de complétude."
+        },
+        {
+            "Element": "Flop 5 Promptitude",
+            "Commentaire": "Classement des 5 unités avec les plus faibles taux de promptitude."
+        },
+        {
             "Element": "Onglet 5 - Tableau Catégorisation",
             "Commentaire": (
                 "Le tableau compare M-1 et M: règles violées, règles corrigées et ratio /100 rapports. "
@@ -245,6 +394,9 @@ def build_dashboard_comments_df(df_final_c, df_final_p, df_synth, selected_zone,
     return pd.DataFrame(rows)
 
 def to_excel_dashboard_report(
+    df_base,
+    df_actual_detail,
+    df_expected_detail,
     df_final_c,
     df_final_p,
     df_synth,
@@ -252,44 +404,77 @@ def to_excel_dashboard_report(
     df_tab4_fusion=None,
     df_comparatif=None,
     df_tab5=None,
+    df_top5=None,
+    df_flop5=None,
     style_context=None
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        sty_base = _build_styler(df_base, **style_context.get("base", {}))
+        (sty_base if sty_base is not None else df_base).to_excel(
+            writer, index=False, sheet_name='Base_Donnees'
+        )
+
+        sty_actual = _build_styler(df_actual_detail, **style_context.get("actual_detail", {}))
+        (sty_actual if sty_actual is not None else df_actual_detail).to_excel(
+            writer, index=False, sheet_name='Detail_Donnees_Reelles'
+        )
+
+        sty_expected = _build_styler(df_expected_detail, **style_context.get("expected_detail", {}))
+        (sty_expected if sty_expected is not None else df_expected_detail).to_excel(
+            writer, index=False, sheet_name='Detail_Reports_Attendus'
+        )
+
         sty_comp = _build_styler(df_final_c, **style_context.get("completude", {}))
         (sty_comp if sty_comp is not None else df_final_c).to_excel(
-            writer, index=False, sheet_name='Onglet2_Completude'
+            writer, index=False, sheet_name='Perf_Final_Completude'
         )
 
         sty_prom = _build_styler(df_final_p, **style_context.get("promptitude", {}))
         (sty_prom if sty_prom is not None else df_final_p).to_excel(
-            writer, index=False, sheet_name='Onglet3_Promptitude'
+            writer, index=False, sheet_name='Analyse_Promptitude'
         )
 
         sty_synth = _build_styler(df_synth, **style_context.get("synthese", {}))
         (sty_synth if sty_synth is not None else df_synth).to_excel(
-            writer, index=False, sheet_name='Onglet4_Comparatif'
+            writer, index=False, sheet_name='Synthese_Comparative'
         )
 
         if df_comparatif is not None and not df_comparatif.empty:
             sty_compa = _build_styler(df_comparatif, **style_context.get("comparatif", {}))
             (sty_compa if sty_compa is not None else df_comparatif).to_excel(
-                writer, index=False, sheet_name='Onglet4_Tab_Comp'
+                writer, index=False, sheet_name='Comparatif_C_P'
             )
 
         if df_tab4_fusion is not None and not df_tab4_fusion.empty:
             sty_fusion = _build_styler(df_tab4_fusion, **style_context.get("fusion", {}))
             (sty_fusion if sty_fusion is not None else df_tab4_fusion).to_excel(
-                writer, index=False, sheet_name='Onglet4_Fusion_Zone'
+                writer, index=False, sheet_name='Perf_Zone_Filtree'
+            )
+
+        if df_top5 is not None and not df_top5.empty:
+            sty_top5 = _build_styler(df_top5, **style_context.get("top5", {}))
+            (sty_top5 if sty_top5 is not None else df_top5).to_excel(
+                writer, index=False, sheet_name='Top5_Completude'
+            )
+
+        if df_flop5 is not None and not df_flop5.empty:
+            sty_flop5 = _build_styler(df_flop5, **style_context.get("flop5", {}))
+            (sty_flop5 if sty_flop5 is not None else df_flop5).to_excel(
+                writer, index=False, sheet_name='Flop5_Promptitude'
             )
 
         if df_tab5 is not None and not df_tab5.empty:
             sty_tab5 = _build_styler(df_tab5, **style_context.get("tab5", {}))
             (sty_tab5 if sty_tab5 is not None else df_tab5).to_excel(
-                writer, index=False, sheet_name='Onglet5_Categorisation'
+                writer, index=False, sheet_name='Resultats_Regles'
             )
+        else:
+            pd.DataFrame(
+                [{"Information": "Aucun résultat de règles. Lancez d'abord l'analyse des violations (onglet 5)."}]
+            ).to_excel(writer, index=False, sheet_name='Resultats_Regles')
 
         comments_df.to_excel(writer, index=False, sheet_name='Commentaires')
     return output.getvalue()
@@ -568,6 +753,11 @@ def to_powerpoint_dashboard_report(
     df_final_c=None,
     df_final_p=None,
     df_tab5=None,
+    df_base=None,
+    df_actual_detail=None,
+    df_expected_detail=None,
+    df_top5=None,
+    df_flop5=None,
     style_context=None
 ):
     """Exporte un PowerPoint avec graphiques + tableaux colorés + commentaires clairs."""
@@ -603,6 +793,48 @@ def to_powerpoint_dashboard_report(
             "Tableau Complétude (coloré)",
             _comment_for(comments_df, "Tableau Complétude", "Lecture détaillée de la complétude par unité."),
             img_tab_comp
+        )
+
+    # 1-ter) Base de données
+    if df_base is not None and not df_base.empty:
+        img_base, _ = dataframe_to_png_bytes(
+            df_base,
+            title="Base de données",
+            style_context=style_context.get("base", {})
+        )
+        _add_image_slide(
+            prs,
+            "Base de données",
+            _comment_for(comments_df, "Base de données", "Données sources utilisées après filtres."),
+            img_base
+        )
+
+    # 1-quater) Rapports détaillés données réelles
+    if df_actual_detail is not None and not df_actual_detail.empty:
+        img_actual, _ = dataframe_to_png_bytes(
+            df_actual_detail,
+            title="Rapports détaillés - Données réelles",
+            style_context=style_context.get("actual_detail", {})
+        )
+        _add_image_slide(
+            prs,
+            "Rapports détaillés - Données réelles",
+            _comment_for(comments_df, "Données réelles", "Détail des actual reports et total Reports_Actual."),
+            img_actual
+        )
+
+    # 1-quint) Rapports détaillés participants/attendus
+    if df_expected_detail is not None and not df_expected_detail.empty:
+        img_expected, _ = dataframe_to_png_bytes(
+            df_expected_detail,
+            title="Rapports détaillés - Participants/Attendus",
+            style_context=style_context.get("expected_detail", {})
+        )
+        _add_image_slide(
+            prs,
+            "Rapports détaillés - Participants/Attendus",
+            _comment_for(comments_df, "Participants/Attendus", "Détail des expected reports et total Reports_Attendu."),
+            img_expected
         )
 
     # 2) Quadrant comparatif
@@ -655,6 +887,34 @@ def to_powerpoint_dashboard_report(
             img_fusion
         )
 
+    # 4-bis) Top 5 complétude
+    if df_top5 is not None and not df_top5.empty:
+        img_top5, _ = dataframe_to_png_bytes(
+            df_top5,
+            title="Top 5 Complétude",
+            style_context=style_context.get("top5", {})
+        )
+        _add_image_slide(
+            prs,
+            "Top 5 Complétude",
+            _comment_for(comments_df, "Top 5 Complétude", "Unités les plus performantes en complétude."),
+            img_top5
+        )
+
+    # 4-ter) Flop 5 promptitude
+    if df_flop5 is not None and not df_flop5.empty:
+        img_flop5, _ = dataframe_to_png_bytes(
+            df_flop5,
+            title="Flop 5 Promptitude",
+            style_context=style_context.get("flop5", {})
+        )
+        _add_image_slide(
+            prs,
+            "Flop 5 Promptitude",
+            _comment_for(comments_df, "Flop 5 Promptitude", "Unités prioritaires à renforcer en promptitude."),
+            img_flop5
+        )
+
     # 5) Tableau catégorisation (si disponible)
     if df_tab5 is not None and not df_tab5.empty:
         img_tab5, _ = dataframe_to_png_bytes(
@@ -667,6 +927,13 @@ def to_powerpoint_dashboard_report(
             "Tableau Catégorisation (coloré)",
             _comment_for(comments_df, "Catégorisation", "Lecture des violations, corrections et ratio /100 rapports."),
             img_tab5
+        )
+    else:
+        _add_image_slide(
+            prs,
+            "Résultats des règles de validation",
+            "Aucun résultat à afficher. Lancez d'abord l'analyse des violations dans l'onglet 5.",
+            None
         )
 
     s = prs.slides.add_slide(prs.slide_layouts[1])
@@ -1027,6 +1294,7 @@ with st.sidebar:
     dict_favoris = {
         "Performance Globale (ROzCY14OLTE)": "ROzCY14OLTE",
         "Analyse Promptitude (mldsgxAvIIi)": "mldsgxAvIIi",
+        "Rapport TyAJb0qitMz": "TyAJb0qitMz",
         "Autre ID personnalisé": "CUSTOM"
     }
     choix_fav = st.selectbox("Rapport DHIS2 :", list(dict_favoris.keys()))
@@ -1061,6 +1329,8 @@ with st.sidebar:
 # --- 4. CHARGEMENT & FILTRAGE DES DONNÉES ---
 current_user_for_cache = st.session_state.get("dhis2_user", "")
 df_raw = get_data(id_final, period=period_id, cache_user=current_user_for_cache)
+if df_raw is not None:
+    df_raw = normalize_orgunit_columns(df_raw)
 
 if df_raw is not None:
     # Récupération dynamique de l'ID de l'unité d'organisation (OrgUnit ID)
@@ -1199,6 +1469,32 @@ if df_raw is not None:
             current_id_systeme = zone_to_id.get(selected_zone) or mapping_ou_id.get(selected_zone)
             selected_scope_label = f"Zone {selected_zone}"
 
+    # Garde-fou final: garantir la colonne 'Organisation unit' après tous les filtres.
+    if "Organisation unit" not in target_df_all.columns:
+        target_df_all = normalize_orgunit_columns(target_df_all)
+    if "Organisation unit" not in target_df.columns:
+        target_df = normalize_orgunit_columns(target_df)
+
+    if "Organisation unit" not in target_df.columns:
+        fallback_org_col = _find_best_column(
+            target_df.columns.tolist(),
+            include_terms=["organisation", "unit"]
+        ) or _find_best_column(
+            target_df.columns.tolist(),
+            include_terms=["org", "unit"]
+        )
+
+        if fallback_org_col and fallback_org_col in target_df.columns:
+            target_df = target_df.rename(columns={fallback_org_col: "Organisation unit"})
+        elif target_df.shape[1] > 0:
+            # Dernier recours: créer la colonne à partir de la première colonne disponible.
+            target_df = target_df.copy()
+            target_df["Organisation unit"] = target_df.iloc[:, 0].astype(str)
+            st.warning("La colonne 'Organisation unit' n'était pas fournie par le favori. Un fallback a été appliqué.")
+        else:
+            st.error("Impossible d'identifier les unités d'organisation dans ce favori DHIS2.")
+            st.stop()
+
     if target_df.empty:
         st.warning("Aucune donnée trouvée avec ce niveau de filtre.")
 
@@ -1212,6 +1508,11 @@ if df_raw is not None:
     df_tab4_fusion = pd.DataFrame()
     df_comparatif = pd.DataFrame()
     df_tab5_export = pd.DataFrame()
+    df_tab1_export = pd.DataFrame()
+    df_actual_detail_export = pd.DataFrame()
+    df_expected_detail_export = pd.DataFrame()
+    df_top5_export = pd.DataFrame()
+    df_flop5_export = pd.DataFrame()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📁 Base de données", "✅ Complétude", "⏱️ Promptitude", "⚖️ Analyse Comparative", "🩺 Éléments de catégorisation"])
 
@@ -1229,6 +1530,7 @@ if df_raw is not None:
             st.warning("Aucune aire de santé à afficher avec ce filtre.")
         else:
             st.dataframe(df_tab1.head(15), use_container_width=True)
+        df_tab1_export = df_tab1.copy()
 
     # --- ONGLET 2 : COMPLÉTUDE ---
     with tab2:
@@ -1239,6 +1541,7 @@ if df_raw is not None:
             for col in col_actual_strict: df_actual[col] = pd.to_numeric(df_actual[col], errors='coerce').fillna(0)
             df_actual['Reports_Actual'] = df_actual[col_actual_strict].sum(axis=1).round(2)
             with st.expander("Détail Reports Actuals"): st.dataframe(df_actual.head(15))
+            df_actual_detail_export = df_actual.copy()
 
         col_expected_strict = [c for c in target_df.columns if 'expected reports' in c.lower() and 'time' not in c.lower()]
         if col_expected_strict:
@@ -1246,6 +1549,7 @@ if df_raw is not None:
             for col in col_expected_strict: df_expected[col] = pd.to_numeric(df_expected[col], errors='coerce').fillna(0)
             df_expected['Reports_Attendu'] = df_expected[col_expected_strict].sum(axis=1).round(2)
             with st.expander("Détail Reports Attendus"): st.dataframe(df_expected.head(15))
+            df_expected_detail_export = df_expected.copy()
 
         col_rate_uniquement = [c for c in target_df.columns if 'reporting rate' in c.lower() and 'on time' not in c.lower()]
         df_affichage = target_df[['Organisation unit']].copy()
@@ -1272,7 +1576,7 @@ if df_raw is not None:
 
         st.divider()
         fig_comp = px.bar(df_final_c.sort_values('Complétude_Globale (%)'), x='Complétude_Globale (%)', y='Organisation unit', orientation='h', color='Complétude_Globale (%)', color_continuous_scale='RdYlGn', title="Classement des zones")
-        st.plotly_chart(fig_comp, use_container_width=True, config=plotly_config)
+        st.plotly_chart(fig_comp, use_container_width=True, config=plotly_config, key="chart_comp_tab2")
 
     # --- ONGLET 3 : PROMPTITUDE ---
     with tab3:
@@ -1405,15 +1709,17 @@ if df_raw is not None:
         fig_quad = px.scatter(df_synth, x='Complétude_Globale (%)', y='Promptitude_Globale (%)', text='Organisation unit', range_x=[0, 110], range_y=[0, 110])
         fig_quad.add_hline(y=80, line_dash="dot", line_color="red")
         fig_quad.add_vline(x=80, line_dash="dot", line_color="red")
-        st.plotly_chart(fig_quad, use_container_width=True)
+        st.plotly_chart(fig_quad, use_container_width=True, key="chart_quad_tab4")
 
         col_l, col_r = st.columns(2)
         with col_l:
             st.success("🏆 **Top 5 Complétude**")
-            st.table(df_synth.nlargest(5, 'Complétude_Globale (%)')[['Organisation unit', 'Complétude_Globale (%)']].round(1))
+            df_top5_export = df_synth.nlargest(5, 'Complétude_Globale (%)')[['Organisation unit', 'Complétude_Globale (%)']].round(1)
+            st.table(df_top5_export)
         with col_r:
             st.error("⚠️ **Flop 5 Promptitude**")
-            st.table(df_synth.nsmallest(5, 'Promptitude_Globale (%)')[['Organisation unit', 'Promptitude_Globale (%)']].round(1))
+            df_flop5_export = df_synth.nsmallest(5, 'Promptitude_Globale (%)')[['Organisation unit', 'Promptitude_Globale (%)']].round(1)
+            st.table(df_flop5_export)
 
     # --- ONGLET 5 : ÉLÉMENTS DE CATÉGORISATION (CORRECTIF APPLIQUÉ SUR TON SCRIPT) ---
     with tab5:
@@ -1677,11 +1983,20 @@ if df_raw is not None:
         st.subheader("📤 Extraction du rapport")
         report_type = st.selectbox(
             "Type de téléchargement :",
-            ["Excel", "Word", "PowerPoint"],
+            ["Excel"],
             key="report_type_selector"
         )
 
         export_style_context = {
+            "base": {
+                "decimals": 2,
+            },
+            "actual_detail": {
+                "decimals": 2,
+            },
+            "expected_detail": {
+                "decimals": 2,
+            },
             "completude": {
                 "taux_cols": (col_rate_uniquement if 'col_rate_uniquement' in locals() else []) + ['Complétude_Globale (%)'],
                 "score_cols": ['Nombre des data set complétude >/=95%'],
@@ -1718,6 +2033,14 @@ if df_raw is not None:
                 "int_cols": ['Règles violées (M-1)', 'Règles corrigées (M-1 -> M)', 'Règles violées (M)'],
                 "decimals": 2,
             },
+            "top5": {
+                "taux_cols": ['Complétude_Globale (%)'],
+                "decimals": 2,
+            },
+            "flop5": {
+                "taux_cols": ['Promptitude_Globale (%)'],
+                "decimals": 2,
+            },
         }
 
         comments_df = build_dashboard_comments_df(
@@ -1726,7 +2049,13 @@ if df_raw is not None:
             df_synth=df_synth,
             selected_zone=selected_scope_label,
             df_tab4_fusion=df_tab4_fusion,
-            df_tab5=df_tab5_export
+            df_tab5=df_tab5_export,
+            df_base=df_tab1_export,
+            df_actual_detail=df_actual_detail_export,
+            df_expected_detail=df_expected_detail_export,
+            df_comparatif=df_comparatif,
+            df_top5=df_top5_export,
+            df_flop5=df_flop5_export
         )
 
         export_bytes = None
@@ -1734,49 +2063,23 @@ if df_raw is not None:
         export_name = None
         export_error = None
 
-        if report_type == "Excel":
-            export_bytes = to_excel_dashboard_report(
-                df_final_c=df_final_c,
-                df_final_p=df_final_p,
-                df_synth=df_synth,
-                comments_df=comments_df,
-                df_tab4_fusion=df_tab4_fusion,
-                df_comparatif=df_comparatif,
-                df_tab5=df_tab5_export,
-                style_context=export_style_context
-            )
-            export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        elif report_type == "Word":
-            export_bytes, export_error = to_word_dashboard_report(
-                df_final_c=df_final_c,
-                df_final_p=df_final_p,
-                df_synth=df_synth,
-                comments_df=comments_df,
-                df_tab4_fusion=df_tab4_fusion,
-                fig_comp=fig_comp,
-                fig_quad=fig_quad,
-                df_comparatif=df_comparatif,
-                df_tab5=df_tab5_export,
-                style_context=export_style_context
-            )
-            export_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
-        else:
-            export_bytes, export_error = to_powerpoint_dashboard_report(
-                df_synth=df_synth,
-                comments_df=comments_df,
-                fig_comp=fig_comp,
-                fig_quad=fig_quad,
-                df_comparatif=df_comparatif,
-                df_tab4_fusion=df_tab4_fusion,
-                df_final_c=df_final_c,
-                df_final_p=df_final_p,
-                df_tab5=df_tab5_export,
-                style_context=export_style_context
-            )
-            export_mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.pptx"
+        export_bytes = to_excel_dashboard_report(
+            df_base=df_tab1_export,
+            df_actual_detail=df_actual_detail_export,
+            df_expected_detail=df_expected_detail_export,
+            df_final_c=df_final_c,
+            df_final_p=df_final_p,
+            df_synth=df_synth,
+            comments_df=comments_df,
+            df_tab4_fusion=df_tab4_fusion,
+            df_comparatif=df_comparatif,
+            df_tab5=df_tab5_export,
+            df_top5=df_top5_export,
+            df_flop5=df_flop5_export,
+            style_context=export_style_context
+        )
+        export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
 
         if export_bytes is not None:
             st.download_button(
@@ -1789,5 +2092,59 @@ if df_raw is not None:
             )
         else:
             st.info(export_error if export_error else "Export indisponible.")
+
+        st.divider()
+        if "show_report_preview" not in st.session_state:
+            st.session_state["show_report_preview"] = False
+        col_prev1, col_prev2 = st.columns(2)
+        if col_prev1.button("Visualiser le rapport", use_container_width=True):
+            st.session_state["show_report_preview"] = True
+        if col_prev2.button("Masquer la vue", use_container_width=True):
+            st.session_state["show_report_preview"] = False
+
+    if st.session_state.get("show_report_preview", False):
+        st.divider()
+        st.subheader("👁️ Visualisation consolidée du rapport")
+        st.caption("Aperçu interactif des manipulations en cours (filtres, période, niveau).")
+
+        p_tabs = st.tabs([
+            "Base de données",
+            "Données réelles",
+            "Participants/Attendus",
+            "Perf finale",
+            "Promptitude",
+            "Comparatif",
+            "Top/Flop",
+            "Règles",
+            "Commentaires",
+        ])
+
+        with p_tabs[0]:
+            st.dataframe(df_tab1_export, use_container_width=True)
+        with p_tabs[1]:
+            st.dataframe(df_actual_detail_export, use_container_width=True)
+        with p_tabs[2]:
+            st.dataframe(df_expected_detail_export, use_container_width=True)
+        with p_tabs[3]:
+            st.dataframe(df_final_c, use_container_width=True)
+        with p_tabs[4]:
+            st.dataframe(df_final_p, use_container_width=True)
+        with p_tabs[5]:
+            st.dataframe(df_comparatif, use_container_width=True)
+            if not df_tab4_fusion.empty:
+                st.write("Tableau fusionné zone filtrée")
+                st.dataframe(df_tab4_fusion, use_container_width=True)
+        with p_tabs[6]:
+            cprev1, cprev2 = st.columns(2)
+            with cprev1:
+                st.write("Top 5 complétude")
+                st.dataframe(df_top5_export, use_container_width=True)
+            with cprev2:
+                st.write("Flop 5 promptitude")
+                st.dataframe(df_flop5_export, use_container_width=True)
+        with p_tabs[7]:
+            st.dataframe(df_tab5_export, use_container_width=True)
+        with p_tabs[8]:
+            st.dataframe(comments_df, use_container_width=True)
 else:
     st.error("❌ Données indisponibles.")
