@@ -83,6 +83,21 @@ sources. La déconnexion efface ce résultat.
 Si plusieurs mois sont sélectionnés, M est cet ensemble de mois et M-1 reste le mois
 précédant son début ; les signatures de violations sont dédupliquées entre les mois.
 
+Pour consulter les résultats de catégorisation :
+
+- **Rechercher une zone** ignore les accents, la casse et les espaces supplémentaires.
+- **Afficher les résultats** permet de garder les scores complets, les scores incomplets
+  ou les scores inférieurs à 80, sans modifier les notes.
+- **Trier les résultats** propose l'ordre initial, le score croissant/décroissant ou le nom.
+- Le nombre de lignes affichées est indiqué. La recherche, le filtre de score et le tri
+  concernent uniquement le tableau à l'écran : les indicateurs, l'aperçu et l'export Excel
+  gardent l'analyse complète du périmètre géographique sélectionné.
+
+L'analyse affiche sa progression par zone et conserve sa date de réalisation, en heure
+de Kinshasa, lors des changements de vue. L'option **Toutes les règles (Global)** reste
+disponible même si aucun groupe de règles n'est configuré. Si la liste des groupes est
+indisponible, un message le précise sans bloquer cette option globale.
+
 Le filtrage s'applique à tous les tableaux, graphiques, exports et règles de validation :
 
 - **Pays** : toutes les zones de santé du pays sélectionné.
@@ -102,6 +117,12 @@ avec une dimension organisationnelle bornée au pays, à la province ou à la zo
 Les périodes sont agrégées par DHIS2 avant le calcul des taux. Les filtres complexes
 non représentables sont signalés, sans retirer silencieusement une restriction du favori.
 Référence : [dimensions et niveaux de l'API DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
+
+Le bouton **Actualiser les données**, dans la barre latérale, recharge catalogue,
+données et groupes pour la session en cours. Il invalide son ancienne catégorisation
+et ferme l'aperçu : l'analyse des violations doit être relancée. Cette actualisation
+ne purge pas le cache de données des autres sessions. Une sélection de mois inversée
+interrompt le chargement et retire les anciens résultats jusqu'à correction.
 
 ## 2. Export de rapport
 
@@ -164,6 +185,7 @@ Ensuite:
 Extraction_Favori/
 |- dashbord.py
 |- categorisation.py
+|- categorisation_view.py
 |- reporting_metrics.py
 |- geography.py
 |- scoped_analytics.py
