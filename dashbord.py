@@ -8,6 +8,13 @@ from urllib3.util.retry import Retry
 import io
 import os
 from datetime import datetime
+from categorisation import (
+    NOTE_COLS, TOTAL_COL, build_baremes_df, calculer_categorisation,
+    style_context_tab5, style_note_20,
+)
+from reporting_metrics import attach_reporting_scope, clean_ou_id, count_datasets_95
+from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
+from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="SNIS RDC - Dashboard Performance", layout="wide")
@@ -199,7 +206,8 @@ def _build_styler(
     decimals=2,
     highlight_max_cols=None,
     ratio_alert_col=None,
-    ratio_alert_threshold=10.0
+    ratio_alert_threshold=10.0,
+    note_cols=None
 ):
     """Construit un Styler pandas avec les mêmes règles de couleurs que le dashboard."""
     if df is None or df.empty:
@@ -207,6 +215,7 @@ def _build_styler(
 
     taux_cols = [c for c in (taux_cols or []) if c in df.columns]
     score_cols = [c for c in (score_cols or []) if c in df.columns]
+    note_cols = [c for c in (note_cols or []) if c in df.columns]
     int_cols = [c for c in (int_cols or []) if c in df.columns]
     highlight_max_cols = [c for c in (highlight_max_cols or []) if c in df.columns]
 
@@ -223,6 +232,8 @@ def _build_styler(
         styler = styler.map(style_taux, subset=taux_cols)
     if score_cols:
         styler = styler.map(style_score, subset=score_cols)
+    if note_cols:
+        styler = styler.map(style_note_20, subset=note_cols)
     if highlight_max_cols:
         styler = styler.highlight_max(subset=highlight_max_cols, color="#ffcccc")
     if ratio_alert_col and ratio_alert_col in df.columns:
@@ -365,7 +376,10 @@ def build_dashboard_comments_df(
             "Element": "Onglet 5 - Tableau Catégorisation",
             "Commentaire": (
                 "Le tableau compare M-1 et M: règles violées, règles corrigées et ratio /100 rapports. "
-                "Le ratio élevé (texte rouge) signale un risque qualité prioritaire."
+                "Le score de catégorisation /100 additionne les notes de complétude, promptitude, "
+                "datasets à complétude >=95%, violations et corrections. "
+                "Le score de qualité historique reste distinct de ce total. "
+                "Les barèmes DPS/ZS sont détaillés dans la feuille Baremes_Categorisation."
             )
         },
     ]
@@ -386,7 +400,8 @@ def build_dashboard_comments_df(
                 "Element": "Onglet 5 - Lecture décisionnelle",
                 "Commentaire": (
                     "Comparer d'abord 'Règles violées (M)' puis 'Règles corrigées (M-1 -> M)'. "
-                    "Un ratio qui baisse avec des règles corrigées en hausse indique une amélioration."
+                    "La note des corrections vaut 20 si aucune violation de M-1 ne reste à corriger. "
+                    "Une note ou un total vide indique une donnée indisponible, précisée dans le statut."
                 )
             }
         )
@@ -475,6 +490,19 @@ def to_excel_dashboard_report(
             pd.DataFrame(
                 [{"Information": "Aucun résultat de règles. Lancez d'abord l'analyse des violations (onglet 5)."}]
             ).to_excel(writer, index=False, sheet_name='Resultats_Regles')
+
+        build_baremes_df().to_excel(writer, index=False, sheet_name='Baremes_Categorisation')
+        for name in ['Resultats_Regles', 'Baremes_Categorisation']:
+            sheet = writer.sheets[name]
+            sheet.freeze_panes(1, 1)
+            sheet.set_column(0, 0, 28)
+            if name == 'Baremes_Categorisation':
+                sheet.set_column(1, 1, 12)
+                sheet.set_column(2, 2, 32)
+                sheet.set_column(3, 3, 12)
+            elif df_tab5 is not None and not df_tab5.empty:
+                sheet.set_column(1, len(df_tab5.columns) - 1, 22)
+                sheet.set_column(len(df_tab5.columns) - 1, len(df_tab5.columns) - 1, 65)
 
         comments_df.to_excel(writer, index=False, sheet_name='Commentaires')
     return output.getvalue()
@@ -621,6 +649,7 @@ def dataframe_to_png_bytes(df, title="Tableau", max_rows=20, style_context=None)
     style_context = style_context or {}
     taux_cols = [c for c in style_context.get("taux_cols", []) if c in df.columns]
     score_cols = [c for c in style_context.get("score_cols", []) if c in df.columns]
+    note_cols = [c for c in style_context.get("note_cols", []) if c in df.columns]
     int_cols = [c for c in style_context.get("int_cols", []) if c in df.columns]
     highlight_max_cols = [c for c in style_context.get("highlight_max_cols", []) if c in df.columns]
     ratio_alert_col = style_context.get("ratio_alert_col")
@@ -688,6 +717,9 @@ def dataframe_to_png_bytes(df, title="Tableau", max_rows=20, style_context=None)
             if col in score_cols:
                 text_color, bg_color, bold_score = _extract_css_values(style_score(val))
                 bold = bold or bold_score
+            if col in note_cols:
+                text_color, bg_color, bold_note = _extract_css_values(style_note_20(val))
+                bold = bold or bold_note
 
             if col in highlight_max_cols and pd.notna(max_values.get(col)):
                 val_num = pd.to_numeric(val, errors='coerce')
@@ -1073,11 +1105,18 @@ def get_dhis2_client():
     )
 
 @st.cache_data(ttl=3600)
-def get_data(favori_id, period=None, cache_user=None):
+def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
     _ = cache_user
     if not favori_id: return None
     try:
         dhis = get_dhis2_client()
+        if ou_dimension:
+            visualization = dhis.get(
+                f"visualizations/{favori_id}",
+                params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
+            )
+            params, labels = build_analytics_query(visualization, period, ou_dimension)
+            return analytics_to_reporting_frame(dhis.get("analytics.json", params=params), labels)
         endpoint = f"visualizations/{favori_id}/data.json"
         if period:
             endpoint += f"?dimension=pe:{period}"
@@ -1086,6 +1125,9 @@ def get_data(favori_id, period=None, cache_user=None):
         headers, rows = response.get("headers", []), response.get("rows", [])
         columns = [h.get("name", h.get("column")) for h in headers]
         return pd.DataFrame(rows, columns=columns)
+    except ValueError as e:
+        st.error(f"Impossible de préparer les données du favori pour ce périmètre : {e}")
+        return None
     except requests.exceptions.ReadTimeout:
         st.error(
             "Erreur de connexion : délai de lecture dépassé sur DHIS2. "
@@ -1104,6 +1146,26 @@ def get_data(favori_id, period=None, cache_user=None):
         return None
 
 @st.cache_data(ttl=3600)
+def get_organisation_catalog(cache_user=None):
+    """Catalogue des pays, provinces et zones, indépendant des lignes du favori."""
+    _ = cache_user
+    try:
+        response = get_dhis2_client().get(
+            "organisationUnits",
+            params={
+                "fields": "id,displayName,level,ancestors[id,displayName,level]",
+                "filter": "level:le:3",
+                "paging": "false",
+            },
+        )
+        units = response.get("organisationUnits")
+        if not isinstance(units, list):
+            return None
+        return build_geography_catalog(units)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600)
 def get_validation_groups(cache_user=None):
     _ = cache_user
     try:
@@ -1116,25 +1178,33 @@ def get_validation_results(ou_id, period_list, group_id, cache_user=None):
     _ = cache_user
     # Sécurité anti-Erreur 409 : si l'ID n'est pas un ID système DHIS2, on bloque.
     if not ou_id or ou_id == "USER_ORGUNIT" or len(str(ou_id)) < 5:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs['failed_periods'] = list(period_list)
+        return result
 
     all_results = []
+    failed_periods = []
     try:
         dhis = get_dhis2_client()
-    except Exception as e:
-        st.error(f"Erreur de connexion DHIS2 : {e}")
-        return pd.DataFrame()
+    except Exception:
+        result = pd.DataFrame()
+        result.attrs['failed_periods'] = list(period_list)
+        return result
     for pe in period_list:
         try:
             params = {"ou": ou_id, "pe": pe, "ouMode": "DESCENDANTS"}
             if group_id:
                 params["vrg"] = group_id
             res = dhis.get("validationResults", params=params)
-            if 'validationResults' in res:
+            if isinstance(res.get('validationResults'), list):
                 all_results.extend(res['validationResults'])
+            else:
+                failed_periods.append(pe)
         except Exception:
-            continue # Ignore les erreurs de périodes vides
-    return pd.DataFrame(all_results)
+            failed_periods.append(pe)
+    result = pd.DataFrame(all_results)
+    result.attrs['failed_periods'] = failed_periods
+    return result
 
 @st.cache_data(ttl=3600)
 def get_children_org_units_details(parent_id, cache_user=None):
@@ -1193,44 +1263,7 @@ def get_org_units_hierarchy(org_unit_ids, cache_user=None):
         except Exception:
             units = []
 
-        for ou in units:
-            ou_id = str(ou.get("id", "")).strip()
-            if not ou_id:
-                continue
-            ou_name = str(ou.get("displayName", "")).strip()
-            ou_level = ou.get("level")
-
-            ancestors = ou.get("ancestors", []) or []
-            ancestors_sorted = sorted(
-                [a for a in ancestors if isinstance(a, dict) and a.get("id")],
-                key=lambda a: int(a.get("level") or 0)
-            )
-
-            chain = []
-            seen = set()
-            for item in ancestors_sorted + [{"id": ou_id, "displayName": ou_name, "level": ou_level}]:
-                item_id = str(item.get("id", "")).strip()
-                if not item_id or item_id in seen:
-                    continue
-                seen.add(item_id)
-                chain.append(item)
-
-            if not chain:
-                continue
-
-            country = chain[0]
-            province = chain[1] if len(chain) > 1 else chain[0]
-            zone = chain[2] if len(chain) > 2 else (chain[1] if len(chain) > 1 else chain[0])
-
-            hierarchy[ou_id] = {
-                "country_name": str(country.get("displayName", "")).strip(),
-                "country_id": str(country.get("id", "")).strip(),
-                "province_name": str(province.get("displayName", "")).strip(),
-                "province_id": str(province.get("id", "")).strip(),
-                "zone_name": str(zone.get("displayName", "")).strip(),
-                "zone_id": str(zone.get("id", "")).strip(),
-                "level": int(ou_level) if ou_level is not None else None,
-            }
+        hierarchy.update(resolve_hierarchy(units))
 
     return hierarchy
 
@@ -1261,7 +1294,7 @@ with st.sidebar:
     logout_button = col_disc.button("Se déconnecter", use_container_width=True)
 
     if logout_button:
-        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input"]:
+        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result"]:
             st.session_state.pop(key, None)
         st.cache_resource.clear()
         st.rerun()
@@ -1326,148 +1359,123 @@ with st.sidebar:
     else:
         st.error("Le mois de début doit être avant le mois de fin.")
 
-# --- 4. CHARGEMENT & FILTRAGE DES DONNÉES ---
+# --- 4. FILTRES PAYS / PROVINCE / ZONE ET CHARGEMENT AU NIVEAU ZS ---
 current_user_for_cache = st.session_state.get("dhis2_user", "")
-df_raw = get_data(id_final, period=period_id, cache_user=current_user_for_cache)
+organisation_catalog = get_organisation_catalog(cache_user=current_user_for_cache)
+if organisation_catalog is None:
+    st.error("Impossible de charger la liste des provinces et zones de santé depuis DHIS2. Réessayez la connexion.")
+    st.stop()
+if organisation_catalog.empty:
+    st.info("Aucun pays, province ou zone de santé accessible avec cette connexion.")
+    st.stop()
+
+st.sidebar.subheader("🔍 Filtrage")
+
+def _select_scope_id(label, options, labels, key):
+    if st.session_state.get(key) not in options:
+        st.session_state.pop(key, None)
+    return st.sidebar.selectbox(label, options, format_func=lambda item: labels.get(item, item), key=key)
+
+country_rows = organisation_catalog[organisation_catalog['Pays_ID'].map(clean_ou_id).ne('')]
+country_labels = labels_for_units(country_rows, 'Pays_ID', 'Pays')
+country_options = sorted(country_labels, key=lambda item: country_labels[item])
+if not country_options:
+    st.info("Le pays de rattachement des unités est indisponible dans la hiérarchie DHIS2.")
+    st.stop()
+selected_country_id = (
+    _select_scope_id("Pays :", country_options, country_labels, "filter_country_main")
+    if len(country_options) > 1 else country_options[0]
+)
+country_label = country_labels[selected_country_id]
+if len(country_options) == 1:
+    st.sidebar.caption(f"Pays : {country_label}")
+
+if st.session_state.get('filter_level_main') == 'Synthèse pays':
+    st.session_state['filter_level_main'] = 'Pays'
+filter_level = st.sidebar.selectbox(
+    "Niveau d'analyse :", ["Pays", "Province", "Zone de santé"], key="filter_level_main"
+)
+selected_province_id = None
+selected_zone_id = None
+selected_province = "Toutes les provinces"
+selected_zone = "Toutes les zones"
+selected_scope_label = f"Pays {country_label}"
+current_id_systeme = selected_country_id
+country_catalog = organisation_catalog[organisation_catalog['Pays_ID'].eq(selected_country_id)]
+
+if filter_level in ('Province', 'Zone de santé'):
+    province_rows = country_catalog[country_catalog['Province_ID'].map(clean_ou_id).ne('')]
+    province_labels = labels_for_units(province_rows, 'Province_ID', 'Province')
+    province_options = sorted(province_labels, key=lambda item: province_labels[item])
+    if not province_options:
+        st.info("Aucune province accessible pour ce pays.")
+        st.stop()
+    selected_province_id = _select_scope_id(
+        "Province :", province_options, province_labels, "filter_province_main"
+    )
+    selected_province = province_labels[selected_province_id]
+    selected_scope_label = f"Province {selected_province}"
+    current_id_systeme = selected_province_id
+
+selected_zones_df = zone_catalog(
+    organisation_catalog, country_id=selected_country_id, province_id=selected_province_id
+)
+if selected_zones_df.empty:
+    st.info("Aucune zone de santé accessible pour ce périmètre.")
+    st.stop()
+
+if filter_level in ('Province', 'Zone de santé'):
+    zone_labels = labels_for_units(selected_zones_df, 'Zone_ID', 'Zone')
+    zone_options = sorted(zone_labels, key=lambda item: zone_labels[item])
+    if filter_level == 'Province':
+        zone_options = [''] + zone_options
+        zone_labels[''] = 'Toutes les zones'
+    selected_zone_id = _select_scope_id("Zone de santé :", zone_options, zone_labels, "filter_zone_main") or None
+    if selected_zone_id:
+        selected_zone = zone_labels[selected_zone_id]
+        current_id_systeme = selected_zone_id
+        selected_scope_label = f"Zone de santé {selected_zone} ({selected_province})"
+        selected_zones_df = zone_catalog(
+            organisation_catalog, country_id=selected_country_id,
+            province_id=selected_province_id, zone_id=selected_zone_id
+        )
+
+is_zone_focus = selected_zone_id is not None
+ou_dimension = selected_zone_id or f"LEVEL-3;{selected_province_id or selected_country_id}"
+st.sidebar.caption(f"{len(selected_zones_df)} zone(s) de santé dans le périmètre sélectionné.")
+
+df_raw = get_data(id_final, period=period_id, cache_user=current_user_for_cache, ou_dimension=ou_dimension)
 if df_raw is not None:
     df_raw = normalize_orgunit_columns(df_raw)
+    if 'Organisation unit ID' not in df_raw.columns:
+        st.error("La réponse DHIS2 ne contient pas les identifiants des zones de santé.")
+        st.stop()
+    df_raw['Organisation unit ID'] = df_raw['Organisation unit ID'].map(clean_ou_id)
+    df_raw = df_raw[df_raw['Organisation unit ID'].isin(selected_zones_df['Zone_ID'])].copy()
+    display_labels = labels_for_units(selected_zones_df, 'Zone_ID', 'Zone')
+    df_raw['Organisation unit'] = df_raw['Organisation unit ID'].map(display_labels)
 
 if df_raw is not None:
-    # Récupération dynamique de l'ID de l'unité d'organisation (OrgUnit ID)
-    # On cherche l'ID dans les colonnes renvoyées par le favori
-    mapping_ou_id = {}
-    if 'Organisation unit' in df_raw.columns and 'Organisation unit ID' in df_raw.columns:
-        mapping_ou_id = dict(zip(df_raw['Organisation unit'], df_raw['Organisation unit ID']))
-
-    # Indicateur parent (zone/province) pour filtrer les aires de santé.
-    is_parent_by_ou = {}
-    if 'Organisation unit' in df_raw.columns and 'Organisation unit is parent' in df_raw.columns:
-        temp_parent = df_raw[['Organisation unit', 'Organisation unit is parent']].drop_duplicates('Organisation unit')
-        is_parent_by_ou = {
-            row['Organisation unit']: str(row['Organisation unit is parent']).strip().lower() in ['true', '1']
-            for _, row in temp_parent.iterrows()
-        }
-
     target_df_all = df_raw.copy()
     default_cols = ['Organisation unit code', 'Organisation unit description',
                     'Reporting month', 'Organisation unit parameter', 'Organisation unit is parent']
-    cols_existing = [c for c in default_cols if c in target_df_all.columns]
-    if cols_existing: target_df_all.drop(columns=cols_existing, inplace=True)
+    target_df_all = target_df_all.drop(columns=default_cols, errors='ignore')
+    target_df = target_df_all.copy()
+    mapping_ou_id = dict(zip(df_raw['Organisation unit'], df_raw['Organisation unit ID']))
+    is_parent_by_ou = {}
 
-    st.sidebar.subheader("🔍 Filtrage")
-    scope_df = pd.DataFrame({"Organisation unit": df_raw.get("Organisation unit", pd.Series(dtype=str))})
-    if "Organisation unit ID" in df_raw.columns:
-        scope_df["Organisation unit ID"] = df_raw["Organisation unit ID"].astype(str)
-    else:
-        scope_df["Organisation unit ID"] = ""
-
-    hierarchy_by_id = get_org_units_hierarchy(
-        scope_df["Organisation unit ID"].dropna().tolist(),
-        cache_user=current_user_for_cache
-    )
-
-    scope_df["Pays"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("country_name", "")
-    )
-    scope_df["Pays_ID"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("country_id", "")
-    )
-    scope_df["Province"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("province_name", "")
-    )
-    scope_df["Province_ID"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("province_id", "")
-    )
-    scope_df["Zone"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("zone_name", "")
-    )
-    scope_df["Zone_ID"] = scope_df["Organisation unit ID"].map(
-        lambda x: hierarchy_by_id.get(str(x), {}).get("zone_id", "")
-    )
-
-    scope_df["Pays"] = scope_df["Pays"].replace("", np.nan).fillna("Pays")
-    scope_df["Province"] = scope_df["Province"].replace("", np.nan).fillna(scope_df["Organisation unit"])
-    scope_df["Zone"] = scope_df["Zone"].replace("", np.nan).fillna(scope_df["Organisation unit"])
-
-    province_to_id = (
-        scope_df[scope_df["Province_ID"].astype(str).str.strip() != ""]
-        .drop_duplicates("Province")
-        .set_index("Province")["Province_ID"]
-        .to_dict()
-    )
-    zone_to_id = (
-        scope_df[scope_df["Zone_ID"].astype(str).str.strip() != ""]
-        .drop_duplicates("Zone")
-        .set_index("Zone")["Zone_ID"]
-        .to_dict()
-    )
-
-    scope_df["is_zone_candidate"] = scope_df["Zone"].astype(str) != scope_df["Province"].astype(str)
-    if not scope_df["is_zone_candidate"].any() and is_parent_by_ou:
-        scope_df["is_zone_candidate"] = ~scope_df["Organisation unit"].map(is_parent_by_ou).fillna(False)
-    if not scope_df["is_zone_candidate"].any():
-        scope_df["is_zone_candidate"] = True
-
-    filter_level = st.sidebar.selectbox(
-        "Niveau d'analyse :",
-        ["Synthèse pays", "Province", "Zone de santé"],
-        key="filter_level_main"
-    )
-
-    selected_province = "Toutes les provinces"
-    selected_zone = "Toutes les zones"
-    selected_scope_label = "Synthèse pays"
-    current_id_systeme = None
-
-    provinces = sorted(scope_df["Province"].dropna().unique().tolist())
-    country_names = sorted(scope_df["Pays"].dropna().unique().tolist())
-    country_label = country_names[0] if country_names else "Pays"
-
-    if filter_level == "Synthèse pays":
-        target_df = target_df_all.copy()
-        selected_scope_label = f"Synthèse {country_label}"
-        country_ids = [cid for cid in scope_df["Pays_ID"].dropna().astype(str).tolist() if cid.strip()]
-        current_id_systeme = country_ids[0] if country_ids else None
-
-    elif filter_level == "Province":
-        if not provinces:
-            st.warning("Aucune province détectée dans les données.")
-            target_df = target_df_all.copy()
-            selected_scope_label = "Province indisponible"
-        else:
-            selected_province = st.sidebar.selectbox("Province :", provinces, key="filter_province_main")
-            mask_province = scope_df["Province"] == selected_province
-            target_df = target_df_all[mask_province.values].copy()
-            current_id_systeme = province_to_id.get(selected_province)
-            selected_scope_label = f"Province {selected_province}"
-
-    else:
-        province_options = ["Toutes les provinces"] + provinces if provinces else ["Toutes les provinces"]
-        selected_province = st.sidebar.selectbox("Province :", province_options, key="filter_zone_province_main")
-
-        zone_pool = scope_df.copy()
-        if selected_province != "Toutes les provinces":
-            zone_pool = zone_pool[zone_pool["Province"] == selected_province]
-
-        zone_options = sorted(
-            zone_pool[zone_pool["is_zone_candidate"]]["Zone"].dropna().unique().tolist()
-        )
-        if not zone_options:
-            zone_options = sorted(zone_pool["Organisation unit"].dropna().unique().tolist())
-
-        if not zone_options:
-            st.warning("Aucune zone de santé détectée pour ce filtre.")
-            target_df = target_df_all.iloc[0:0].copy()
-            selected_scope_label = "Zone indisponible"
-        else:
-            selected_zone = st.sidebar.selectbox("Zone de santé :", zone_options, key="filter_zone_main")
-            mask_exact = target_df_all["Organisation unit"] == selected_zone
-            if mask_exact.any():
-                target_df = target_df_all[mask_exact].copy()
-            else:
-                target_df = target_df_all[(scope_df["Zone"] == selected_zone).values].copy()
-            current_id_systeme = zone_to_id.get(selected_zone) or mapping_ou_id.get(selected_zone)
-            selected_scope_label = f"Zone {selected_zone}"
+    catalog_by_id = organisation_catalog.drop_duplicates('Organisation unit ID').set_index('Organisation unit ID')
+    scope_df = catalog_by_id.reindex(df_raw['Organisation unit ID']).reset_index()
+    scope_df.index = df_raw.index
+    scope_df['Organisation unit'] = df_raw['Organisation unit']
+    hierarchy_by_id = {
+        row['Organisation unit ID']: {
+            'country_name': row['Pays'], 'country_id': row['Pays_ID'],
+            'province_name': row['Province'], 'province_id': row['Province_ID'],
+            'zone_name': row['Zone'], 'zone_id': row['Zone_ID'], 'level': row['level'],
+        }
+        for row in organisation_catalog.to_dict('records')
+    }
 
     # Garde-fou final: garantir la colonne 'Organisation unit' après tous les filtres.
     if "Organisation unit" not in target_df_all.columns:
@@ -1498,7 +1506,6 @@ if df_raw is not None:
     if target_df.empty:
         st.warning("Aucune donnée trouvée avec ce niveau de filtre.")
 
-    is_zone_focus = filter_level == "Zone de santé" and selected_zone != "Toutes les zones"
 
     st.title(f"📊 SNIS RDC - Performance {selected_scope_label}")
 
@@ -1527,7 +1534,7 @@ if df_raw is not None:
             df_tab1 = df_tab1[~df_tab1['Organisation unit'].map(is_parent_by_ou).fillna(False)]
 
         if df_tab1.empty:
-            st.warning("Aucune aire de santé à afficher avec ce filtre.")
+            st.warning("Aucune zone de santé à afficher avec ce filtre.")
         else:
             st.dataframe(df_tab1.head(15), use_container_width=True)
         df_tab1_export = df_tab1.copy()
@@ -1642,7 +1649,7 @@ if df_raw is not None:
             .round(2)
         )
         df_comparatif = df_comparatif.rename(columns={
-            'Organisation unit': 'Aire de santé',
+            'Organisation unit': 'Zone de santé',
             col_score_comp: 'Nombre de dataset complétude >/= 95%',
             col_score_prompt: 'Nombre de dataset promptitude >/= 95%'
         })
@@ -1721,7 +1728,7 @@ if df_raw is not None:
             df_flop5_export = df_synth.nsmallest(5, 'Promptitude_Globale (%)')[['Organisation unit', 'Promptitude_Globale (%)']].round(1)
             st.table(df_flop5_export)
 
-    # --- ONGLET 5 : ÉLÉMENTS DE CATÉGORISATION (CORRECTIF APPLIQUÉ SUR TON SCRIPT) ---
+    # --- ONGLET 5 : ÉLÉMENTS DE CATÉGORISATION ---
     with tab5:
         st.header("🩺 Éléments de catégorisation interactifs")
 
@@ -1731,6 +1738,36 @@ if df_raw is not None:
             options_regles = ["Toutes les règles (Global)"] + list(group_mapping.keys())
 
             selected_vr_name = st.selectbox("Sélectionner le Groupe de Règles de Validation :", options_regles)
+            target_group_id = group_mapping.get(selected_vr_name)
+            profil_bareme = st.selectbox(
+                "Barème du nombre de datasets à complétude ≥95 % :",
+                ["Automatique", "DPS", "ZS"],
+                help="Automatique utilise le niveau DHIS2 : province = DPS, zone de santé = ZS."
+            )
+            with st.expander("Consulter les barèmes de catégorisation"):
+                st.dataframe(build_baremes_df(), hide_index=True, use_container_width=True)
+                st.caption(
+                    "Le score de catégorisation /100 additionne cinq notes sur 20. "
+                    "Le score de qualité historique et sa note /20 restent basés sur la moyenne "
+                    "de la complétude et de la promptitude et ne sont pas ajoutés au total."
+                )
+            validation_context = (
+                base_url, current_user_for_cache, id_final, tuple(selection_mois),
+                tuple(selection_mois_prev), filter_level, selected_province,
+                selected_zone, target_group_id,
+                selected_country_id, selected_province_id, selected_zone_id,
+                tuple(selected_zones_df['Zone_ID']),
+                tuple(target_df.columns),
+                int(pd.util.hash_pandas_object(target_df.astype(str), index=True).sum()),
+            )
+            saved_validation = st.session_state.get("categorisation_result")
+            if saved_validation and saved_validation.get("context") != validation_context:
+                st.session_state.pop("categorisation_result", None)
+            st.caption(
+                f"Période M : {', '.join(selection_mois)}. "
+                f"Période de référence M-1 : {', '.join(selection_mois_prev)}. "
+                "Les violations identiques sur plusieurs mois sont comptées une seule fois."
+            )
 
             if st.button("Lancer l'analyse des violations"):
                 can_run_validation = True
@@ -1740,107 +1777,29 @@ if df_raw is not None:
                 if can_run_validation:
                     with st.spinner('Analyse des violations en cours...'):
 
-                        target_group_id = group_mapping.get(selected_vr_name) if selected_vr_name != "Toutes les règles (Global)" else None
+                        # 1) Le catalogue sélectionné contient exclusivement des zones de santé.
+                        validation_labels = labels_for_units(selected_zones_df, 'Zone_ID', 'Zone')
+                        zones_resolues = [(validation_labels[ou_id], ou_id) for ou_id in selected_zones_df['Zone_ID']]
 
-                        # 1) Construire la liste des zones selon le niveau de filtre
-                        zone_id_mapping = {
-                            str(k).strip(): str(v).strip()
-                            for k, v in zone_to_id.items()
-                            if str(k).strip() and str(v).strip()
-                        }
-
-                        if is_zone_focus:
-                            zones_cibles = [selected_zone]
-                            if selected_zone not in zone_id_mapping:
-                                zid = mapping_ou_id.get(selected_zone)
-                                if zid:
-                                    zone_id_mapping[selected_zone] = str(zid)
-                        else:
-                            if filter_level == "Province" and selected_province != "Toutes les provinces":
-                                zone_source_df = scope_df[
-                                    (scope_df["Province"] == selected_province) &
-                                    (scope_df["is_zone_candidate"])
-                                ]
-                            else:
-                                zone_source_df = scope_df[scope_df["is_zone_candidate"]]
-
-                            zones_cibles = sorted(zone_source_df["Zone"].dropna().unique().tolist())
-
-                            for _, row_meta in zone_source_df.iterrows():
-                                zone_name = str(row_meta.get("Zone", "")).strip()
-                                zone_id = str(row_meta.get("Zone_ID", "")).strip()
-                                if zone_name and zone_id:
-                                    zone_id_mapping[zone_name] = zone_id
-
-                            if not zones_cibles and current_id_systeme:
-                                children_info = get_children_org_units_details(current_id_systeme, cache_user=current_user_for_cache)
-                                zones_cibles = [c['displayName'] for c in children_info if c.get('displayName') and c.get('id')]
-                                for child in children_info:
-                                    zone_id_mapping[str(child['displayName']).strip()] = str(child['id']).strip()
-
-                        zones_cibles = [z for z in zones_cibles if zone_id_mapping.get(z)]
-                        zones_cibles = list(dict.fromkeys(zones_cibles))
-
-                        # Mapping normalisé (fallback si les libellés diffèrent légèrement)
-                        zone_id_mapping_norm = {
-                            normalize_org_name(k): v
-                            for k, v in zone_id_mapping.items()
-                            if k and v
-                        }
-
-                        zones_resolues = []
-                        for z in zones_cibles:
-                            zid = zone_id_mapping.get(z) or zone_id_mapping_norm.get(normalize_org_name(z))
-                            if zid:
-                                zones_resolues.append((z, zid))
-                        zones_cibles = [z for z, _ in zones_resolues]
-                        zone_id_mapping = {z: zid for z, zid in zones_resolues}
-
-                        if not zones_cibles:
+                        if not zones_resolues:
                             st.warning("Aucune zone de santé valide trouvée.")
                             st.stop()
 
                         # 2) Recalcul des métriques au niveau "Zone de santé" (évite les zéros dus aux différences de niveaux)
                         actual_zone_by_id = {}
-                        actual_zone_by_name = {}
                         comp_zone_by_id = {}
-                        comp_zone_by_name = {}
                         prompt_zone_by_id = {}
-                        prompt_zone_by_name = {}
 
                         scope_meta = scope_df[['Organisation unit', 'Organisation unit ID', 'Zone', 'Zone_ID']].copy()
-                        scope_meta['Organisation unit'] = scope_meta['Organisation unit'].astype(str)
-                        scope_meta['Organisation unit ID'] = scope_meta['Organisation unit ID'].astype(str)
-                        scope_meta['Zone'] = scope_meta['Zone'].astype(str)
-                        scope_meta['Zone_ID'] = scope_meta['Zone_ID'].astype(str)
-                        scope_meta['_ou_key'] = scope_meta['Organisation unit'].map(normalize_org_name)
-                        scope_meta = scope_meta.drop_duplicates(subset=['_ou_key', 'Organisation unit ID'])
+                        scope_meta = scope_meta.drop_duplicates(subset=['Organisation unit', 'Organisation unit ID'])
 
                         def _attach_zone_meta(df_source):
                             if df_source is None or df_source.empty or 'Organisation unit' not in df_source.columns:
                                 return pd.DataFrame()
-                            tmp = df_source.copy()
-                            tmp['Organisation unit'] = tmp['Organisation unit'].astype(str)
-                            tmp['_ou_key'] = tmp['Organisation unit'].map(normalize_org_name)
-                            tmp = tmp.merge(
-                                scope_meta[['_ou_key', 'Organisation unit ID', 'Zone', 'Zone_ID']],
-                                on='_ou_key',
-                                how='left'
-                            )
-                            tmp['ou_id'] = tmp['Organisation unit'].map(mapping_ou_id)
-                            tmp['ou_id'] = tmp['ou_id'].where(
-                                tmp['ou_id'].notna() & (tmp['ou_id'].astype(str).str.strip() != ""),
-                                tmp['Organisation unit ID']
-                            )
-                            tmp['Zone_ID'] = tmp['Zone_ID'].where(
-                                tmp['Zone_ID'].notna() & (tmp['Zone_ID'].astype(str).str.strip() != ""),
-                                tmp['ou_id']
-                            )
-                            tmp['Zone'] = tmp['Zone'].where(
-                                tmp['Zone'].notna() & (tmp['Zone'].astype(str).str.strip() != ""),
-                                tmp['Organisation unit']
-                            )
-                            return tmp
+                            source = df_source.copy()
+                            if 'Organisation unit ID' not in source and 'Organisation unit ID' in target_df:
+                                source['Organisation unit ID'] = target_df['Organisation unit ID'].reindex(source.index)
+                            return attach_reporting_scope(source, scope_meta)
 
                         if {'Organisation unit', 'Reports_Actual', 'Reports_Attendu'}.issubset(df_synthese.columns):
                             df_comp_zone = _attach_zone_meta(
@@ -1856,13 +1815,10 @@ if df_raw is not None:
                                 )
                                 grouped_comp['Complétude_Globale'] = (
                                     grouped_comp['Reports_Actual'] / grouped_comp['Reports_Attendu'].replace(0, np.nan) * 100
-                                ).fillna(0).round(2)
+                                ).round(2)
 
                                 actual_zone_by_id = grouped_comp.set_index('Zone_ID')['Reports_Actual'].to_dict()
                                 comp_zone_by_id = grouped_comp.set_index('Zone_ID')['Complétude_Globale'].to_dict()
-                                grouped_comp['_zone_key'] = grouped_comp['Zone'].map(normalize_org_name)
-                                actual_zone_by_name = grouped_comp.set_index('_zone_key')['Reports_Actual'].to_dict()
-                                comp_zone_by_name = grouped_comp.set_index('_zone_key')['Complétude_Globale'].to_dict()
 
                         if {'Organisation unit', 'Reports_Actual_On_Time', 'Reports_Attendu'}.issubset(df_final_p.columns):
                             df_prompt_zone = _attach_zone_meta(
@@ -1878,31 +1834,54 @@ if df_raw is not None:
                                 )
                                 grouped_prompt['Promptitude_Globale'] = (
                                     grouped_prompt['Reports_Actual_On_Time'] / grouped_prompt['Reports_Attendu'].replace(0, np.nan) * 100
-                                ).fillna(0).round(2)
+                                ).round(2)
 
                                 prompt_zone_by_id = grouped_prompt.set_index('Zone_ID')['Promptitude_Globale'].to_dict()
-                                grouped_prompt['_zone_key'] = grouped_prompt['Zone'].map(normalize_org_name)
-                                prompt_zone_by_name = grouped_prompt.set_index('_zone_key')['Promptitude_Globale'].to_dict()
 
-                        # 3) Violations par zone + ratio /100 + corrigées T vs T-1
+                        # Compter chaque dataset une seule fois au niveau de l'unité analysée.
+                        datasets_zone_by_id = {}
+                        df_dataset_zone = _attach_zone_meta(target_df)
+                        if not df_dataset_zone.empty:
+                            for (ou_id, ou_name), dataset_rows in df_dataset_zone.groupby(['Zone_ID', 'Zone']):
+                                dataset_count = count_datasets_95(dataset_rows, col_rate_uniquement, target_id=ou_id)
+                                datasets_zone_by_id[str(ou_id)] = dataset_count
+
+                        profile_by_id = {}
+                        for ou_id, metadata in hierarchy_by_id.items():
+                            level = metadata.get('level')
+                            if level is not None and level >= 2 and clean_ou_id(metadata.get('province_id')):
+                                profile_by_id[clean_ou_id(metadata['province_id'])] = 'DPS'
+                            if level is not None and level >= 3 and clean_ou_id(metadata.get('zone_id')):
+                                profile_by_id[clean_ou_id(metadata['zone_id'])] = 'ZS'
+                            if metadata.get('level') in (2, 3):
+                                profile_by_id[str(ou_id)] = 'DPS' if metadata['level'] == 2 else 'ZS'
+
+                        # 3) Violations par zone et corrections des mêmes erreurs entre M-1 et M.
                         rows_cat = []
-                        for zone_name in zones_cibles:
-                            zone_id = zone_id_mapping.get(zone_name) or zone_id_mapping_norm.get(normalize_org_name(zone_name))
-                            zone_key = normalize_org_name(zone_name)
-                            comp_val = float(comp_zone_by_id.get(zone_id, comp_zone_by_name.get(zone_key, 0)))
-                            prompt_val = float(prompt_zone_by_id.get(zone_id, prompt_zone_by_name.get(zone_key, 0)))
-                            actual_val = float(actual_zone_by_id.get(zone_id, actual_zone_by_name.get(zone_key, 0)))
+                        for zone_name, zone_id in zones_resolues:
+                            comp_val = float(comp_zone_by_id.get(zone_id, np.nan))
+                            prompt_val = float(prompt_zone_by_id.get(zone_id, np.nan))
+                            actual_val = float(actual_zone_by_id.get(zone_id, np.nan))
+                            if not col_actual_strict or not col_expected_strict:
+                                comp_val = np.nan
+                            if not actual_ot_cols or not col_expected_strict:
+                                prompt_val = np.nan
                             score_qualite = round((comp_val + prompt_val) / 2, 1)
+                            row_cat = {
+                                'Zone de santé': zone_name,
+                                'Complétude_Globale': comp_val,
+                                'Promptitude_Globale': prompt_val,
+                                'Actual_Reports': actual_val,
+                                'Score_Qualite': score_qualite,
+                                'Nombre_Datasets_95': datasets_zone_by_id.get(zone_id, np.nan),
+                                'Profil_Bareme': profile_by_id.get(str(zone_id)),
+                            }
                             if not zone_id or len(str(zone_id)) < 5:
-                                rows_cat.append({
-                                    'Zone de santé': zone_name,
-                                    'Complétude_Globale': comp_val,
-                                    'Promptitude_Globale': prompt_val,
-                                    'Actual_Reports': actual_val,
-                                    'Violations_Actuelles': 0,
-                                    'Violations_Mois_Precedent': 0,
-                                    'Violations_Corrigees': 0,
-                                    'Score_Qualite': score_qualite
+                                rows_cat.append({**row_cat,
+                                    'Violations_Actuelles': np.nan,
+                                    'Violations_Mois_Precedent': np.nan,
+                                    'Violations_Corrigees': np.nan,
+                                    'Erreur_Validation': "Identifiant DHIS2 indisponible",
                                 })
                                 continue
 
@@ -1912,68 +1891,78 @@ if df_raw is not None:
                             # Comparaison des mêmes erreurs entre T-1 et T
                             sig_now = build_violation_signature_set(df_val_zone)
                             sig_prev = build_violation_signature_set(df_val_prev_zone)
-                            violations_actuelles = len(sig_now)
-                            violations_mois_precedent = len(sig_prev)
-                            violations_corrigees = len(sig_prev - sig_now)
+                            failed_now = df_val_zone.attrs.get('failed_periods', [])
+                            failed_prev = df_val_prev_zone.attrs.get('failed_periods', [])
+                            violations_actuelles = np.nan if failed_now else len(sig_now)
+                            violations_mois_precedent = np.nan if failed_prev else len(sig_prev)
+                            violations_corrigees = np.nan if failed_now or failed_prev else len(sig_prev - sig_now)
+                            errors = []
+                            if failed_now:
+                                errors.append(f"Validation M indisponible : {', '.join(failed_now)}")
+                            if failed_prev:
+                                errors.append(f"Validation M-1 indisponible : {', '.join(failed_prev)}")
 
-                            rows_cat.append({
-                                'Zone de santé': zone_name,
-                                'Complétude_Globale': comp_val,
-                                'Promptitude_Globale': prompt_val,
-                                'Actual_Reports': actual_val,
-                                'Violations_Actuelles': int(violations_actuelles),
-                                'Violations_Mois_Precedent': int(violations_mois_precedent),
-                                'Violations_Corrigees': int(violations_corrigees),
-                                'Score_Qualite': score_qualite
+                            rows_cat.append({**row_cat,
+                                'Violations_Actuelles': violations_actuelles,
+                                'Violations_Mois_Precedent': violations_mois_precedent,
+                                'Violations_Corrigees': violations_corrigees,
+                                'Erreur_Validation': '; '.join(errors),
                             })
 
-                        df_cat = pd.DataFrame(rows_cat)
-
-                        # Formule demandée: nombre de règle violée / Actual * 100
-                        df_cat['Ratio_Violations_sur_100'] = (
-                            (df_cat['Violations_Actuelles'] / df_cat['Actual_Reports'].replace(0, np.nan)) * 100
-                        ).fillna(0).round(2)
-
-                        if 'Violations_Corrigees' not in df_cat.columns:
-                            df_cat['Violations_Corrigees'] = 0
-                        df_cat['Violations_Corrigees'] = pd.to_numeric(
-                            df_cat['Violations_Corrigees'], errors='coerce'
-                        ).fillna(0).astype(int)
-
-                        st.subheader(f"Résultats : {selected_vr_name}")
-
-                        df_display = df_cat[['Zone de santé', 'Complétude_Globale', 'Promptitude_Globale', 'Actual_Reports', 'Violations_Mois_Precedent', 'Violations_Corrigees', 'Violations_Actuelles', 'Ratio_Violations_sur_100', 'Score_Qualite']].rename(columns={
-                            'Complétude_Globale': 'Complétude globale (%)',
-                            'Promptitude_Globale': 'Promptitude globale (%)',
-                            'Actual_Reports': 'Reports_Actual',
-                            'Violations_Mois_Precedent': 'Règles violées (M-1)',
-                            'Violations_Corrigees': 'Règles corrigées (M-1 -> M)',
-                            'Violations_Actuelles': 'Règles violées (M)',
-                            'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
-                            'Score_Qualite': 'Score de qualité'
-                        })
-                        df_tab5_export = df_display.copy()
-
-                        st.dataframe(
-                            df_display.style.format({
-                                'Complétude globale (%)': '{:.2f}',
-                                'Promptitude globale (%)': '{:.2f}',
-                                'Reports_Actual': '{:.2f}',
-                                'Ratio / 100 rapports': '{:.2f}',
-                                'Score de qualité': '{:.2f}'
-                            })
-                            .map(style_taux, subset=['Complétude globale (%)', 'Promptitude globale (%)', 'Score de qualité'])
-                            .highlight_max(subset=['Règles violées (M)'], color='#ffcccc')
-                            .map(lambda x: 'color: red; font-weight: bold' if x > 10 else '', subset=['Ratio / 100 rapports']),
-                            use_container_width=True
-                        )
-
-                        col_res1, col_res2 = st.columns(2)
-                        col_res1.metric("Total violations détectées", int(df_cat['Violations_Actuelles'].sum()))
-                        col_res2.metric("Total règles corrigées", int(df_cat['Violations_Corrigees'].sum()), delta=f"{int(df_cat['Violations_Corrigees'].sum())}")
+                        st.session_state['categorisation_result'] = {
+                            'context': validation_context,
+                            'data': pd.DataFrame(rows_cat),
+                        }
 
                 else:
                     st.error("L'ID de la zone de santé sélectionnée est manquant dans les données sources.")
+
+            saved_validation = st.session_state.get('categorisation_result')
+            if saved_validation and saved_validation.get('context') == validation_context:
+                df_cat = calculer_categorisation(saved_validation['data'], profil=profil_bareme)
+                st.subheader(f"Résultats : {selected_vr_name}")
+                st.caption(
+                    "Les nouvelles notes et le total /100 sont ajoutés à droite des colonnes existantes. "
+                    "Une cellule vide indique qu'une donnée nécessaire au calcul est indisponible."
+                )
+                historical_columns = {
+                    'Zone de santé': 'Zone de santé',
+                    'Complétude_Globale': 'Complétude globale (%)',
+                    'Promptitude_Globale': 'Promptitude globale (%)',
+                    'Actual_Reports': 'Reports_Actual',
+                    'Violations_Mois_Precedent': 'Règles violées (M-1)',
+                    'Violations_Corrigees': 'Règles corrigées (M-1 -> M)',
+                    'Violations_Actuelles': 'Règles violées (M)',
+                    'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
+                    'Score_Qualite': 'Score de qualité',
+                }
+                added_columns = [
+                    'Score de qualité /20', 'Barème datasets',
+                    'Nombre de datasets complétude ≥95 %', 'Règles restantes (M-1 -> M)',
+                    *[c for c in NOTE_COLS if c != 'Score de qualité /20'],
+                    TOTAL_COL, 'Statut catégorisation',
+                ]
+                df_display = df_cat[list(historical_columns) + added_columns].rename(columns=historical_columns)
+                df_tab5_export = df_display.copy()
+                st.dataframe(
+                    _build_styler(df_display, **style_context_tab5()),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                invalid_scores = df_cat[TOTAL_COL].isna()
+                if invalid_scores.any():
+                    st.warning(
+                        f"{int(invalid_scores.sum())} unité(s) sans score total : consultez la colonne "
+                        "« Statut catégorisation ». Pour un barème non identifié, choisissez DPS ou ZS."
+                    )
+                col_res1, col_res2, col_res3, col_res4 = st.columns(4)
+                detected = df_cat['Violations_Actuelles'].sum(min_count=1)
+                corrected = df_cat['Violations_Corrigees'].sum(min_count=1)
+                col_res1.metric("Violations détectées (données disponibles)", '—' if pd.isna(detected) else int(detected))
+                col_res2.metric("Règles corrigées (données disponibles)", '—' if pd.isna(corrected) else int(corrected))
+                average_score = df_cat[TOTAL_COL].mean()
+                col_res3.metric("Score moyen de catégorisation /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
+                col_res4.metric("Unités avec score complet", f"{int((~invalid_scores).sum())} / {len(df_cat)}")
         else:
             st.warning("⚠️ Impossible de charger les groupes de règles.")
 
@@ -2025,14 +2014,7 @@ if df_raw is not None:
                 "int_cols": ['Nombre de dataset complétude >/= 95%', 'Nombre de dataset promptitude >/= 95%'],
                 "decimals": 2,
             },
-            "tab5": {
-                "taux_cols": ['Complétude globale (%)', 'Promptitude globale (%)', 'Score de qualité'],
-                "highlight_max_cols": ['Règles violées (M)'],
-                "ratio_alert_col": 'Ratio / 100 rapports',
-                "ratio_alert_threshold": 10.0,
-                "int_cols": ['Règles violées (M-1)', 'Règles corrigées (M-1 -> M)', 'Règles violées (M)'],
-                "decimals": 2,
-            },
+            "tab5": style_context_tab5(),
             "top5": {
                 "taux_cols": ['Complétude_Globale (%)'],
                 "decimals": 2,
@@ -2143,7 +2125,10 @@ if df_raw is not None:
                 st.write("Flop 5 promptitude")
                 st.dataframe(df_flop5_export, use_container_width=True)
         with p_tabs[7]:
-            st.dataframe(df_tab5_export, use_container_width=True)
+            if df_tab5_export.empty:
+                st.info("Lancez l'analyse des violations dans l'onglet 5 pour afficher la catégorisation.")
+            else:
+                st.dataframe(_build_styler(df_tab5_export, **style_context_tab5()), use_container_width=True, hide_index=True)
         with p_tabs[8]:
             st.dataframe(comments_df, use_container_width=True)
 else:

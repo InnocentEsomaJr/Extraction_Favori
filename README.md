@@ -3,8 +3,8 @@
 Application Streamlit pour analyser la performance SNIS (DHIS2) avec:
 - complétude
 - promptitude
-- comparaison entre zones/aires de santé
-- filtrage hiérarchique `Synthèse pays` / `Province` / `Zone de santé`
+- comparaison entre zones de santé
+- filtrage hiérarchique `Pays` / `Province` / `Zone de santé`
 - analyse des violations de règles de validation
 - export commenté en **Excel / PowerPoint**
 
@@ -16,7 +16,7 @@ Le dashboard est organisé en 5 onglets:
 
 1. **Base de données**
 - Affichage des données brutes (sans `Organisation unit ID`)
-- Filtrage des lignes parent pour afficher les aires de santé
+- Données des zones de santé du périmètre sélectionné
 
 2. **Complétude**
 - Calcul `Reports_Actual`, `Reports_Attendu`, `Complétude_Globale (%)`
@@ -42,6 +42,66 @@ Le dashboard est organisé en 5 onglets:
 - `Ratio / 100 rapports` calculé par:
   - `(Règles violées (M) / Reports_Actual) * 100`
 - `Score de qualité`
+- `Score de qualité /20`, placé juste après `Score de qualité` dans le tableau et l'export Excel.
+  Le barème s'applique au score de qualité (moyenne de la complétude et de la promptitude) :
+  - moins de 50 % : **0**
+  - de 50 à moins de 60 % : **5**
+  - de 60 à moins de 80 % : **10**
+  - de 80 à moins de 95 % : **15**
+  - 95 % et plus : **20**
+- **Catégorisation issue du modèle Excel** : toutes les colonnes précédentes sont conservées,
+  puis le tableau affiche le barème DPS/ZS, le nombre de datasets à complétude `>=95 %`,
+  les anciennes violations restantes, les cinq notes détaillées et leur somme
+  `Score catégorisation /100`. Le score de qualité historique et sa note `/20` sont des
+  repères distincts et ne sont pas ajoutés au total.
+
+| Critère | Barème actif sur 20 |
+| --- | --- |
+| Complétude et promptitude | `<50 : 0` ; `50–<60 : 5` ; `60–<80 : 10` ; `80–<95 : 15` ; `>=95 : 20` |
+| Datasets à complétude >=95 % (DPS) | `<6 : 0` ; `6–7 : 5` ; `8–9 : 10` ; `10–11 : 15` ; `>=12 : 20` |
+| Datasets à complétude >=95 % (ZS) | `<5 : 0` ; `5 : 5` ; `6–7 : 10` ; `8–9 : 15` ; `>=10 : 20` |
+| Violations pour 100 rapports | `0–5 : 20` ; `>5–10 : 15` ; `>10–15 : 10` ; `>15–20 : 5` ; `>20 : 0` |
+| Corrections de M-1 | Aucune ancienne violation restante : `20` ; au moins une restante : `0` |
+
+Le mode **Automatique** déduit DPS/ZS du niveau DHIS2 de chaque unité. Le sélecteur
+permet de choisir explicitement DPS ou ZS si la hiérarchie est indisponible.
+Les règles sont consultables dans l'expandeur « Consulter les barèmes de catégorisation ».
+Les trois ambiguïtés du modèle ont été clarifiées : promptitude `>=95 % = 20`,
+ratio exactement `20 = 5`, et corrections notées sur les violations **restantes**.
+Les notes saisies manuellement dans les exemples du modèle ne remplacent pas les barèmes.
+
+Chaque dataset est compté une seule fois pour l'unité analysée. Une ligne directe de
+l'unité prime sur ses descendants ; à défaut, son taux est recalculé à partir des
+rapports réels et attendus des descendants. Sans données suffisantes, le compte reste
+indisponible. Une erreur DHIS2, l'absence de rapports ou une composante manquante laisse
+le total vide, avec un motif dans `Statut catégorisation`.
+
+Les résultats restent en session lors d'un changement de barème ou de l'ouverture
+de l'aperçu. Changer de favori, période, groupe de règles ou périmètre impose une
+nouvelle analyse pour éviter un résultat périmé, tout comme un changement des données
+sources. La déconnexion efface ce résultat.
+Si plusieurs mois sont sélectionnés, M est cet ensemble de mois et M-1 reste le mois
+précédant son début ; les signatures de violations sont dédupliquées entre les mois.
+
+Le filtrage s'applique à tous les tableaux, graphiques, exports et règles de validation :
+
+- **Pays** : toutes les zones de santé du pays sélectionné.
+- **Province** : toutes les zones de la province choisie ; le filtre « Zone de santé »
+  permet ensuite de garder toutes les zones ou d'en sélectionner une.
+- **Zone de santé** : choix de la province puis d'une seule zone.
+
+Le catalogue DHIS2 des niveaux 1/2/3 alimente les sélecteurs, indépendamment du niveau
+enregistré dans le favori. Les données sont demandées au niveau des zones de santé,
+même si le favori d'origine affiche des provinces. La sélection utilise les IDs :
+les zones homonymes sont distinguées par province ou identifiant. Un changement de
+province réinitialise une zone qui n'appartient plus au périmètre. Une province ou un
+pays ne sont jamais utilisés comme ligne de zone de santé quand la hiérarchie manque.
+
+Le chargement reprend les éléments et filtres explicites du favori via l'API Analytics,
+avec une dimension organisationnelle bornée au pays, à la province ou à la zone.
+Les périodes sont agrégées par DHIS2 avant le calcul des taux. Les filtres complexes
+non représentables sont signalés, sans retirer silencieusement une restriction du favori.
+Référence : [dimensions et niveaux de l'API DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
 
 ## 2. Export de rapport
 
@@ -54,6 +114,7 @@ Le rapport exporté inclut:
 - tableaux principaux
 - commentaires automatiques (lecture des graphiques et tableaux)
 - conservation des colorations conditionnelles du dashboard dans les tableaux exportés
+- catégorisation complète dans `Resultats_Regles` et légende dans `Baremes_Categorisation`
 - (PowerPoint) images des graphiques et tableaux
 - feuilles/slides dédiées: base de données, rapports détaillés (réels/attendus), performance finale, promptitude, comparatif, top/flop, résultats des règles
 
@@ -94,7 +155,7 @@ streamlit run dashbord.py
 Ensuite:
 1. Choisir le favori DHIS2 (ou un ID personnalisé)
 2. Choisir la période (année + mois début/fin)
-3. Filtrer par zone/aire de santé
+3. Choisir le pays, une province ou une zone de santé
 4. Consulter les onglets et exporter le rapport
 
 ## 7. Structure du dossier
@@ -102,10 +163,21 @@ Ensuite:
 ```text
 Extraction_Favori/
 |- dashbord.py
+|- categorisation.py
+|- reporting_metrics.py
+|- geography.py
+|- scoped_analytics.py
+|- tests/
 |- requirements.txt
 |- .streamlit/
 |  |- secrets.toml
 |- .gitignore
+```
+
+Vérification des calculs, de l'export et des interactions Streamlit sans accès DHIS2 :
+
+```powershell
+python -B -m unittest discover -s tests
 ```
 
 ## 8. Dépannage rapide
