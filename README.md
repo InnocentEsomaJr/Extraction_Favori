@@ -80,8 +80,23 @@ Les résultats restent en session lors d'un changement de barème ou de l'ouvert
 de l'aperçu. Changer de favori, période, groupe de règles ou périmètre impose une
 nouvelle analyse pour éviter un résultat périmé, tout comme un changement des données
 sources. La déconnexion efface ce résultat.
-Si plusieurs mois sont sélectionnés, M est cet ensemble de mois et M-1 reste le mois
-précédant son début ; les signatures de violations sont dédupliquées entre les mois.
+Dans l'onglet de catégorisation, les calendriers **Date de début** et **Date de fin**
+définissent l'intervalle M. La référence M-1 reste le mois entier précédant celui de
+la date de début ; les signatures de violations sont dédupliquées entre les mois.
+
+Le bloc **Unité d’organisation parent** permet de choisir le pays, puis une province
+et éventuellement une zone de santé. Les parents possibles restent les niveaux pays,
+province et ZS ; leurs centres et postes apparaissent dans le détail des violations.
+Les dates et le parent sont initialisés à partir de la barre latérale et peuvent ensuite
+être ajustés pour cette analyse. Ces filtres pilotent sa synthèse de catégorisation et
+son détail ; les quatre premiers onglets suivent les filtres de la barre latérale.
+
+Les requêtes de validation utilisent les dates exactes, y compris un même jour ou un
+intervalle qui traverse deux années. DHIS2 renvoie les violations des périodes qui
+chevauchent ces dates. Les rapports, la complétude, la promptitude et les datasets
+sont recalculés pour le même parent et les mois couverts ; les données de déclaration
+mensuelles restent celles de mois entiers, sans prorata journalier. Une date manquante
+ou un début après la fin désactive le lancement et retire les anciens résultats de règles.
 
 Pour consulter les résultats de catégorisation :
 
@@ -105,11 +120,14 @@ Le tableau **Détail des règles violées**, sous la synthèse de catégorisatio
 - les valeurs gauche/droite et l'opérateur de comparaison ;
 - les instructions, les expressions et les combinaisons disponibles dans les détails.
 
-Les lignes suivent les filtres pays/province/zone, période M et groupe de règles.
+Les lignes suivent le parent pays/province/zone, les calendriers et le groupe de règles
+choisis dans cet onglet.
 Une recherche et un filtre d'importance affinent ce tableau. L'expandeur
 « Consulter le détail d'une violation » affiche les explications complètes de la ligne.
 Le CSV télécharge les lignes affichées ; la feuille Excel `Details_Violations` et
 l'onglet d'aperçu « Règles détaillées » gardent tous les détails du périmètre analysé.
+La feuille `Contexte_Validation` indique les dates appliquées, le parent et son ID,
+le groupe de règles, les mois des indicateurs, la référence M-1 et le barème utilisé.
 Une violation présente sur deux périodes conserve deux lignes, tandis que les compteurs
 de la synthèse regroupent les signatures identiques entre les mois.
 
@@ -166,6 +184,7 @@ Le rapport exporté inclut:
 - conservation des colorations conditionnelles du dashboard dans les tableaux exportés
 - catégorisation complète dans `Resultats_Regles` et légende dans `Baremes_Categorisation`
 - détail des violations de la période M dans `Details_Violations`
+- dates, unité parent et référence de l'analyse dans `Contexte_Validation`
 - (PowerPoint) images des graphiques et tableaux
 - feuilles/slides dédiées: base de données, rapports détaillés (réels/attendus), performance finale, promptitude, comparatif, top/flop, résultats des règles
 
@@ -221,6 +240,7 @@ Extraction_Favori/
 |- scoped_analytics.py
 |- validation_api.py
 |- validation_details.py
+|- validation_filters.py
 |- tests/
 |- requirements.txt
 |- .streamlit/

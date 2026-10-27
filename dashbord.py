@@ -7,17 +7,18 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import io
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from categorisation import (
     NOTE_COLS, TOTAL_COL, build_baremes_df, calculer_categorisation,
     style_context_tab5, style_note_20,
 )
-from reporting_metrics import attach_reporting_scope, clean_ou_id, count_datasets_95
+from reporting_metrics import aggregate_validation_metrics, clean_ou_id
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
+from validation_filters import date_range_months, monthly_bounds, reference_month
 from validation_details import (
     DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
     filter_validation_details, style_importance, validation_detail_identifiers,
@@ -320,7 +321,8 @@ def build_dashboard_comments_df(
             "Element": "Base de données",
             "Commentaire": (
                 "Cette feuille reprend les données sources filtrées (niveau, période, zone). "
-                "Elle sert de référence brute pour toutes les analyses."
+                "Elle sert de référence aux tableaux de performance. Les dates et le parent "
+                "de l'analyse des règles figurent dans Contexte_Validation."
             )
         },
         {
@@ -430,7 +432,8 @@ def to_excel_dashboard_report(
     df_top5=None,
     df_flop5=None,
     style_context=None,
-    df_violations=None
+    df_violations=None,
+    df_validation_context=None
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -519,6 +522,11 @@ def to_excel_dashboard_report(
         detail_sheet.set_column(4, 4, 65)
         detail_sheet.set_column(5, 7, 18)
         detail_sheet.set_column(8, 8, 90)
+        if df_validation_context is not None:
+            df_validation_context.to_excel(writer, index=False, sheet_name='Contexte_Validation')
+            writer.sheets['Contexte_Validation'].set_column(0, 0, 34)
+            writer.sheets['Contexte_Validation'].set_column(1, 1, 95)
+            writer.sheets['Contexte_Validation'].freeze_panes(1, 0)
         for name in ['Resultats_Regles', 'Baremes_Categorisation']:
             sheet = writer.sheets[name]
             sheet.freeze_panes(1, 1)
@@ -1209,7 +1217,7 @@ def get_validation_groups(cache_user=None):
         return None
 
 @st.cache_data(ttl=3600)
-def get_validation_results(ou_id, period_list, group_id, cache_user=None):
+def get_validation_results(ou_id, period_list, group_id, cache_user=None, start_date=None, end_date=None):
     _ = cache_user
     if not ou_id or ou_id == "USER_ORGUNIT" or len(str(ou_id)) < 5:
         result = pd.DataFrame()
@@ -1221,7 +1229,9 @@ def get_validation_results(ou_id, period_list, group_id, cache_user=None):
         result = pd.DataFrame()
         result.attrs['failed_periods'] = list(period_list)
         return result
-    return fetch_validation_analysis(dhis, ou_id, period_list, group_id)
+    return fetch_validation_analysis(
+        dhis, ou_id, period_list, group_id, start_date=start_date, end_date=end_date
+    )
 
 @st.cache_data(ttl=3600)
 def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
@@ -1347,7 +1357,7 @@ with st.sidebar:
     logout_button = col_disc.button("Se déconnecter", use_container_width=True)
 
     if logout_button:
-        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result", "data_revision", "show_report_preview"]:
+        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result", "data_revision", "show_report_preview", "validation_defaults_context"]:
             st.session_state.pop(key, None)
         st.cache_resource.clear()
         st.rerun()
@@ -1366,6 +1376,7 @@ with st.sidebar:
                 st.session_state['data_revision'] = uuid4().hex
                 st.session_state.pop('categorisation_result', None)
                 st.session_state.pop('show_report_preview', None)
+                st.session_state.pop('validation_defaults_context', None)
                 st.success(f"Connecté en tant que : {user_input}")
                 st.rerun()
             else:
@@ -1441,10 +1452,11 @@ if organisation_catalog.empty:
 
 st.sidebar.subheader("🔍 Filtrage")
 
-def _select_scope_id(label, options, labels, key):
+def _select_scope_id(label, options, labels, key, surface=None, on_change=None):
     if st.session_state.get(key) not in options:
         st.session_state.pop(key, None)
-    return st.sidebar.selectbox(label, options, format_func=lambda item: labels.get(item, item), key=key)
+    surface = st.sidebar if surface is None else surface
+    return surface.selectbox(label, options, format_func=lambda item: labels.get(item, item), key=key, on_change=on_change)
 
 country_rows = organisation_catalog[organisation_catalog['Pays_ID'].map(clean_ou_id).ne('')]
 country_labels = labels_for_units(country_rows, 'Pays_ID', 'Pays')
@@ -1586,6 +1598,8 @@ if df_raw is not None:
     df_comparatif = pd.DataFrame()
     df_tab5_export = pd.DataFrame()
     df_violations_export = None
+    df_validation_context_export = None
+    validation_applied_label = None
     df_tab1_export = pd.DataFrame()
     df_actual_detail_export = pd.DataFrame()
     df_expected_detail_export = pd.DataFrame()
@@ -1809,8 +1823,93 @@ if df_raw is not None:
         group_mapping = {g['displayName']: g['id'] for g in (vr_groups or [])}
         options_regles = ["Toutes les règles (Global)"] + list(group_mapping.keys())
 
-        selected_vr_name = st.selectbox("Sélectionner le Groupe de Règles de Validation :", options_regles)
+        default_start, default_end = monthly_bounds(selection_mois)
+        validation_defaults_context = (
+            selected_country_id, selected_province_id, selected_zone_id, tuple(selection_mois)
+        )
+        if (
+            st.session_state.get('validation_defaults_context') != validation_defaults_context
+            or 'validation_start_date' not in st.session_state or 'validation_end_date' not in st.session_state
+        ):
+            st.session_state.update({
+                'validation_country': selected_country_id,
+                'validation_province': selected_province_id or '',
+                'validation_zone': selected_zone_id or '',
+                'validation_start_date': default_start,
+                'validation_end_date': default_end,
+                'validation_defaults_context': validation_defaults_context,
+            })
+
+        st.subheader("Filtres de l'analyse des règles")
+        parent_column, dates_column = st.columns([1, 1.2])
+        with parent_column:
+            st.markdown("**Unité d’organisation parent**")
+            if len(country_options) > 1:
+                validation_country_id = _select_scope_id(
+                    "Pays de l’analyse", country_options, country_labels, 'validation_country', surface=st,
+                    on_change=lambda: st.session_state.update({'validation_province': '', 'validation_zone': ''})
+                )
+            else:
+                validation_country_id = country_options[0]
+                st.caption(country_labels[validation_country_id])
+            validation_country_catalog = organisation_catalog[
+                organisation_catalog['Pays_ID'].eq(validation_country_id)
+            ]
+            validation_province_labels = labels_for_units(
+                validation_country_catalog, 'Province_ID', 'Province'
+            )
+            validation_province_options = [''] + sorted(
+                validation_province_labels, key=lambda item: validation_province_labels[item]
+            )
+            validation_province_labels[''] = 'Toutes les provinces'
+            validation_province_id = _select_scope_id(
+                "Province de l’analyse", validation_province_options, validation_province_labels,
+                'validation_province', surface=st,
+                on_change=lambda: st.session_state.update({'validation_zone': ''})
+            ) or None
+            validation_zones_df = zone_catalog(
+                organisation_catalog, country_id=validation_country_id, province_id=validation_province_id
+            )
+            validation_zone_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
+            validation_zone_options = [''] + sorted(validation_zone_labels, key=lambda item: validation_zone_labels[item])
+            validation_zone_labels[''] = 'Toutes les zones'
+            validation_zone_id = _select_scope_id(
+                "Zone de santé de l’analyse", validation_zone_options, validation_zone_labels,
+                'validation_zone', surface=st
+            ) or None
+            if validation_zone_id:
+                validation_zones_df = zone_catalog(
+                    organisation_catalog, country_id=validation_country_id,
+                    province_id=validation_province_id, zone_id=validation_zone_id
+                )
+            validation_parent_id = validation_zone_id or validation_province_id or validation_country_id
+            validation_parent_label = (
+                validation_zone_labels[validation_zone_id] if validation_zone_id else
+                validation_province_labels[validation_province_id] if validation_province_id else
+                country_labels[validation_country_id]
+            )
+            st.caption(f"Parent sélectionné : {validation_parent_label} — {len(validation_zones_df)} zone(s) de santé.")
+        with dates_column:
+            validation_start_date = st.date_input(
+                "Date de début", value=None, format="YYYY-MM-DD", key='validation_start_date'
+            )
+            validation_end_date = st.date_input(
+                "Date de fin", value=None, format="YYYY-MM-DD", key='validation_end_date'
+            )
+            selected_vr_name = st.selectbox("Sélectionner le Groupe de Règles de Validation :", options_regles)
         target_group_id = group_mapping.get(selected_vr_name)
+        validation_dates_valid = (
+            isinstance(validation_start_date, date) and isinstance(validation_end_date, date)
+            and validation_start_date <= validation_end_date
+        )
+        if not validation_dates_valid:
+            st.error("Renseignez les deux dates ; la date de début doit être antérieure ou égale à la date de fin.")
+        if validation_zones_df.empty:
+            st.warning("Aucune zone de santé accessible pour cette unité parent.")
+        validation_months = date_range_months(validation_start_date, validation_end_date) if validation_dates_valid else []
+        validation_reference_months = [reference_month(validation_start_date)] if validation_dates_valid else []
+        validation_period_id = ';'.join(validation_months)
+        validation_ou_dimension = validation_zone_id or f"LEVEL-3;{validation_parent_id}"
         profil_bareme = st.selectbox(
             "Barème du nombre de datasets à complétude ≥95 % :",
             ["Automatique", "DPS", "ZS"],
@@ -1824,11 +1923,10 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'calculated-details-v1', base_url, current_user_for_cache, id_final, tuple(selection_mois),
-            tuple(selection_mois_prev), filter_level, selected_province,
-            selected_zone, target_group_id,
-            selected_country_id, selected_province_id, selected_zone_id,
-            tuple(selected_zones_df['Zone_ID']),
+            'calculated-date-filters-v1', base_url, current_user_for_cache, id_final,
+            validation_start_date, validation_end_date, tuple(validation_months),
+            tuple(validation_reference_months), validation_parent_id, target_group_id,
+            tuple(validation_zones_df['Zone_ID']),
             tuple(target_df.columns),
             int(pd.util.hash_pandas_object(target_df.astype(str), index=True).sum()),
         )
@@ -1836,88 +1934,45 @@ if df_raw is not None:
         if saved_validation and saved_validation.get("context") != validation_context:
             st.session_state.pop("categorisation_result", None)
         st.caption(
-            f"Période M : {', '.join(selection_mois)}. "
-            f"Période de référence M-1 : {', '.join(selection_mois_prev)}. "
-            "DHIS2 recalcule les règles pour ces périodes, sans enregistrer les résultats ni envoyer de notification. "
-            "Les compteurs dédupliquent les violations identiques sur plusieurs mois."
+            f"Mois couverts : {', '.join(validation_months) or '—'}. "
+            f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
+            "Les dates exactes filtrent le calcul DHIS2. Les indicateurs de déclaration restent mensuels "
+            "et couvrent les mois de cet intervalle. Le calcul n'enregistre aucun résultat et n'envoie aucune notification."
         )
 
-        if st.button("Lancer l'analyse des violations"):
-            can_run_validation = True
-            if is_zone_focus and (not current_id_systeme or len(str(current_id_systeme)) <= 5):
-                can_run_validation = False
+        if st.button("Lancer l'analyse des violations", disabled=not validation_dates_valid or validation_zones_df.empty):
+            can_run_validation = bool(validation_parent_id)
 
             if can_run_validation:
                 with st.spinner('Analyse des violations en cours...'):
 
                     # 1) Le catalogue sélectionné contient exclusivement des zones de santé.
-                    validation_labels = labels_for_units(selected_zones_df, 'Zone_ID', 'Zone')
-                    zones_resolues = [(validation_labels[ou_id], ou_id) for ou_id in selected_zones_df['Zone_ID']]
+                    validation_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
+                    zones_resolues = [(validation_labels[ou_id], ou_id) for ou_id in validation_zones_df['Zone_ID']]
 
                     if not zones_resolues:
                         st.warning("Aucune zone de santé valide trouvée.")
                         st.stop()
 
-                    # 2) Recalcul des métriques au niveau "Zone de santé" (évite les zéros dus aux différences de niveaux)
-                    actual_zone_by_id = {}
-                    comp_zone_by_id = {}
-                    prompt_zone_by_id = {}
-
-                    scope_meta = scope_df[['Organisation unit', 'Organisation unit ID', 'Zone', 'Zone_ID']].copy()
-                    scope_meta = scope_meta.drop_duplicates(subset=['Organisation unit', 'Organisation unit ID'])
-
-                    def _attach_zone_meta(df_source):
-                        if df_source is None or df_source.empty or 'Organisation unit' not in df_source.columns:
-                            return pd.DataFrame()
-                        source = df_source.copy()
-                        if 'Organisation unit ID' not in source and 'Organisation unit ID' in target_df:
-                            source['Organisation unit ID'] = target_df['Organisation unit ID'].reindex(source.index)
-                        return attach_reporting_scope(source, scope_meta)
-
-                    if {'Organisation unit', 'Reports_Actual', 'Reports_Attendu'}.issubset(df_synthese.columns):
-                        df_comp_zone = _attach_zone_meta(
-                            df_synthese[['Organisation unit', 'Reports_Actual', 'Reports_Attendu']]
+                    # 2) Déclarations mensuelles du même périmètre et des mois choisis.
+                    reporting_warnings = []
+                    if validation_ou_dimension == ou_dimension and validation_period_id == period_id:
+                        validation_reporting_source = target_df
+                    else:
+                        validation_reporting_source = get_data(
+                            id_final, period=validation_period_id, cache_user=current_user_for_cache,
+                            ou_dimension=validation_ou_dimension
                         )
-                        if not df_comp_zone.empty:
-                            df_comp_zone['Reports_Actual'] = pd.to_numeric(df_comp_zone['Reports_Actual'], errors='coerce').fillna(0)
-                            df_comp_zone['Reports_Attendu'] = pd.to_numeric(df_comp_zone['Reports_Attendu'], errors='coerce').fillna(0)
-                            grouped_comp = (
-                                df_comp_zone
-                                .groupby(['Zone_ID', 'Zone'], as_index=False)[['Reports_Actual', 'Reports_Attendu']]
-                                .sum()
-                            )
-                            grouped_comp['Complétude_Globale'] = (
-                                grouped_comp['Reports_Actual'] / grouped_comp['Reports_Attendu'].replace(0, np.nan) * 100
-                            ).round(2)
-
-                            actual_zone_by_id = grouped_comp.set_index('Zone_ID')['Reports_Actual'].to_dict()
-                            comp_zone_by_id = grouped_comp.set_index('Zone_ID')['Complétude_Globale'].to_dict()
-
-                    if {'Organisation unit', 'Reports_Actual_On_Time', 'Reports_Attendu'}.issubset(df_final_p.columns):
-                        df_prompt_zone = _attach_zone_meta(
-                            df_final_p[['Organisation unit', 'Reports_Actual_On_Time', 'Reports_Attendu']]
+                        if validation_reporting_source is not None:
+                            validation_reporting_source = normalize_orgunit_columns(validation_reporting_source)
+                    if validation_reporting_source is None or 'Organisation unit ID' not in validation_reporting_source:
+                        reporting_warnings.append(
+                            "Les indicateurs de déclaration sont indisponibles pour cet intervalle et ce parent. "
+                            "Les violations restent consultables ; les scores incomplets restent vides."
                         )
-                        if not df_prompt_zone.empty:
-                            df_prompt_zone['Reports_Actual_On_Time'] = pd.to_numeric(df_prompt_zone['Reports_Actual_On_Time'], errors='coerce').fillna(0)
-                            df_prompt_zone['Reports_Attendu'] = pd.to_numeric(df_prompt_zone['Reports_Attendu'], errors='coerce').fillna(0)
-                            grouped_prompt = (
-                                df_prompt_zone
-                                .groupby(['Zone_ID', 'Zone'], as_index=False)[['Reports_Actual_On_Time', 'Reports_Attendu']]
-                                .sum()
-                            )
-                            grouped_prompt['Promptitude_Globale'] = (
-                                grouped_prompt['Reports_Actual_On_Time'] / grouped_prompt['Reports_Attendu'].replace(0, np.nan) * 100
-                            ).round(2)
-
-                            prompt_zone_by_id = grouped_prompt.set_index('Zone_ID')['Promptitude_Globale'].to_dict()
-
-                    # Compter chaque dataset une seule fois au niveau de l'unité analysée.
-                    datasets_zone_by_id = {}
-                    df_dataset_zone = _attach_zone_meta(target_df)
-                    if not df_dataset_zone.empty:
-                        for (ou_id, ou_name), dataset_rows in df_dataset_zone.groupby(['Zone_ID', 'Zone']):
-                            dataset_count = count_datasets_95(dataset_rows, col_rate_uniquement, target_id=ou_id)
-                            datasets_zone_by_id[str(ou_id)] = dataset_count
+                        validation_reporting_source = pd.DataFrame()
+                    validation_metrics = aggregate_validation_metrics(validation_reporting_source, validation_zones_df)
+                    metrics_by_id = validation_metrics.set_index('Zone_ID').to_dict('index')
 
                     profile_by_id = {}
                     for ou_id, metadata in hierarchy_by_id.items():
@@ -1939,13 +1994,10 @@ if df_raw is not None:
                             (zone_index - 1) / len(zones_resolues) * 0.9,
                             text=f"Zone {zone_index}/{len(zones_resolues)} : {zone_name}"
                         )
-                        comp_val = float(comp_zone_by_id.get(zone_id, np.nan))
-                        prompt_val = float(prompt_zone_by_id.get(zone_id, np.nan))
-                        actual_val = float(actual_zone_by_id.get(zone_id, np.nan))
-                        if not col_actual_strict or not col_expected_strict:
-                            comp_val = np.nan
-                        if not actual_ot_cols or not col_expected_strict:
-                            prompt_val = np.nan
+                        zone_metrics = metrics_by_id.get(zone_id, {})
+                        comp_val = float(zone_metrics.get('Complétude_Globale', np.nan))
+                        prompt_val = float(zone_metrics.get('Promptitude_Globale', np.nan))
+                        actual_val = float(zone_metrics.get('Actual_Reports', np.nan))
                         score_qualite = round((comp_val + prompt_val) / 2, 1)
                         row_cat = {
                             'Zone de santé': zone_name,
@@ -1953,7 +2005,7 @@ if df_raw is not None:
                             'Promptitude_Globale': prompt_val,
                             'Actual_Reports': actual_val,
                             'Score_Qualite': score_qualite,
-                            'Nombre_Datasets_95': datasets_zone_by_id.get(zone_id, np.nan),
+                            'Nombre_Datasets_95': zone_metrics.get('Nombre_Datasets_95', np.nan),
                             'Profil_Bareme': profile_by_id.get(str(zone_id)),
                         }
                         if not zone_id or len(str(zone_id)) < 5:
@@ -1965,8 +2017,13 @@ if df_raw is not None:
                             })
                             continue
 
-                        df_val_zone = get_validation_results(zone_id, selection_mois, target_group_id, cache_user=current_user_for_cache)
-                        df_val_prev_zone = get_validation_results(zone_id, selection_mois_prev, target_group_id, cache_user=current_user_for_cache)
+                        df_val_zone = get_validation_results(
+                            zone_id, validation_months, target_group_id, cache_user=current_user_for_cache,
+                            start_date=validation_start_date, end_date=validation_end_date
+                        )
+                        df_val_prev_zone = get_validation_results(
+                            zone_id, validation_reference_months, target_group_id, cache_user=current_user_for_cache
+                        )
                         if not df_val_zone.empty:
                             zone_violations = df_val_zone.copy()
                             zone_violations.attrs = {}
@@ -2018,6 +2075,16 @@ if df_raw is not None:
                         'violations': violations_details,
                         'validation_warnings': validation_warnings,
                         'detail_warnings': detail_warnings,
+                        'reporting_warnings': reporting_warnings,
+                        'filters': {
+                            'Date de début': validation_start_date.isoformat(),
+                            'Date de fin': validation_end_date.isoformat(),
+                            'Unité d’organisation parent': validation_parent_label,
+                            'ID unité parent': validation_parent_id,
+                            'Groupe de règles': selected_vr_name,
+                            'Mois des indicateurs de déclaration': validation_period_id,
+                            'Période de référence M-1': ';'.join(validation_reference_months),
+                        },
                         'analysed_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds'),
                     }
 
@@ -2028,6 +2095,18 @@ if df_raw is not None:
         if saved_validation and saved_validation.get('context') == validation_context:
             df_cat = calculer_categorisation(saved_validation['data'], profil=profil_bareme)
             st.subheader(f"Résultats : {selected_vr_name}")
+            applied_filters = dict(saved_validation.get('filters', {}))
+            applied_filters['Barème datasets'] = profil_bareme
+            df_validation_context_export = pd.DataFrame(
+                [{'Paramètre': key, 'Valeur': value} for key, value in applied_filters.items()]
+            )
+            validation_applied_label = (
+                f"Parent : {applied_filters.get('Unité d’organisation parent', validation_parent_label)}. "
+                f"Du {applied_filters.get('Date de début', '')} au {applied_filters.get('Date de fin', '')}."
+            )
+            st.caption(validation_applied_label)
+            for message in saved_validation.get('reporting_warnings', []):
+                st.warning(message)
             analysed_at = saved_validation.get('analysed_at')
             if analysed_at:
                 st.caption(f"Analyse effectuée le {datetime.fromisoformat(analysed_at).strftime('%d/%m/%Y à %H:%M:%S')} (Kinshasa).")
@@ -2137,7 +2216,7 @@ if df_raw is not None:
                 st.download_button(
                     "Télécharger les violations affichées en CSV",
                     data=detail_view.to_csv(index=False).encode('utf-8-sig'),
-                    file_name=f"violations_{period_id.replace(';', '_')}.csv", mime='text/csv',
+                    file_name=f"violations_{validation_start_date.isoformat()}_{validation_end_date.isoformat()}.csv", mime='text/csv',
                     key="download_validation_details_csv"
                 )
                 with st.expander("Consulter le détail d'une violation"):
@@ -2258,6 +2337,7 @@ if df_raw is not None:
             df_flop5=df_flop5_export,
             style_context=export_style_context,
             df_violations=df_violations_export,
+            df_validation_context=df_validation_context_export,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -2325,6 +2405,8 @@ if df_raw is not None:
                 st.write("Flop 5 promptitude")
                 st.dataframe(df_flop5_export, use_container_width=True)
         with p_tabs[7]:
+            if validation_applied_label:
+                st.caption(validation_applied_label)
             if df_tab5_export.empty:
                 st.info("Lancez l'analyse des violations dans l'onglet 5 pour afficher la catégorisation.")
             else:
@@ -2332,6 +2414,8 @@ if df_raw is not None:
         with p_tabs[8]:
             st.dataframe(comments_df, use_container_width=True)
         with p_tabs[9]:
+            if validation_applied_label:
+                st.caption(validation_applied_label)
             if df_violations_export is None:
                 st.info("Lancez l'analyse des violations dans l'onglet 5 pour afficher leur détail.")
             elif df_violations_export.empty:

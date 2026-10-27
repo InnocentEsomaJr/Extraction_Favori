@@ -160,3 +160,80 @@ def count_datasets_95(df, rate_columns, target_id=None, id_column="ou_id"):
         count += int(rate >= 95)
 
     return float(count) if applicable else float("nan")
+
+
+def aggregate_validation_metrics(reporting_df, targets):
+    """Agrège les indicateurs mensuels des seules zones ciblées par leur ID.
+
+    Les données Analytics sont attendues au niveau ZS. Une ligne sans ID,
+    d'un autre niveau ou d'une autre zone n'est jamais associée par son nom.
+    Les zones sans données et les métriques incomplètes restent indisponibles.
+    Les mois restent entiers : aucun prorata journalier n'est appliqué.
+    """
+    output_columns = [
+        "Zone_ID", "Complétude_Globale", "Promptitude_Globale",
+        "Actual_Reports", "Nombre_Datasets_95",
+    ]
+    if targets is None or targets.empty or "Zone_ID" not in targets:
+        return pd.DataFrame(columns=output_columns)
+
+    selected = targets.copy()
+    selected["Zone_ID"] = selected["Zone_ID"].map(clean_ou_id)
+    selected = selected.loc[selected["Zone_ID"].ne("")].drop_duplicates("Zone_ID")
+    if selected.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    source = reporting_df.copy() if reporting_df is not None else pd.DataFrame()
+    if "Organisation unit ID" not in source:
+        source = source.iloc[:0].copy()
+        source["Organisation unit ID"] = pd.Series(dtype=object)
+    source["Organisation unit ID"] = source["Organisation unit ID"].map(clean_ou_id)
+    source = source.loc[source["Organisation unit ID"].isin(selected["Zone_ID"])].copy()
+    if "Organisation unit" not in source:
+        source["Organisation unit"] = source["Organisation unit ID"]
+    # Une répétition de la même ligne n'est pas un second rapport. Une vraie
+    # période différente est conservée grâce à ses champs de période distincts.
+    source = source.drop_duplicates()
+
+    scope = pd.DataFrame({
+        "Organisation unit ID": selected["Zone_ID"],
+        "Organisation unit": selected["Zone"] if "Zone" in selected else selected["Zone_ID"],
+        "Zone_ID": selected["Zone_ID"],
+        "Zone": selected["Zone"] if "Zone" in selected else selected["Zone_ID"],
+    })
+    source = attach_reporting_scope(source, scope)
+    actual_columns, expected_columns, on_time_columns, rate_columns = [], [], [], []
+    for column in source.columns:
+        name = _normalise_name(column)
+        if "actual reports" in name:
+            (on_time_columns if "on time" in name else actual_columns).append(column)
+        elif "expected reports" in name and "on time" not in name:
+            expected_columns.append(column)
+        if "reporting rate" in name and "on time" not in name:
+            rate_columns.append(column)
+
+    def total(frame, columns):
+        if not columns:
+            return float("nan")
+        numeric = frame[columns].apply(pd.to_numeric, errors="coerce").astype(float)
+        if numeric.isna().any().any() or (~np.isfinite(numeric)).any().any() or numeric.lt(0).any().any():
+            return float("nan")
+        return round(float(numeric.to_numpy().sum()), 2)
+
+    records = []
+    for target_id in selected["Zone_ID"]:
+        rows = source.loc[source["ou_id"].eq(target_id)]
+        metrics = {column: float("nan") for column in output_columns[1:]}
+        if not rows.empty:
+            actual = total(rows, actual_columns)
+            expected = total(rows, expected_columns)
+            on_time = total(rows, on_time_columns)
+            metrics["Actual_Reports"] = actual
+            if pd.notna(expected) and expected > 0:
+                if pd.notna(actual):
+                    metrics["Complétude_Globale"] = round(actual / expected * 100, 2)
+                if pd.notna(on_time):
+                    metrics["Promptitude_Globale"] = round(on_time / expected * 100, 2)
+            metrics["Nombre_Datasets_95"] = count_datasets_95(rows, rate_columns, target_id=target_id)
+        records.append({"Zone_ID": target_id, **metrics})
+    return pd.DataFrame(records, columns=output_columns)

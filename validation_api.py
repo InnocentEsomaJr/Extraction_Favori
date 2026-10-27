@@ -14,6 +14,8 @@ import re
 
 import pandas as pd
 
+from validation_filters import date_range_months, normalize_date
+
 
 def _identifier(value):
     if isinstance(value, dict):
@@ -118,15 +120,29 @@ def _observation_value(record, flat, legacy):
         return text
 
 
-def fetch_validation_analysis(dhis, ou_id, period_list, group_id=None, limit=500):
+def fetch_validation_analysis(
+    dhis, ou_id, period_list, group_id=None, limit=500, *, start_date=None, end_date=None
+):
     """Calcule les violations du périmètre et de ses descendants, par mois.
 
     Retourne les lignes disponibles avec ``failed_periods`` et
     ``truncated_periods`` dans ``DataFrame.attrs``. Toute période incomplète
     est signalée, même lorsqu'une partie de ses lignes reste affichable.
+    Les bornes facultatives découpent chaque mois aux dates exactes choisies.
+    Si ``period_list`` vaut None et que les deux dates sont fournies, les mois
+    intersectant cet intervalle sont dérivés automatiquement.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("La limite de résultats doit être un entier strictement positif.")
+    exact_start = exact_end = None
+    if start_date is not None or end_date is not None:
+        if start_date is None or end_date is None:
+            raise ValueError("Les dates de début et de fin doivent être fournies ensemble.")
+        exact_start, exact_end = normalize_date(start_date), normalize_date(end_date)
+        if exact_start > exact_end:
+            raise ValueError("La date de début doit précéder ou égaler la date de fin.")
+        if period_list is None:
+            period_list = date_range_months(exact_start, exact_end)
     requested_ou = _identifier(ou_id)
     periods = list(dict.fromkeys(str(value).strip() for value in (
         [period_list] if isinstance(period_list, str) else (period_list or [])
@@ -144,6 +160,10 @@ def fetch_validation_analysis(dhis, ou_id, period_list, group_id=None, limit=500
         except (ValueError, OverflowError):
             incomplete(period, "Période mensuelle invalide")
             continue
+        if exact_start is not None:
+            start, end = max(start, exact_start), min(end, exact_end)
+            if start > end:
+                continue
         if not requested_ou:
             incomplete(period, "Identifiant de l'unité indisponible")
             continue
@@ -206,5 +226,7 @@ def fetch_validation_analysis(dhis, ou_id, period_list, group_id=None, limit=500
     result.attrs.update(
         source="calculated", failed_periods=failed, truncated_periods=truncated,
         errors=errors, scope_ou_id=requested_ou, max_results=limit,
+        start_date=exact_start.isoformat() if exact_start is not None else None,
+        end_date=exact_end.isoformat() if exact_end is not None else None,
     )
     return result

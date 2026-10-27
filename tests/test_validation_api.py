@@ -1,4 +1,5 @@
 import unittest
+from datetime import date, datetime
 
 from validation_api import fetch_validation_analysis
 
@@ -30,6 +31,54 @@ def violation(ou="LeafAAAAAAA", period="202402", rule="RuleAAAAAAA", **changes):
 
 
 class ValidationAnalysisTests(unittest.TestCase):
+    def test_exact_dates_clip_each_month_and_skip_explicit_months_outside_range(self):
+        client = FakeClient([[], [], [], []])
+        result = fetch_validation_analysis(
+            client, "ZoneAAAAAAA", ["202606", "202607", "202608", "202609", "202610", "202611"],
+            start_date=date(2026, 7, 27), end_date="2026-10-27",
+        )
+        self.assertEqual([(params["startDate"], params["endDate"]) for _, params in client.calls], [
+            ("2026-07-27", "2026-07-31"), ("2026-08-01", "2026-08-31"),
+            ("2026-09-01", "2026-09-30"), ("2026-10-01", "2026-10-27"),
+        ])
+        self.assertEqual(result.attrs["start_date"], "2026-07-27")
+        self.assertEqual(result.attrs["end_date"], "2026-10-27")
+        self.assertEqual(result.attrs["failed_periods"], [])
+
+    def test_exact_dates_can_derive_months_cross_year(self):
+        client = FakeClient([[], []])
+        fetch_validation_analysis(client, "ZoneAAAAAAA", None,
+                                  start_date="2025-12-31", end_date=datetime(2026, 1, 1, 12, 30))
+        self.assertEqual([(params["startDate"], params["endDate"]) for _, params in client.calls],
+                         [("2025-12-31", "2025-12-31"), ("2026-01-01", "2026-01-01")])
+
+    def test_same_day_leap_date_uses_exact_day_and_filters_daily_results(self):
+        client = FakeClient([[violation(period="20240228"), violation(period="20240229"), violation(period="20240301")]])
+        result = fetch_validation_analysis(client, "ZoneAAAAAAA", ["202402"],
+                                           start_date="2024-02-29", end_date=date(2024, 2, 29))
+        self.assertEqual(client.calls[0][1]["startDate"], "2024-02-29")
+        self.assertEqual(client.calls[0][1]["endDate"], "2024-02-29")
+        self.assertEqual(result["periodId"].tolist(), ["20240229"])
+        self.assertEqual(result.attrs["failed_periods"], [])
+
+    def test_monthly_and_weekly_period_overlap_uses_clipped_dates(self):
+        client = FakeClient([[violation(period="202607"), violation(period="20260726"),
+                              violation(period="20260727"), violation(period="2026W30"),
+                              violation(period="2026W31")]])
+        result = fetch_validation_analysis(client, "ZoneAAAAAAA", ["202607"],
+                                           start_date="2026-07-27", end_date="2026-07-31")
+        self.assertEqual(result["periodId"].tolist(), ["202607", "20260727", "2026W31"])
+
+    def test_invalid_explicit_dates_fail_before_any_network_request(self):
+        for start, end in [("2026-10-27", None), (None, "2026-10-27"),
+                           ("2026-10-28", "2026-10-27"), ("bad", "2026-10-27"),
+                           ("2026-10-27", "2026-02-30")]:
+            with self.subTest(start=start, end=end):
+                client = FakeClient([])
+                with self.assertRaises(ValueError):
+                    fetch_validation_analysis(client, "ZoneAAAAAAA", ["202610"], start_date=start, end_date=end)
+                self.assertEqual(client.calls, [])
+
     def test_get_parameters_use_calendar_dates_and_disable_all_writes_and_notifications(self):
         client = FakeClient([[], []])
         result = fetch_validation_analysis(client, "ZoneAAAAAAA", ["202402", "202501"], "GroupAAAAAA", limit=123)
