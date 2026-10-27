@@ -98,6 +98,35 @@ de Kinshasa, lors des changements de vue. L'option **Toutes les règles (Global)
 disponible même si aucun groupe de règles n'est configuré. Si la liste des groupes est
 indisponible, un message le précise sans bloquer cette option globale.
 
+Le tableau **Détail des règles violées**, sous la synthèse de catégorisation, présente :
+
+- la zone de santé et l'unité d'organisation concernée (centre de santé, poste, etc.) ;
+- la période, l'importance (`HIGH`, `MEDIUM`, `LOW`) et le libellé de la règle ;
+- les valeurs gauche/droite et l'opérateur de comparaison ;
+- les instructions, les expressions et les combinaisons disponibles dans les détails.
+
+Les lignes suivent les filtres pays/province/zone, période M et groupe de règles.
+Une recherche et un filtre d'importance affinent ce tableau. L'expandeur
+« Consulter le détail d'une violation » affiche les explications complètes de la ligne.
+Le CSV télécharge les lignes affichées ; la feuille Excel `Details_Violations` et
+l'onglet d'aperçu « Règles détaillées » gardent tous les détails du périmètre analysé.
+Une violation présente sur deux périodes conserve deux lignes, tandis que les compteurs
+de la synthèse regroupent les signatures identiques entre les mois.
+
+Les analyses M et M-1 sont calculées à la demande par `GET dataAnalysis/validationRules`,
+avec `persist=false` et `notification=false`. Elles ne modifient pas les données DHIS2
+et ne déclenchent pas de notifications. Le nombre de règles corrigées correspond aux
+signatures de M-1 absentes des résultats M calculés lors de la même analyse.
+Les résultats calculés sont mis en cache pendant une heure ; **Actualiser les données**
+permet de relancer ensuite l'analyse à partir de nouvelles requêtes au serveur.
+Référence : [analyse des règles de validation DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/data-validation.html#validation-rule-analysis).
+
+Une réponse atteignant la limite de 500 résultats demandés est signalée comme partielle.
+Les lignes reçues restent consultables, mais le décompte et les scores concernés restent
+indisponibles. Un groupe de règles plus précis peut réduire le nombre de résultats.
+Si les libellés ou instructions ne sont pas accessibles, les identifiants disponibles
+restent visibles avec un message explicatif ; aucune valeur manquante n'est remplacée par zéro.
+
 Le filtrage s'applique à tous les tableaux, graphiques, exports et règles de validation :
 
 - **Pays** : toutes les zones de santé du pays sélectionné.
@@ -136,6 +165,7 @@ Le rapport exporté inclut:
 - commentaires automatiques (lecture des graphiques et tableaux)
 - conservation des colorations conditionnelles du dashboard dans les tableaux exportés
 - catégorisation complète dans `Resultats_Regles` et légende dans `Baremes_Categorisation`
+- détail des violations de la période M dans `Details_Violations`
 - (PowerPoint) images des graphiques et tableaux
 - feuilles/slides dédiées: base de données, rapports détaillés (réels/attendus), performance finale, promptitude, comparatif, top/flop, résultats des règles
 
@@ -189,6 +219,8 @@ Extraction_Favori/
 |- reporting_metrics.py
 |- geography.py
 |- scoped_analytics.py
+|- validation_api.py
+|- validation_details.py
 |- tests/
 |- requirements.txt
 |- .streamlit/

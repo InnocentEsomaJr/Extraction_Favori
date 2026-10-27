@@ -17,6 +17,11 @@ from reporting_metrics import attach_reporting_scope, clean_ou_id, count_dataset
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
+from validation_api import fetch_validation_analysis
+from validation_details import (
+    DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
+    filter_validation_details, style_importance, validation_detail_identifiers,
+)
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="SNIS RDC - Dashboard Performance", layout="wide")
@@ -424,7 +429,8 @@ def to_excel_dashboard_report(
     df_tab5=None,
     df_top5=None,
     df_flop5=None,
-    style_context=None
+    style_context=None,
+    df_violations=None
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -495,6 +501,24 @@ def to_excel_dashboard_report(
             ).to_excel(writer, index=False, sheet_name='Resultats_Regles')
 
         build_baremes_df().to_excel(writer, index=False, sheet_name='Baremes_Categorisation')
+        if df_violations is not None:
+            details_styler = df_violations.style.format(
+                {'Valeur gauche': '{:.2f}', 'Valeur droite': '{:.2f}'}, na_rep=''
+            )
+            if 'Importance' in df_violations.columns:
+                details_styler = details_styler.map(style_importance, subset=['Importance'])
+            details_styler.to_excel(writer, index=False, sheet_name='Details_Violations')
+        else:
+            pd.DataFrame([{'Information': "Lancez l'analyse des violations pour afficher leur détail."}]).to_excel(
+                writer, index=False, sheet_name='Details_Violations'
+            )
+        detail_sheet = writer.sheets['Details_Violations']
+        detail_sheet.freeze_panes(1, 2)
+        detail_sheet.set_column(0, 1, 30)
+        detail_sheet.set_column(2, 3, 20)
+        detail_sheet.set_column(4, 4, 65)
+        detail_sheet.set_column(5, 7, 18)
+        detail_sheet.set_column(8, 8, 90)
         for name in ['Resultats_Regles', 'Baremes_Categorisation']:
             sheet = writer.sheets[name]
             sheet.freeze_panes(1, 1)
@@ -1187,35 +1211,53 @@ def get_validation_groups(cache_user=None):
 @st.cache_data(ttl=3600)
 def get_validation_results(ou_id, period_list, group_id, cache_user=None):
     _ = cache_user
-    # Sécurité anti-Erreur 409 : si l'ID n'est pas un ID système DHIS2, on bloque.
     if not ou_id or ou_id == "USER_ORGUNIT" or len(str(ou_id)) < 5:
         result = pd.DataFrame()
         result.attrs['failed_periods'] = list(period_list)
         return result
-
-    all_results = []
-    failed_periods = []
     try:
         dhis = get_dhis2_client()
     except Exception:
         result = pd.DataFrame()
         result.attrs['failed_periods'] = list(period_list)
         return result
-    for pe in period_list:
-        try:
-            params = {"ou": ou_id, "pe": pe, "ouMode": "DESCENDANTS"}
-            if group_id:
-                params["vrg"] = group_id
-            res = dhis.get("validationResults", params=params)
-            if isinstance(res.get('validationResults'), list):
-                all_results.extend(res['validationResults'])
-            else:
-                failed_periods.append(pe)
-        except Exception:
-            failed_periods.append(pe)
-    result = pd.DataFrame(all_results)
-    result.attrs['failed_periods'] = failed_periods
-    return result
+    return fetch_validation_analysis(dhis, ou_id, period_list, group_id)
+
+@st.cache_data(ttl=3600)
+def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
+    """Complète les libellés et explications par lots, sans bloquer les résultats."""
+    _ = cache_user
+    rules, units, errors = {}, {}, []
+    if not rule_ids and not org_ids:
+        return rules, units, errors
+    try:
+        dhis = get_dhis2_client()
+    except Exception:
+        return rules, units, ["Les métadonnées des violations sont indisponibles."]
+    requests_metadata = [
+        ('validationRules', rule_ids, 'id,displayName,description,instruction,importance,operator,leftSide[description,expression],rightSide[description,expression]', rules),
+        ('organisationUnits', org_ids, 'id,displayName,path,ancestors[id,displayName,level]', units),
+    ]
+    for endpoint, identifiers, fields, target in requests_metadata:
+        label = 'règles de validation' if endpoint == 'validationRules' else 'unités d’organisation'
+        identifiers = sorted({clean_ou_id(value) for value in (identifiers or []) if clean_ou_id(value)})
+        for start in range(0, len(identifiers), 60):
+            chunk = identifiers[start:start + 60]
+            try:
+                response = dhis.get(endpoint, params={
+                    'fields': fields, 'filter': f"id:in:[{','.join(chunk)}]", 'paging': 'false'
+                })
+                items = response.get(endpoint)
+                if not isinstance(items, list):
+                    raise ValueError("Réponse de métadonnées invalide")
+                for item in items:
+                    if isinstance(item, dict) and clean_ou_id(item.get('id')):
+                        target[clean_ou_id(item['id'])] = item
+                if any(identifier not in target for identifier in chunk):
+                    errors.append(f"Certaines informations sur les {label} sont indisponibles.")
+            except Exception:
+                errors.append(f"Les informations sur les {label} sont indisponibles pour {len(chunk)} élément(s).")
+    return rules, units, list(dict.fromkeys(errors))
 
 @st.cache_data(ttl=3600)
 def get_children_org_units_details(parent_id, cache_user=None):
@@ -1543,6 +1585,7 @@ if df_raw is not None:
     df_tab4_fusion = pd.DataFrame()
     df_comparatif = pd.DataFrame()
     df_tab5_export = pd.DataFrame()
+    df_violations_export = None
     df_tab1_export = pd.DataFrame()
     df_actual_detail_export = pd.DataFrame()
     df_expected_detail_export = pd.DataFrame()
@@ -1781,7 +1824,7 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            base_url, current_user_for_cache, id_final, tuple(selection_mois),
+            'calculated-details-v1', base_url, current_user_for_cache, id_final, tuple(selection_mois),
             tuple(selection_mois_prev), filter_level, selected_province,
             selected_zone, target_group_id,
             selected_country_id, selected_province_id, selected_zone_id,
@@ -1795,7 +1838,8 @@ if df_raw is not None:
         st.caption(
             f"Période M : {', '.join(selection_mois)}. "
             f"Période de référence M-1 : {', '.join(selection_mois_prev)}. "
-            "Les violations identiques sur plusieurs mois sont comptées une seule fois."
+            "DHIS2 recalcule les règles pour ces périodes, sans enregistrer les résultats ni envoyer de notification. "
+            "Les compteurs dédupliquent les violations identiques sur plusieurs mois."
         )
 
         if st.button("Lancer l'analyse des violations"):
@@ -1887,10 +1931,12 @@ if df_raw is not None:
 
                     # 3) Violations par zone et corrections des mêmes erreurs entre M-1 et M.
                     rows_cat = []
+                    raw_violations = []
+                    validation_warnings = []
                     analysis_progress = st.progress(0.0, text=f"Analyse de {len(zones_resolues)} zone(s) de santé")
                     for zone_index, (zone_name, zone_id) in enumerate(zones_resolues, start=1):
                         analysis_progress.progress(
-                            (zone_index - 1) / len(zones_resolues),
+                            (zone_index - 1) / len(zones_resolues) * 0.9,
                             text=f"Zone {zone_index}/{len(zones_resolues)} : {zone_name}"
                         )
                         comp_val = float(comp_zone_by_id.get(zone_id, np.nan))
@@ -1921,6 +1967,12 @@ if df_raw is not None:
 
                         df_val_zone = get_validation_results(zone_id, selection_mois, target_group_id, cache_user=current_user_for_cache)
                         df_val_prev_zone = get_validation_results(zone_id, selection_mois_prev, target_group_id, cache_user=current_user_for_cache)
+                        if not df_val_zone.empty:
+                            zone_violations = df_val_zone.copy()
+                            zone_violations.attrs = {}
+                            zone_violations['_zone_id'] = zone_id
+                            zone_violations['_zone_name'] = zone_name
+                            raw_violations.append(zone_violations)
 
                         # Comparaison des mêmes erreurs entre T-1 et T
                         sig_now = build_violation_signature_set(df_val_zone)
@@ -1931,10 +1983,15 @@ if df_raw is not None:
                         violations_mois_precedent = np.nan if failed_prev else len(sig_prev)
                         violations_corrigees = np.nan if failed_now or failed_prev else len(sig_prev - sig_now)
                         errors = []
-                        if failed_now:
-                            errors.append(f"Validation M indisponible : {', '.join(failed_now)}")
-                        if failed_prev:
-                            errors.append(f"Validation M-1 indisponible : {', '.join(failed_prev)}")
+                        for label, frame, failed in [('M', df_val_zone, failed_now), ('M-1', df_val_prev_zone, failed_prev)]:
+                            truncated = frame.attrs.get('truncated_periods', [])
+                            if truncated:
+                                errors.append(f"Résultats {label} limités pour : {', '.join(truncated)}")
+                            unavailable = [pe for pe in failed if pe not in truncated]
+                            if unavailable:
+                                errors.append(f"Analyse {label} indisponible : {', '.join(unavailable)}")
+                        if errors:
+                            validation_warnings.append(f"{zone_name} : {' ; '.join(errors)}")
 
                         rows_cat.append({**row_cat,
                             'Violations_Actuelles': violations_actuelles,
@@ -1943,10 +2000,24 @@ if df_raw is not None:
                             'Erreur_Validation': '; '.join(errors),
                         })
 
+                    analysis_progress.progress(0.9, text="Chargement des libellés et détails des règles")
+                    all_violations = pd.concat(raw_violations, ignore_index=True) if raw_violations else pd.DataFrame()
+                    identifiers = validation_detail_identifiers(all_violations)
+                    preliminary_details = build_validation_details(all_violations)
+                    missing_unit_ids = preliminary_details.loc[
+                        preliminary_details[VIOLATION_COLUMNS[1]].eq(preliminary_details['_ou_id']), '_ou_id'
+                    ].dropna().unique().tolist()
+                    rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
+                        tuple(identifiers['rule_ids']), tuple(missing_unit_ids), cache_user=current_user_for_cache
+                    )
+                    violations_details = build_validation_details(all_violations, rule_metadata, unit_metadata)
                     analysis_progress.progress(1.0, text=f"{len(zones_resolues)} zone(s) traitée(s)")
                     st.session_state['categorisation_result'] = {
                         'context': validation_context,
                         'data': pd.DataFrame(rows_cat),
+                        'violations': violations_details,
+                        'validation_warnings': validation_warnings,
+                        'detail_warnings': detail_warnings,
                         'analysed_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds'),
                     }
 
@@ -2015,6 +2086,83 @@ if df_raw is not None:
             average_score = df_cat[TOTAL_COL].mean()
             col_res3.metric("Score moyen de catégorisation /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
             col_res4.metric("Unités avec score complet", f"{int((~invalid_scores).sum())} / {len(df_cat)}")
+
+            st.divider()
+            st.subheader("Détail des règles violées")
+            violations_all = saved_validation.get('violations', build_validation_details(pd.DataFrame()))
+            df_violations_export = detail_export_frame(violations_all)
+            validation_warnings = saved_validation.get('validation_warnings', [])
+            if validation_warnings:
+                st.warning(
+                    "Certaines analyses sont indisponibles ou limitées par DHIS2. "
+                    "Les lignes reçues restent visibles, mais les scores concernés ne sont pas calculés."
+                )
+                with st.expander("Voir les périodes et zones concernées"):
+                    for message in validation_warnings:
+                        st.text(message)
+            for message in saved_validation.get('detail_warnings', []):
+                st.info(message)
+            st.caption(
+                "Chaque ligne correspond à une violation par unité d'organisation et période M. "
+                "Les compteurs de catégorisation regroupent les violations identiques entre les mois."
+            )
+            detail_query = st.text_input("Rechercher dans les violations", key="validation_detail_search")
+            detail_importance = st.selectbox(
+                "Filtrer les violations par importance", ['Toutes', 'HIGH', 'MEDIUM', 'LOW', 'Non renseignée'],
+                key="validation_detail_importance"
+            )
+            violations_visible = filter_validation_details(violations_all, query=detail_query, importance=detail_importance)
+            detail_view = detail_export_frame(violations_visible)
+            st.caption(
+                f"{len(detail_view)} violation(s) affichée(s) sur {len(df_violations_export)}. "
+                "Le CSV contient les lignes affichées ; le rapport Excel et l'aperçu conservent le détail complet."
+            )
+            if violations_all.empty:
+                if validation_warnings:
+                    st.info("Aucune ligne de violation n'a été reçue. Consultez les messages d'analyse ci-dessus.")
+                else:
+                    st.success("Aucune règle violée détectée pour les filtres sélectionnés.")
+            elif detail_view.empty:
+                st.info("Aucune violation ne correspond à cette recherche et à ce filtre d'importance.")
+            else:
+                st.dataframe(
+                    detail_view.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
+                    .map(style_importance, subset=['Importance']),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        'Règle de validation': st.column_config.TextColumn(width='large'),
+                        'Détails': st.column_config.TextColumn(width='large'),
+                    },
+                )
+                st.download_button(
+                    "Télécharger les violations affichées en CSV",
+                    data=detail_view.to_csv(index=False).encode('utf-8-sig'),
+                    file_name=f"violations_{period_id.replace(';', '_')}.csv", mime='text/csv',
+                    key="download_validation_details_csv"
+                )
+                with st.expander("Consulter le détail d'une violation"):
+                    row_options = list(range(len(violations_visible)))
+                    if st.session_state.get('validation_selected_row') not in row_options:
+                        st.session_state.pop('validation_selected_row', None)
+                    selected_row = st.selectbox(
+                        "Violation à consulter", row_options,
+                        format_func=lambda position: (
+                            f"{violations_visible.iloc[position][VIOLATION_COLUMNS[1]]} — "
+                            f"{violations_visible.iloc[position]['Période']} — "
+                            f"{violations_visible.iloc[position]['Règle de validation']}"
+                        ),
+                        key="validation_selected_row"
+                    )
+                    violation = violations_visible.iloc[selected_row]
+                    st.text(
+                        f"Unité : {violation[VIOLATION_COLUMNS[1]]}\n"
+                        f"Période : {violation['Période']}\nImportance : {violation['Importance']}"
+                    )
+                    st.text(str(violation['Règle de validation']))
+                    left_value = 'Non renseignée' if pd.isna(violation['Valeur gauche']) else f"{violation['Valeur gauche']:g}"
+                    right_value = 'Non renseignée' if pd.isna(violation['Valeur droite']) else f"{violation['Valeur droite']:g}"
+                    st.text(f"{left_value} {violation['Opérateur']} {right_value}")
+                    st.text(str(violation['Détails']))
 
     # --- MENU SIDEBAR : EXTRACTION COMMENTEE ---
     with st.sidebar:
@@ -2108,7 +2256,8 @@ if df_raw is not None:
             df_tab5=df_tab5_export,
             df_top5=df_top5_export,
             df_flop5=df_flop5_export,
-            style_context=export_style_context
+            style_context=export_style_context,
+            df_violations=df_violations_export,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -2149,6 +2298,7 @@ if df_raw is not None:
             "Top/Flop",
             "Règles",
             "Commentaires",
+            "Règles détaillées",
         ])
 
         with p_tabs[0]:
@@ -2181,5 +2331,15 @@ if df_raw is not None:
                 st.dataframe(_build_styler(df_tab5_export, **style_context_tab5()), use_container_width=True, hide_index=True)
         with p_tabs[8]:
             st.dataframe(comments_df, use_container_width=True)
+        with p_tabs[9]:
+            if df_violations_export is None:
+                st.info("Lancez l'analyse des violations dans l'onglet 5 pour afficher leur détail.")
+            elif df_violations_export.empty:
+                st.info("Aucune ligne de violation disponible pour cette analyse.")
+            else:
+                st.dataframe(
+                    df_violations_export.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
+                    .map(style_importance, subset=['Importance']), use_container_width=True, hide_index=True
+                )
 else:
     st.error("❌ Données indisponibles.")

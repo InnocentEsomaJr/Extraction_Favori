@@ -14,6 +14,7 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from categorisation import TOTAL_COL, build_baremes_df, style_context_tab5, style_note_20
+from validation_api import fetch_validation_analysis
 
 
 DASHBOARD = Path(__file__).resolve().parents[1] / "dashbord.py"
@@ -26,7 +27,11 @@ def dashboard_functions(*names, **overrides):
         node = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name))
         node.decorator_list = []
         functions.append(node)
-    namespace = {"pd": pd, "np": np, "io": io, "style_note_20": style_note_20, "build_baremes_df": build_baremes_df, **overrides}
+    namespace = {
+        "pd": pd, "np": np, "io": io, "style_note_20": style_note_20,
+        "build_baremes_df": build_baremes_df, "fetch_validation_analysis": fetch_validation_analysis,
+        **overrides,
+    }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(DASHBOARD), "exec"), namespace)
     return namespace
 
@@ -35,13 +40,19 @@ class ValidationApiTests(unittest.TestCase):
     def test_empty_success_is_distinct_from_failed_and_malformed_periods(self):
         class Client:
             def get(self, endpoint, params=None):
-                if params["pe"] == "202501":
-                    return {"validationResults": []}
-                if params["pe"] == "202502":
-                    return {"validationResults": [{"organisationUnit": "ZoneAAAAAAA", "validationRule": "ruleA"}]}
-                if params["pe"] == "202503":
+                self.assert_endpoint(endpoint)
+                period = params["startDate"][:7].replace("-", "")
+                if period == "202501":
+                    return []
+                if period == "202502":
+                    return [{"organisationUnitId": "ZoneAAAAAAA", "validationRuleId": "RuleAAAAAAA", "periodId": period, "leftSideValue": 0, "rightSideValue": 1}]
+                if period == "202503":
                     raise RuntimeError("fixture indisponible")
                 return {"unexpected": []}
+
+            def assert_endpoint(self, endpoint):
+                if endpoint != "dataAnalysis/validationRules":
+                    raise AssertionError("Appel fixture non prévu")
 
         namespace = dashboard_functions("get_validation_results", get_dhis2_client=lambda: Client())
         get_results = namespace["get_validation_results"]
@@ -153,13 +164,13 @@ def get_validation_groups(cache_user=None):
 def get_dhis2_client():
     class Client:
         def get(self, endpoint, params=None):
-            if endpoint != "validationResults":
+            if endpoint != "dataAnalysis/validationRules":
                 raise AssertionError("Appel fixture non prévu")
             st.session_state["_fixture_validation_calls"] = st.session_state.get("_fixture_validation_calls", 0) + 1
             targets = list(st.session_state.get("_fixture_validation_targets", []))
             targets.append(params["ou"])
             st.session_state["_fixture_validation_targets"] = targets
-            return {"validationResults": []}
+            return []
     return Client()
 
 def test_dhis2_credentials(base_url, username, password):
