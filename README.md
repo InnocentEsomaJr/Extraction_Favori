@@ -84,6 +84,21 @@ Dans l'onglet de catégorisation, les calendriers **Date de début** et **Date d
 définissent l'intervalle M. La référence M-1 reste le mois entier précédant celui de
 la date de début. Chaque ligne renvoyée par DHIS2 est conservée et comptée.
 
+Deux actions sont séparées :
+
+1. **Lancer l'analyse des violations** interroge uniquement la période filtrée M.
+   Le détail, le compteur M, le ratio et la note des violations sont disponibles
+   sans requête M-1. Les colonnes M-1, corrections et le total /100 restent vides,
+   avec le statut « contrôle des corrections non effectué ».
+2. **Contrôler les corrections du mois précédent** devient disponible après une
+   analyse M réussie. Ce bouton interroge M-1 et le compare aux résultats M déjà
+   affichés, sans relancer ni remplacer M. Il complète les corrections et le total
+   si les données nécessaires sont disponibles. Un échec M-1 conserve le détail,
+   les compteurs et la note des violations M ; le contrôle peut être réessayé.
+
+Relancer M efface le contrôle précédent. Changer les dates, le parent ou le groupe
+de règles impose une nouvelle analyse M avant un nouveau contrôle.
+
 Le bloc **Unité d’organisation parent** permet de choisir le pays, puis une province
 et éventuellement une zone de santé. Les parents possibles restent les niveaux pays,
 province et ZS ; leurs centres et postes apparaissent dans le détail des violations.
@@ -127,7 +142,8 @@ Une recherche et un filtre d'importance affinent ce tableau. L'expandeur
 Le CSV télécharge les lignes affichées ; la feuille Excel `Details_Violations` et
 l'onglet d'aperçu « Règles détaillées » gardent tous les détails du périmètre analysé.
 La feuille `Contexte_Validation` indique les dates appliquées, le parent et son ID,
-le groupe de règles, les mois des indicateurs, la référence M-1 et le barème utilisé.
+le groupe de règles, les mois des indicateurs, la référence M-1, le barème utilisé,
+l'état du contrôle et les horodatages distincts de l'analyse M et du contrôle.
 Les lignes conservent l'ordre, les périodes, les valeurs et les libellés renvoyés par DHIS2,
 y compris les règles dont la description est vide. Une violation présente sur deux
 périodes conserve deux lignes et compte deux fois dans la synthèse. Les signatures
@@ -137,7 +153,7 @@ Les analyses M et M-1 sont calculées à la demande par `POST /api/dataAnalysis/
 avec un corps JSON contenant `ou`, `startDate`, `endDate`, `persist: false`,
 `notification: false` et éventuellement `vrg`, comme l'application officielle DHIS2.
 Une seule requête couvre le parent sélectionné et l'intervalle complet ; la requête
-M-1 utilise le même parent et le mois de référence entier. Les unités descendantes
+M-1, lancée uniquement par le second bouton, utilise le même parent et le mois de référence entier. Les unités descendantes
 sont sélectionnées par DHIS2. Les chemins hiérarchiques ne sont pas obligatoires
 dans la réponse ; les métadonnées servent à répartir les lignes par zone de santé.
 Si ce rattachement manque, les lignes restent affichées et les comptes par zone
@@ -145,13 +161,13 @@ restent indisponibles. Un ancien serveur répondant HTTP 404, 405 ou 501 au POST
 est interrogé en GET avec les mêmes paramètres. Un refus 401/403 reste une erreur.
 Ces analyses ne modifient pas les données DHIS2
 et ne déclenchent pas de notifications. Le nombre de règles corrigées correspond aux
-signatures de M-1 absentes des résultats M calculés lors de la même analyse.
-Chaque clic sur **Lancer l'analyse des violations** effectue de nouvelles requêtes
-DHIS2. Les résultats restent en session pendant la consultation, sans nouvel appel
+signatures de M-1 absentes de l'analyse M affichée.
+Chaque clic sur **Lancer l'analyse des violations** effectue une nouvelle requête
+DHIS2 pour M. Chaque clic sur le contrôle recharge uniquement M-1. Les résultats restent en session pendant la consultation, sans nouvel appel
 lors d'une recherche, d'un tri ou d'un export. **Actualiser les données** recharge
 aussi les indicateurs de déclaration et les métadonnées.
 L'expandeur **Vérifier la requête envoyée à DHIS2** présente le compte, le parent,
-les dates, le groupe et le nombre de lignes reçues pour M et M-1. Les erreurs
+les dates, le groupe et le nombre de lignes reçues pour M, puis M-1 après le contrôle. Les erreurs
 indiquent la méthode et le statut HTTP, sans afficher les identifiants de connexion.
 Références : [appel dans l'application officielle](https://github.com/dhis2/data-quality-app/blob/54a3bf8ed25e051fbea00ceef715df81812b3e62/src/pages/ValidationRulesAnalysis/ValidationRulesAnalysis.jsx),
 [conversion des résultats serveur](https://github.com/dhis2/data-quality-app/blob/54a3bf8ed25e051fbea00ceef715df81812b3e62/src/pages/ValidationRulesAnalysis/convert-element-from-api-response.js).

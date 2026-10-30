@@ -103,21 +103,30 @@ def calculer_categorisation(df, profil="Automatique"):
     previous = _numeric(_column(result, "Violations_Mois_Precedent"))
     corrected = _numeric(_column(result, "Violations_Corrigees"))
     actual = _numeric(_column(result, "Actual_Reports"))
-    correction_valid = previous.notna() & corrected.notna() & corrected.le(previous)
-    remaining = (previous - corrected).clip(lower=0).where(correction_valid)
     errors = _column(result, "Erreur_Validation").fillna("").astype(str).str.strip().ne("")
+    correction_errors = _column(result, "Erreur_Corrections").fillna("").astype(str).str.strip().ne("")
+    # Les anciens résultats contenaient déjà M et M-1 dans une seule analyse.
+    # Dans le nouveau flux, seul le second bouton confirme le contrôle M-1.
+    correction_checked = (
+        result["Controle_Corrections_Effectue"].eq(True).fillna(False).astype(bool)
+        if "Controle_Corrections_Effectue" in result.columns
+        else pd.Series(True, index=result.index, dtype=bool)
+    )
+    correction_counts_valid = previous.notna() & corrected.notna() & corrected.le(previous)
+    correction_valid = correction_counts_valid & correction_checked & ~errors & ~correction_errors
+    remaining = (previous - corrected).clip(lower=0).where(correction_valid)
 
     result["Ratio_Violations_sur_100"] = current / actual.where(actual.gt(0)) * 100
     result[QUALITY_NOTE_COL] = score_taux(_column(result, "Score_Qualite"))
     result["Barème datasets"] = profiles.fillna("À préciser")
     result[DATASET_COUNT_COL] = counts
-    result[REMAINING_COL] = remaining.where(~errors)
+    result[REMAINING_COL] = remaining
     result[COMPONENT_COLS[0]] = score_taux(_column(result, "Complétude_Globale"))
     result[COMPONENT_COLS[1]] = score_taux(_column(result, "Promptitude_Globale"))
     result[COMPONENT_COLS[2]] = score_datasets(counts, profiles)
     result[COMPONENT_COLS[3]] = score_violations(result["Ratio_Violations_sur_100"]).where(~errors)
     correction_score = pd.Series(np.where(remaining.eq(0), 20, 0), index=result.index, dtype=float)
-    result[COMPONENT_COLS[4]] = correction_score.where(remaining.notna() & ~errors)
+    result[COMPONENT_COLS[4]] = correction_score.where(remaining.notna())
     result[TOTAL_COL] = result[COMPONENT_COLS].sum(axis=1, min_count=len(COMPONENT_COLS))
 
     reasons = [
@@ -128,7 +137,12 @@ def calculer_categorisation(df, profil="Automatique"):
         (actual.isna() | actual.le(0), "nombre de rapports nul ou indisponible"),
         (errors, "analyse des violations indisponible"),
         (~errors & current.isna(), "violations actuelles indisponibles"),
-        (~errors & ~correction_valid, "comparaison des corrections indisponible ou incohérente"),
+        (~correction_checked, "contrôle des corrections non effectué"),
+        (correction_checked & correction_errors, "contrôle des corrections indisponible"),
+        (
+            correction_checked & ~errors & ~correction_errors & ~correction_counts_valid,
+            "comparaison des corrections indisponible ou incohérente",
+        ),
     ]
     statuses = []
     for position in range(len(result)):

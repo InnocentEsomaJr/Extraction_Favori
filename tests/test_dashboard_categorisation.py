@@ -253,6 +253,8 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertTrue(app.session_state["_test_export_frame"].empty)
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+            self.run_app(app)
             frame = app.session_state["_test_export_frame"]
             self.assertEqual(frame[TOTAL_COL].tolist(), [100])
             self.assertEqual(frame["Barème datasets"].tolist(), ["ZS"])
@@ -275,6 +277,8 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertTrue(app.session_state["_test_export_frame"].empty)
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+            self.run_app(app)
             self.assertEqual(app.session_state["_test_export_frame"][TOTAL_COL].tolist(), [95])
             self.widget(app, "selectbox", "Mois fin :").select("Février")
             self.run_app(app)
@@ -286,6 +290,8 @@ class CategorisationAppTests(unittest.TestCase):
             self.run_app(app)
             self.assertEqual(app.session_state["_fixture_data_scope"], "LEVEL-3;CountryAAAA")
             self.widget(app, "button", "Lancer l'analyse des violations").click()
+            self.run_app(app)
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
             self.run_app(app)
             frame = app.session_state["_test_export_frame"]
             self.assertEqual(frame["Barème datasets"].tolist(), ["ZS"])

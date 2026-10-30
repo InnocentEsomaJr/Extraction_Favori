@@ -86,6 +86,8 @@ class ValidationDateFilterTests(unittest.TestCase):
     def analyse(self, app):
         self.widget(app, "button", "Lancer l'analyse des violations").click()
         self.run_app(app)
+        self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+        self.run_app(app)
         return app.session_state["_test_export_frame"].copy(deep=True)
 
     def choose_dates(self, app, start, end):

@@ -94,6 +94,64 @@ class CategorisationTests(unittest.TestCase):
         self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
         self.assertIn("analyse des violations indisponible", actual.loc[0, "Statut catégorisation"])
 
+    def test_current_analysis_scores_violations_before_optional_correction_control(self):
+        actual = calculer_categorisation(self.frame(
+            Controle_Corrections_Effectue=False, Erreur_Corrections="",
+            Violations_Mois_Precedent=None, Violations_Corrigees=None,
+        ))
+        self.assertEqual(actual.loc[0, COMPONENT_COLS[3]], 20)
+        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[4]]))
+        self.assertTrue(pd.isna(actual.loc[0, REMAINING_COL]))
+        self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
+        self.assertEqual(actual.loc[0, "Statut catégorisation"],
+                         "Incomplète : contrôle des corrections non effectué")
+
+    def test_unperformed_control_does_not_reuse_stale_correction_counts(self):
+        actual = calculer_categorisation(self.frame(Controle_Corrections_Effectue=False))
+        self.assertEqual(actual.loc[0, COMPONENT_COLS[3]], 20)
+        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[4]]))
+        self.assertTrue(pd.isna(actual.loc[0, REMAINING_COL]))
+        self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
+
+    def test_failed_reference_control_does_not_erase_a_valid_current_violation_score(self):
+        actual = calculer_categorisation(self.frame(
+            Controle_Corrections_Effectue=True, Erreur_Corrections="M-1 : HTTP 403",
+            Violations_Mois_Precedent=None, Violations_Corrigees=None,
+            Violations_Actuelles=20,
+        ))
+        self.assertEqual(actual.loc[0, COMPONENT_COLS[3]], 5)
+        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[4]]))
+        self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
+        self.assertEqual(actual.loc[0, "Statut catégorisation"],
+                         "Incomplète : contrôle des corrections indisponible")
+
+    def test_successful_reference_control_completes_the_total(self):
+        actual = calculer_categorisation(self.frame(
+            Controle_Corrections_Effectue=True, Erreur_Corrections="",
+        ))
+        self.assertEqual(actual.loc[0, COMPONENT_COLS[3:]].tolist(), [20, 20])
+        self.assertEqual(actual.loc[0, TOTAL_COL], 100)
+        self.assertEqual(actual.loc[0, "Statut catégorisation"], "Complète")
+
+    def test_current_failure_still_blocks_both_violation_components_after_control(self):
+        actual = calculer_categorisation(self.frame(
+            Controle_Corrections_Effectue=True, Erreur_Corrections="", Erreur_Validation="M : HTTP 403",
+        ))
+        self.assertTrue(actual.loc[0, COMPONENT_COLS[3:]].isna().all())
+        self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
+        self.assertIn("analyse des violations indisponible", actual.loc[0, "Statut catégorisation"])
+
+    def test_mixed_control_states_stay_independent_per_zone(self):
+        source = pd.concat([
+            self.frame(Controle_Corrections_Effectue=False, Erreur_Corrections=""),
+            self.frame(Controle_Corrections_Effectue=True, Erreur_Corrections="M-1 indisponible"),
+            self.frame(Controle_Corrections_Effectue=True, Erreur_Corrections=""),
+        ], ignore_index=True)
+        actual = calculer_categorisation(source)
+        self.assertEqual(actual[COMPONENT_COLS[3]].tolist(), [20, 20, 20])
+        self.assertTrue(actual.loc[:1, COMPONENT_COLS[4]].isna().all())
+        self.assertEqual(actual.loc[2, TOTAL_COL], 100)
+
     def test_ratio_exactly_twenty_retains_five_points(self):
         actual = calculer_categorisation(self.frame(Violations_Actuelles=20))
         self.assertEqual(actual.loc[0, COMPONENT_COLS[3]], 5)

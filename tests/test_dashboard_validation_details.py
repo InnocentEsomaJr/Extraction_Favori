@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from categorisation import TOTAL_COL
 from reporting_metrics import clean_ou_id
 import test_dashboard_categorisation as dashboard_test
 import test_dashboard_filters as filter_test
@@ -105,6 +106,16 @@ def get_dhis2_client():
 '''
 
 
+PREVIOUS_FAILURE_CLIENT = VALIDATION_CLIENT.replace(
+    '                if period.endswith("12"):\n                    continue',
+    '''                if period.endswith("12"):
+                    import requests
+                    response = requests.Response()
+                    response.status_code = 403
+                    raise requests.HTTPError("Accès refusé au mois précédent", response=response)''',
+)
+
+
 def excel_sheet(data, sheet_name):
     """Lit les cellules exportées sans dépendre d'un moteur Excel installé."""
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -185,7 +196,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertIn("déclarée", high["Détails"])
             self.assertEqual(frame.loc[frame["Importance"].eq("LOW"), "Valeur droite"].iloc[0], 0)
             queries = len(app.session_state["_fixture_detail_queries"])
-            self.assertEqual(queries, 2)
+            self.assertEqual(queries, 1)
             self.assertEqual(app.session_state["_fixture_detail_metadata_calls"], 1)
 
             self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
@@ -268,8 +279,8 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertEqual(summary["Règles violées (M)"].tolist(), [1, 1, 1])
             self.assertEqual(app.session_state["categorisation_result"]["validation_warnings"], [])
             requests = app.session_state["categorisation_result"]["validation_requests"]
-            self.assertEqual([request["Méthode"] for request in requests], ["POST", "POST"])
-            self.assertEqual([request["Unité parent"] for request in requests], ["CountryAAAA", "CountryAAAA"])
+            self.assertEqual([request["Méthode"] for request in requests], ["POST"])
+            self.assertEqual([request["Unité parent"] for request in requests], ["CountryAAAA"])
             self.assertEqual(requests[0]["Lignes reçues"], 3)
             self.assertTrue(any(
                 item.label == "Vérifier la requête envoyée à DHIS2" for item in app.expander
@@ -277,7 +288,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
 
             queries = list(app.session_state["_fixture_detail_queries"])
             repeated = self.analyse(app)
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 2)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 1)
             pd.testing.assert_frame_equal(repeated, frame)
 
             queries = list(app.session_state["_fixture_detail_queries"])
@@ -285,7 +296,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.run_app(app)
             self.assertNotIn("categorisation_result", app.session_state)
             self.analyse(app)
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 2)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 1)
 
     def test_forbidden_analysis_explains_the_http_failure_and_never_reports_a_healthy_zero(self):
         app = self.new_app(client=FORBIDDEN_VALIDATION_CLIENT)
@@ -299,6 +310,91 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertTrue(any("403" in str(message) for message in saved["validation_warnings"]))
             self.assertTrue(any("403" in str(item.value) for item in app.text))
             self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
+            self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+
+    def test_current_analysis_and_previous_corrections_have_independent_buttons_and_requests(self):
+        app = self.new_app(client=PATHLESS_VALIDATION_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            control_label = "Contrôler les corrections du mois précédent"
+            self.assertTrue(self.widget(app, "button", control_label).disabled)
+
+            details = self.analyse(app).copy(deep=True)
+            current = app.session_state["_test_export_frame"].copy(deep=True)
+            saved = app.session_state["categorisation_result"]
+            timestamp = saved["analysed_at"]
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 1)
+            self.assertFalse(saved["corrections_checked"])
+            self.assertFalse(self.widget(app, "button", control_label).disabled)
+            self.assertTrue(current["Règles violées (M-1)"].isna().all())
+            self.assertTrue(current["Règles corrigées (M-1 -> M)"].isna().all())
+            self.assertTrue(current[TOTAL_COL].isna().all())
+            self.assertEqual(current["Règles violées (M)"].tolist(), [1, 1, 1])
+
+            self.widget(app, "button", control_label).click()
+            self.run_app(app)
+            checked = app.session_state["categorisation_result"]
+            summary = app.session_state["_test_export_frame"]
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+            self.assertTrue(checked["corrections_checked"])
+            self.assertTrue(checked.get("corrections_checked_at"))
+            self.assertEqual(checked["analysed_at"], timestamp)
+            pd.testing.assert_frame_equal(self.detail_view(app), details)
+            for column in [
+                "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
+                "Règles violées (M)", "Ratio / 100 rapports", "Score de qualité",
+                "Score de qualité /20", "Score violations /20",
+            ]:
+                pd.testing.assert_series_equal(summary[column], current[column])
+            self.assertEqual(summary["Règles violées (M-1)"].tolist(), [0, 0, 0])
+            self.assertTrue(summary[TOTAL_COL].notna().all())
+            self.assertEqual([request["Période"] for request in checked["validation_requests"]], ["M", "M-1"])
+
+            self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
+            self.run_app(app)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+
+            self.analyse(app)
+            renewed = app.session_state["categorisation_result"]
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 3)
+            self.assertFalse(renewed["corrections_checked"])
+            self.assertFalse(renewed.get("corrections_checked_at"))
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M-1)"].isna().all())
+            self.assertEqual([request["Période"] for request in renewed["validation_requests"]], ["M"])
+
+            self.widget(app, "selectbox", "Sélectionner le Groupe de Règles de Validation :").select("Groupe test")
+            self.run_app(app)
+            self.assertNotIn("categorisation_result", app.session_state)
+            self.assertTrue(self.widget(app, "button", control_label).disabled)
+
+    def test_previous_month_failure_preserves_the_current_dhis2_results_and_notes(self):
+        app = self.new_app(client=PREVIOUS_FAILURE_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            details = self.analyse(app).copy(deep=True)
+            current = app.session_state["_test_export_frame"].copy(deep=True)
+            timestamp = app.session_state["categorisation_result"]["analysed_at"]
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 1)
+
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+            self.run_app(app)
+            saved = app.session_state["categorisation_result"]
+            summary = app.session_state["_test_export_frame"]
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+            self.assertEqual(saved["analysed_at"], timestamp)
+            self.assertEqual(saved["validation_warnings"], [])
+            self.assertTrue(any("403" in str(message) for message in saved["correction_warnings"]))
+            pd.testing.assert_frame_equal(self.detail_view(app), details)
+            for column in [
+                "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
+                "Règles violées (M)", "Ratio / 100 rapports", "Score de qualité",
+                "Score de qualité /20", "Score violations /20",
+            ]:
+                pd.testing.assert_series_equal(summary[column], current[column])
+            self.assertTrue(summary["Règles violées (M-1)"].isna().all())
+            self.assertTrue(summary["Règles corrigées (M-1 -> M)"].isna().all())
+            self.assertTrue(summary[TOTAL_COL].isna().all())
+            self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
 
     def test_missing_metadata_preserves_identifiers_and_actual_values(self):
         app = self.new_app(metadata=MISSING_METADATA)

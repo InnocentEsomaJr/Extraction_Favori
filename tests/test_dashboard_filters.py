@@ -165,6 +165,8 @@ class DashboardFilterTests(unittest.TestCase):
     def analyse(self, app, expected_ids):
         self.widget(app, "button", "Lancer l'analyse des violations").click()
         self.run_app(app)
+        self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+        self.run_app(app)
         frame = app.session_state["_test_export_frame"]
         self.assertEqual(len(frame), len(expected_ids))
         self.assertEqual(frame["Barème datasets"].tolist(), ["ZS"] * len(expected_ids))

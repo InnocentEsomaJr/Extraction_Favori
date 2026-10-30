@@ -65,6 +65,8 @@ class DashboardImprovementTests(unittest.TestCase):
     def analyse(self, app):
         self.widget(app, "button", "Lancer l'analyse des violations").click()
         self.run_app(app)
+        self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+        self.run_app(app)
         frame = app.session_state["_test_export_frame"]
         self.assertEqual(len(frame), 3)
         self.assertEqual(frame[TOTAL_COL].tolist(), [100, 100, 100])
