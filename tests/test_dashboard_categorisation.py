@@ -58,7 +58,7 @@ class ValidationApiTests(unittest.TestCase):
         self.assertEqual(session.auth, ("fixture-user", "fixture-password"))
         session.request.assert_called_once_with(
             "POST", "https://fixture.invalid/api/dataAnalysis/validationRules",
-            params=None, json=payload, timeout=(10, 90),
+            params=None, json=payload, timeout=(10, 600),
         )
 
     def test_empty_success_is_distinct_from_failed_and_malformed_periods(self):

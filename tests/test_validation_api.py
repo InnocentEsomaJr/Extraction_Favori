@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, datetime
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
@@ -311,6 +312,93 @@ class ValidationAnalysisTests(unittest.TestCase):
         self.assertNotIn('password', message)
         self.assertNotIn('secret', message)
         self.assertEqual(client.methods, ['POST'])
+
+    def test_elapsed_time_and_validation_read_limit_are_recorded_without_changing_the_request(self):
+        client = FakeClient([[violation()]])
+        client.timeout = (10, 90)
+        client.validation_timeout = (10, 600)
+        with patch('validation_api.perf_counter', side_effect=[100.0, 101.25]):
+            result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+        self.assertEqual(result.attrs['elapsed_seconds'], 1.25)
+        self.assertEqual(result.attrs['validation_read_timeout_seconds'], 600)
+        self.assertEqual(client.methods, ['POST'])
+        self.assertEqual(client.calls[0][1], {
+            'ou': 'ZoneAAAAAAA', 'startDate': '2024-02-01', 'endDate': '2024-02-29',
+            'persist': False, 'notification': False,
+        })
+
+    def test_read_timeout_reports_configured_limit_and_elapsed_time_without_retrying(self):
+        client = FakeClient([requests.ReadTimeout('url password=fixture secret=fixture')])
+        client.validation_timeout = (10, 600)
+        with patch('validation_api.perf_counter', side_effect=[100.0, 700.5]):
+            result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+        message = result.attrs['errors']['202402'][0]
+        self.assertIn('lecture de la réponse DHIS2', message)
+        self.assertIn('limite 600 s', message)
+        self.assertNotIn('password', message)
+        self.assertNotIn('secret', message)
+        self.assertEqual(result.attrs['elapsed_seconds'], 600.5)
+        self.assertEqual(result.attrs['validation_read_timeout_seconds'], 600)
+        self.assertEqual(client.methods, ['POST'])
+        self.assertEqual(result.attrs['failed_periods'], ['202402'])
+
+    def test_connect_timeout_is_distinguished_from_waiting_for_the_analysis_response(self):
+        client = FakeClient([requests.ConnectTimeout('private connection info')])
+        client.validation_timeout = (10, 600)
+        result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+        message = result.attrs['errors']['202402'][0]
+        self.assertIn('délai d’attente dépassé à la connexion', message)
+        self.assertNotIn('lecture', message)
+        self.assertNotIn('600', message)
+        self.assertNotIn('private', message)
+        self.assertEqual(client.methods, ['POST'])
+
+    def test_generic_timeouts_keep_a_safe_waiting_diagnostic_without_method_fallback(self):
+        for error in [requests.Timeout('private timeout info'), TimeoutError('private timeout info')]:
+            with self.subTest(error_type=type(error).__name__):
+                client = FakeClient([error])
+                result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+                message = result.attrs['errors']['202402'][0]
+                self.assertIn('délai d’attente dépassé', message)
+                self.assertNotIn('private', message)
+                self.assertEqual(client.methods, ['POST'])
+
+    def test_gateway_failures_identify_the_http_relay_without_retrying(self):
+        for status in [502, 504, 524]:
+            with self.subTest(status=status):
+                client = FakeClient([http_error(status)])
+                result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+                message = result.attrs['errors']['202402'][0]
+                self.assertIn(f'HTTP {status}', message)
+                self.assertIn('relais HTTP de SNIS', message)
+                self.assertNotIn('contenu sensible', message)
+                self.assertEqual(client.methods, ['POST'])
+
+    def test_read_limit_falls_back_to_the_generic_tuple_when_validation_config_is_invalid(self):
+        invalid_configs = [
+            None, Mock(), {'read': 600}, (), (10,), (10, 600, 700),
+            (10, Mock()), (10, MagicMock(spec=float)), (10, {'read': 600}),
+            (10, True), (10, 0), (10, -1), (10, float('nan')), (10, float('inf')), (10, '600'),
+        ]
+        for configured in invalid_configs:
+            with self.subTest(config_type=type(configured).__name__):
+                client = FakeClient([[]])
+                client.validation_timeout = configured
+                client.timeout = (10, 125.5)
+                result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+                self.assertEqual(result.attrs['validation_read_timeout_seconds'], 125.5)
+
+    def test_missing_or_mocked_read_limit_is_unavailable_and_never_printed(self):
+        client = FakeClient([requests.ReadTimeout('private')])
+        client.validation_timeout = Mock()
+        client.timeout = {'read': 600}
+        result = fetch_validation_analysis(client, 'ZoneAAAAAAA', ['202402'])
+        self.assertIsNone(result.attrs['validation_read_timeout_seconds'])
+        message = result.attrs['errors']['202402'][0]
+        self.assertIn('lecture de la réponse DHIS2', message)
+        self.assertNotIn('limite', message)
+        self.assertNotIn('Mock', message)
+        self.assertNotIn('private', message)
 
     def test_fiscal_period_returned_by_dhis2_is_preserved_without_local_calendar_parsing(self):
         result = fetch_validation_analysis(FakeClient([[violation(period='2026April')]]), 'ZoneAAAAAAA', ['202609'])

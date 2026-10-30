@@ -1071,12 +1071,13 @@ def test_dhis2_credentials(base_url, username, password):
     return False, f"Connexion DHIS2 échouée (HTTP {response.status_code})."
 
 @st.cache_resource
-def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0):
+def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=600):
     class SimpleDHIS2Client:
         """Client DHIS2 minimal sans dépendance openhexa."""
-        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0):
+        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0, validation_timeout_read_sec=600):
             self.base_url = str(base_url).rstrip("/")
             self.timeout = (timeout_connect_sec, timeout_read_sec)
+            self.validation_timeout = (timeout_connect_sec, validation_timeout_read_sec)
             self.session = requests.Session()
             self.session.auth = (user, pwd)
             self.session.headers.update({"Accept": "application/json"})
@@ -1100,7 +1101,12 @@ def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_rea
             if not clean_endpoint.startswith("api/"):
                 clean_endpoint = f"api/{clean_endpoint}"
             url = f"{self.base_url}/{clean_endpoint}"
-            response = self.session.request(method, url, params=params, json=data, timeout=self.timeout)
+            request_timeout = (
+                self.validation_timeout
+                if clean_endpoint.rstrip('/') == 'api/dataAnalysis/validationRules'
+                else self.timeout
+            )
+            response = self.session.request(method, url, params=params, json=data, timeout=request_timeout)
             response.raise_for_status()
             if not response.text:
                 return {}
@@ -1112,7 +1118,7 @@ def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_rea
         def post(self, endpoint, data=None):
             return self._request("POST", endpoint, data=data)
 
-    return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff)
+    return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff, validation_timeout_read)
 
 def get_dhis2_client():
     dhis2_url = _read_config_value("DHIS2_URL")
@@ -1120,6 +1126,9 @@ def get_dhis2_client():
     dhis2_pass = str(st.session_state.get("dhis2_pass", "")).strip()
     dhis2_timeout_connect = _read_int_config_value("DHIS2_TIMEOUT_CONNECT", 10)
     dhis2_timeout_read = _read_int_config_value("DHIS2_TIMEOUT_READ", 90)
+    dhis2_validation_timeout_read = _read_int_config_value(
+        "DHIS2_VALIDATION_TIMEOUT_READ", max(600, dhis2_timeout_read)
+    )
     dhis2_retries = _read_int_config_value("DHIS2_HTTP_RETRIES", 2)
 
     missing_keys = []
@@ -1143,6 +1152,7 @@ def get_dhis2_client():
         dhis2_pass,
         timeout_connect=dhis2_timeout_connect,
         timeout_read=dhis2_timeout_read,
+        validation_timeout_read=dhis2_validation_timeout_read,
         retries=dhis2_retries,
         backoff=1.0,
     )
@@ -1951,6 +1961,7 @@ if df_raw is not None:
         )
 
         saved_validation = st.session_state.get('categorisation_result')
+        st.caption("L'analyse DHIS2 peut prendre plusieurs minutes. Le délai de lecture est de 10 minutes par défaut.")
         current_action, correction_action = st.columns(2)
         with current_action:
             run_current_analysis = st.button(
@@ -2046,13 +2057,17 @@ if df_raw is not None:
                         analysis_frames.append(('M-1', previous_violations))
                     for label, frame in analysis_frames:
                         request_params = frame.attrs.get('request_params', {})
+                        request_failed = bool(frame.attrs.get('failed_periods'))
                         validation_requests.append({
                             'Période': label,
                             'Méthode': frame.attrs.get('request_method', 'POST'),
                             'Unité parent': validation_parent_id,
                             'Début': request_params.get('startDate', ''),
                             'Fin': request_params.get('endDate', ''),
-                            'Lignes reçues': len(frame),
+                            'Statut': ('Indisponible' if frame.empty else 'Partiel') if request_failed else 'Terminé',
+                            'Lignes reçues': np.nan if request_failed and frame.empty else len(frame),
+                            'Durée (s)': frame.attrs.get('elapsed_seconds', np.nan),
+                            'Délai de lecture (s)': frame.attrs.get('validation_read_timeout_seconds', np.nan),
                         })
                         for period in frame.attrs.get('failed_periods', []):
                             reasons = frame.attrs.get('errors', {}).get(period) or ["Analyse DHIS2 indisponible"]
@@ -2333,13 +2348,16 @@ if df_raw is not None:
             )
             violations_visible = filter_validation_details(violations_all, query=detail_query, importance=detail_importance)
             detail_view = detail_export_frame(violations_visible)
-            st.caption(
-                f"{len(detail_view)} violation(s) affichée(s) sur {len(df_violations_export)}. "
-                "Le CSV contient les lignes affichées ; le rapport Excel et l'aperçu conservent le détail complet."
-            )
+            if not saved_validation.get('current_analysis_succeeded', False) and violations_all.empty:
+                st.caption("Décompte indisponible : DHIS2 n'a pas fourni de résultat exploitable pour cette analyse.")
+            else:
+                st.caption(
+                    f"{len(detail_view)} violation(s) affichée(s) sur {len(df_violations_export)}. "
+                    "Le CSV contient les lignes affichées ; le rapport Excel et l'aperçu conservent le détail complet."
+                )
             if violations_all.empty:
                 if validation_warnings:
-                    st.info("Aucune ligne de violation n'a été reçue. Consultez les messages d'analyse ci-dessus.")
+                    st.info("L'analyse n'a pas abouti : le nombre de violations est indisponible. Consultez les messages d'analyse ci-dessus.")
                 else:
                     st.success("Aucune règle violée détectée pour les filtres sélectionnés.")
             elif detail_view.empty:

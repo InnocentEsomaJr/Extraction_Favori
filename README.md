@@ -245,11 +245,28 @@ DHIS2_URL = "https://votre-instance-dhis2"
 # Optionnel (connexion lente):
 # DHIS2_TIMEOUT_CONNECT = 10
 # DHIS2_TIMEOUT_READ = 120
+# DHIS2_VALIDATION_TIMEOUT_READ = 600
 # DHIS2_HTTP_RETRIES = 2
 ```
 
 Le projet lit `DHIS2_URL` via `st.secrets`.
 Le **nom d'utilisateur** et le **mot de passe** sont saisis par chaque utilisateur dans la barre latérale (`🔐 Connexion DHIS2`).
+
+L'analyse des règles peut attendre le calcul DHIS2 plus longtemps que les autres
+requêtes. `DHIS2_VALIDATION_TIMEOUT_READ` règle son délai de lecture, à 600 secondes
+par défaut (ou au moins le délai général si celui-ci dépasse 600). Ce réglage
+s'applique uniquement à `dataAnalysis/validationRules`, en POST et en GET de repli.
+Les autres appels gardent `DHIS2_TIMEOUT_READ` (90 secondes par défaut).
+La connexion conserve `DHIS2_TIMEOUT_CONNECT` (10 secondes par défaut).
+Dans Streamlit Cloud, ces options se règlent dans **App settings → Secrets**.
+Le délai de lecture mesure l'attente de données, pas une durée totale garantie.
+Une coupure du serveur ou d'un relais peut arriver plus tôt.
+
+En cas de délai dépassé, le diagnostic indique **Indisponible** et laisse le nombre
+de lignes vide. Un vrai résultat sans violation indique **Terminé**, avec zéro ligne.
+La durée de la requête et son délai de lecture sont affichés dans le diagnostic.
+L'application ne relance pas automatiquement un POST qui a dépassé le délai :
+DHIS2 peut encore être en train de calculer l'analyse.
 
 ## 6. Lancement
 

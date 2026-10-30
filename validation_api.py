@@ -8,9 +8,13 @@ ni déduplication locale. Une limite atteinte laisse le décompte incomplet.
 
 import calendar
 from datetime import date
+import math
+from numbers import Real
 import re
+from time import perf_counter
 
 import pandas as pd
+from requests.exceptions import ConnectTimeout, ReadTimeout, Timeout
 
 from validation_filters import date_range_months, normalize_date
 
@@ -93,7 +97,22 @@ def _http_status(error):
         return None
 
 
-def _request_error(error, method, endpoint):
+def _validation_read_timeout(dhis):
+    """Lit uniquement une durée numérique connue, jamais un objet client arbitraire."""
+    for attribute in ("validation_timeout", "timeout"):
+        configured = getattr(dhis, attribute, None)
+        if not isinstance(configured, (tuple, list)) or len(configured) != 2:
+            continue
+        read_timeout = configured[1]
+        if (
+            issubclass(type(read_timeout), Real) and not isinstance(read_timeout, bool)
+            and math.isfinite(float(read_timeout)) and read_timeout > 0
+        ):
+            return float(read_timeout)
+    return None
+
+
+def _request_error(error, method, endpoint, read_timeout_seconds=None):
     """Diagnostic utile sans reprendre un corps de réponse ou une URL sensible."""
     status = _http_status(error)
     prefix = f"{method} /api/{endpoint}"
@@ -102,9 +121,18 @@ def _request_error(error, method, endpoint):
             401: "authentification refusée", 403: "autorisation refusée",
             404: "ressource introuvable", 405: "méthode non prise en charge",
             501: "méthode non implémentée",
+            502: "réponse invalide du service en amont, signalée par un relais HTTP de SNIS",
+            504: "délai d’attente du relais HTTP de SNIS dépassé",
+            524: "délai d’attente du relais HTTP de SNIS dépassé",
         }
         return f"{prefix} — HTTP {status} : {reasons.get(status, 'échec de l’analyse DHIS2')}"
-    if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower():
+    error_type = type(error).__name__.lower()
+    if isinstance(error, ConnectTimeout) or "connecttimeout" in error_type:
+        return f"{prefix} — délai d’attente dépassé à la connexion"
+    if isinstance(error, ReadTimeout) or "readtimeout" in error_type:
+        limit = f" (limite {read_timeout_seconds:g} s)" if read_timeout_seconds is not None else ""
+        return f"{prefix} — délai d’attente dépassé lors de la lecture de la réponse DHIS2{limit}"
+    if isinstance(error, (TimeoutError, Timeout)) or "timeout" in error_type:
         return f"{prefix} — délai d’attente dépassé"
     if isinstance(error, ValueError):
         return f"{prefix} — réponse non JSON ou invalide (vérifiez la connexion et l'accès à l'API)"
@@ -121,6 +149,8 @@ def fetch_validation_analysis(
     500 lignes déclenchent alors un avertissement prudent de limite atteinte.
     Les résultats conservent l'ordre, les périodes et les doublons du serveur.
     """
+    analysis_started = perf_counter()
+    read_timeout_seconds = _validation_read_timeout(dhis)
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("La limite de résultats doit être un entier strictement positif.")
     effective_limit = 500 if limit is None else limit
@@ -193,7 +223,7 @@ def fetch_validation_analysis(
                 incomplete_interval(f"{method} /api/{endpoint} — réponse DHIS2 invalide (liste de violations attendue)")
                 records = []
         except Exception as error:
-            incomplete_interval(_request_error(error, method, endpoint))
+            incomplete_interval(_request_error(error, method, endpoint, read_timeout_seconds))
             records = []
         if len(records) >= effective_limit:
             truncated.extend(periods)
@@ -223,6 +253,8 @@ def fetch_validation_analysis(
         source="calculated", failed_periods=failed, truncated_periods=truncated,
         errors=errors, scope_ou_id=requested_ou, max_results=effective_limit,
         request_method=method, request_params=params,
+        elapsed_seconds=max(0.0, perf_counter() - analysis_started),
+        validation_read_timeout_seconds=read_timeout_seconds,
         start_date=exact_start.isoformat() if exact_start is not None else None,
         end_date=exact_end.isoformat() if exact_end is not None else None,
     )

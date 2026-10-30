@@ -106,6 +106,25 @@ def get_dhis2_client():
 '''
 
 
+TIMEOUT_VALIDATION_CLIENT = '''
+def get_dhis2_client():
+    class Client:
+        def post(self, endpoint, data=None):
+            import requests
+            raise requests.ReadTimeout("Fixture : délai de lecture dépassé")
+    return Client()
+'''
+
+
+EMPTY_VALIDATION_CLIENT = '''
+def get_dhis2_client():
+    class Client:
+        def post(self, endpoint, data=None):
+            return []
+    return Client()
+'''
+
+
 PREVIOUS_FAILURE_CLIENT = VALIDATION_CLIENT.replace(
     '                if period.endswith("12"):\n                    continue',
     '''                if period.endswith("12"):
@@ -311,6 +330,42 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertTrue(any("403" in str(item.value) for item in app.text))
             self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
             self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+
+    def test_read_timeout_is_unavailable_without_displaying_a_zero_violation_count(self):
+        app = self.new_app(client=TIMEOUT_VALIDATION_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            frame = self.analyse(app)
+            self.assertTrue(frame.empty)
+            saved = app.session_state["categorisation_result"]
+            request = saved["validation_requests"][0]
+            self.assertEqual(request["Statut"], "Indisponible")
+            self.assertTrue(pd.isna(request["Lignes reçues"]))
+            self.assertTrue(any("délai" in str(message).casefold() for message in saved["validation_warnings"]))
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
+            self.assertFalse(any(
+                "0 violation(s) affichée(s) sur 0" in str(item.value) for item in app.caption
+            ))
+            self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
+            self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+
+    def test_successful_empty_analysis_keeps_a_real_zero_and_a_success_message(self):
+        app = self.new_app(client=EMPTY_VALIDATION_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            frame = self.analyse(app)
+            self.assertTrue(frame.empty)
+            saved = app.session_state["categorisation_result"]
+            request = saved["validation_requests"][0]
+            self.assertNotEqual(request["Statut"], "Indisponible")
+            self.assertEqual(request["Lignes reçues"], 0)
+            self.assertEqual(saved["validation_warnings"], [])
+            self.assertEqual(app.session_state["_test_export_frame"]["Règles violées (M)"].tolist(), [0, 0, 0])
+            self.assertTrue(any(
+                "0 violation(s) affichée(s) sur 0" in str(item.value) for item in app.caption
+            ))
+            self.assertTrue(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
+            self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
 
     def test_current_analysis_and_previous_corrections_have_independent_buttons_and_requests(self):
         app = self.new_app(client=PATHLESS_VALIDATION_CLIENT)
