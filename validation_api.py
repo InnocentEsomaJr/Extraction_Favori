@@ -1,15 +1,13 @@
-"""Lecture des violations calculées, sans persistance ni notification DHIS2.
+"""Analyse des violations avec le même contrat que l'application Data Quality.
 
-Contrat officiel GET /dataAnalysis/validationRules :
-https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/data-validation.html#validation-rule-analysis
-
-Ce point d'entrée possède une limite de résultats, sans pagination documentée.
-Une réponse atteignant la limite reste consultable mais son décompte est incomplet.
+Source : dhis2/data-quality-app, ValidationRulesAnalysis.jsx (POST JSON unique).
+Le repli GET est réservé aux anciennes versions qui refusent cette méthode.
+Les périodes et les lignes retournées sont choisies par DHIS2, sans redécoupage
+ni déduplication locale. Une limite atteinte laisse le décompte incomplet.
 """
 
 import calendar
-from datetime import date, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import date
 import re
 
 import pandas as pd
@@ -33,27 +31,6 @@ def _month_dates(period):
     return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
 
 
-def _period_dates(period):
-    """Intervalles ISO usuels, pour filtrer aussi les règles d'autres périodicités."""
-    if re.fullmatch(r"\d{6}", period):
-        return _month_dates(period)
-    if re.fullmatch(r"\d{8}", period):
-        day = date(int(period[:4]), int(period[4:6]), int(period[6:]))
-        return day, day
-    if re.fullmatch(r"\d{4}", period):
-        return date(int(period), 1, 1), date(int(period), 12, 31)
-    match = re.fullmatch(r"(\d{4})Q([1-4])", period)
-    if match:
-        year, quarter = int(match[1]), int(match[2])
-        end_month = quarter * 3
-        return date(year, end_month - 2, 1), date(year, end_month, calendar.monthrange(year, end_month)[1])
-    match = re.fullmatch(r"(\d{4})W(\d{1,2})", period)
-    if match:
-        start = date.fromisocalendar(int(match[1]), int(match[2]), 1)
-        return start, start + timedelta(days=6)
-    raise ValueError("La période de la violation n'est pas vérifiable.")
-
-
 def _value(record, flat, nested):
     flat_value = _identifier(record.get(flat))
     if flat_value:
@@ -72,16 +49,16 @@ def _scope_matches(record, requested_ou):
     own_id = _value(record, "organisationUnitId", "organisationUnit")
     if not own_id:
         return None
-    if own_id == requested_ou:
-        return True
     nested = record.get("organisationUnit")
     nested_path = nested.get("path", "") if isinstance(nested, dict) else ""
     path = str(record.get("organisationUnitPath") or nested_path).strip()
     if not path:
-        return None
+        # Certaines versions ne renvoient pas de chemin. L'API a déjà appliqué
+        # le parent et ses descendants ; cette absence n'est pas une erreur.
+        return True
     segments = [segment for segment in path.split("/") if segment]
     if not segments or segments[-1] != own_id:
-        return None
+        return False
     return requested_ou in segments
 
 
@@ -105,35 +82,48 @@ def _with_legacy_aliases(record):
     return result
 
 
-def _observation_value(record, flat, legacy):
-    """Clé numérique stable : zéro reste distinct d'une valeur absente."""
-    value = record[flat] if flat in record else record.get(legacy)
+def _http_status(error):
+    response = getattr(error, "response", None)
+    value = getattr(response, "status_code", None) if response is not None else None
     if value is None:
-        return None
-    text = str(value).strip()
-    if text.lower() in {"", "none", "null", "nan", "<na>"}:
-        return None
+        value = getattr(error, "status_code", None)
     try:
-        number = Decimal(text)
-        return number.normalize() if number.is_finite() else text
-    except InvalidOperation:
-        return text
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_error(error, method, endpoint):
+    """Diagnostic utile sans reprendre un corps de réponse ou une URL sensible."""
+    status = _http_status(error)
+    prefix = f"{method} /api/{endpoint}"
+    if status is not None:
+        reasons = {
+            401: "authentification refusée", 403: "autorisation refusée",
+            404: "ressource introuvable", 405: "méthode non prise en charge",
+            501: "méthode non implémentée",
+        }
+        return f"{prefix} — HTTP {status} : {reasons.get(status, 'échec de l’analyse DHIS2')}"
+    if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower():
+        return f"{prefix} — délai d’attente dépassé"
+    if isinstance(error, ValueError):
+        return f"{prefix} — réponse non JSON ou invalide (vérifiez la connexion et l'accès à l'API)"
+    return f"{prefix} — connexion ou analyse DHIS2 indisponible"
 
 
 def fetch_validation_analysis(
-    dhis, ou_id, period_list, group_id=None, limit=500, *, start_date=None, end_date=None
+    dhis, ou_id, period_list, group_id=None, limit=None, *, start_date=None, end_date=None
 ):
-    """Calcule les violations du périmètre et de ses descendants, par mois.
+    """Une analyse DHIS2 sur le parent et l'intervalle complet sélectionnés.
 
-    Retourne les lignes disponibles avec ``failed_periods`` et
-    ``truncated_periods`` dans ``DataFrame.attrs``. Toute période incomplète
-    est signalée, même lorsqu'une partie de ses lignes reste affichable.
-    Les bornes facultatives découpent chaque mois aux dates exactes choisies.
-    Si ``period_list`` vaut None et que les deux dates sont fournies, les mois
-    intersectant cet intervalle sont dérivés automatiquement.
+    Sans dates explicites, les mois fournis déterminent les deux bornes.
+    Comme l'application officielle, ``maxResults`` est omis par défaut ;
+    500 lignes déclenchent alors un avertissement prudent de limite atteinte.
+    Les résultats conservent l'ordre, les périodes et les doublons du serveur.
     """
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("La limite de résultats doit être un entier strictement positif.")
+    effective_limit = 500 if limit is None else limit
     exact_start = exact_end = None
     if start_date is not None or end_date is not None:
         if start_date is None or end_date is None:
@@ -141,40 +131,58 @@ def fetch_validation_analysis(
         exact_start, exact_end = normalize_date(start_date), normalize_date(end_date)
         if exact_start > exact_end:
             raise ValueError("La date de début doit précéder ou égaler la date de fin.")
-        if period_list is None:
-            period_list = date_range_months(exact_start, exact_end)
     requested_ou = _identifier(ou_id)
     periods = list(dict.fromkeys(str(value).strip() for value in (
         [period_list] if isinstance(period_list, str) else (period_list or [])
     )))
-    failed, truncated, errors, results, seen = [], [], {}, [], set()
+    failed, truncated, errors, results = [], [], {}, []
+    method = "POST"
+    endpoint = "dataAnalysis/validationRules"
+    params = {}
 
     def incomplete(period, reason):
         if period not in failed:
             failed.append(period)
         errors.setdefault(period, []).append(reason)
 
-    for period in periods:
-        try:
-            start, end = _month_dates(period)
-        except (ValueError, OverflowError):
-            incomplete(period, "Période mensuelle invalide")
-            continue
-        if exact_start is not None:
-            start, end = max(start, exact_start), min(end, exact_end)
-            if start > end:
-                continue
-        if not requested_ou:
-            incomplete(period, "Identifiant de l'unité indisponible")
-            continue
+    if exact_start is not None:
+        periods = date_range_months(exact_start, exact_end)
+    else:
+        valid_bounds = []
+        for period in periods:
+            try:
+                valid_bounds.append(_month_dates(period))
+            except (ValueError, OverflowError):
+                incomplete(period, "Période mensuelle invalide")
+        if valid_bounds:
+            exact_start = min(first for first, _ in valid_bounds)
+            exact_end = max(last for _, last in valid_bounds)
+            periods = date_range_months(exact_start, exact_end)
+
+    def incomplete_interval(reason):
+        for period in periods:
+            incomplete(period, reason)
+
+    if not requested_ou:
+        incomplete_interval("Identifiant de l'unité indisponible")
+    elif exact_start is not None and exact_end is not None:
         params = {
-            "ou": requested_ou, "startDate": start.isoformat(), "endDate": end.isoformat(),
-            "persist": "false", "notification": "false", "maxResults": limit,
+            "ou": requested_ou, "startDate": exact_start.isoformat(), "endDate": exact_end.isoformat(),
+            "persist": False, "notification": False,
         }
+        if limit is not None:
+            params["maxResults"] = limit
         if _identifier(group_id):
             params["vrg"] = _identifier(group_id)
         try:
-            payload = dhis.get("dataAnalysis/validationRules", params=params)
+            try:
+                payload = dhis.post(endpoint, data=params)
+            except Exception as error:
+                if _http_status(error) not in {404, 405, 501}:
+                    raise
+                method = "GET"
+                params = {**params, "persist": "false", "notification": "false"}
+                payload = dhis.get(endpoint, params=params)
             if isinstance(payload, list):
                 records = payload
             elif isinstance(payload, dict):
@@ -182,50 +190,39 @@ def fetch_validation_analysis(
             else:
                 records = None
             if not isinstance(records, list):
-                raise ValueError("Réponse invalide")
-        except Exception:
-            incomplete(period, "Analyse DHIS2 indisponible ou réponse invalide")
-            continue
-        if len(records) >= limit:
-            truncated.append(period)
-            incomplete(period, "Limite des résultats atteinte ; décompte incomplet")
+                incomplete_interval(f"{method} /api/{endpoint} — réponse DHIS2 invalide (liste de violations attendue)")
+                records = []
+        except Exception as error:
+            incomplete_interval(_request_error(error, method, endpoint))
+            records = []
+        if len(records) >= effective_limit:
+            truncated.extend(periods)
+            incomplete_interval("Limite des résultats atteinte ; décompte incomplet")
         for record in records:
             if not isinstance(record, dict):
-                incomplete(period, "Une violation retournée est invalide")
+                incomplete_interval("Une violation retournée est invalide")
                 continue
             matches = _scope_matches(record, requested_ou)
             if matches is None:
-                incomplete(period, "Le périmètre d'une violation n'est pas vérifiable")
+                incomplete_interval("L'identifiant de l'unité d'une violation est indisponible")
                 continue
             if not matches:
+                incomplete_interval("DHIS2 a retourné une violation dont le chemin ne correspond pas au parent sélectionné")
                 continue
             record_period = _value(record, "periodId", "period")
-            try:
-                record_start, record_end = _period_dates(record_period)
-            except (ValueError, OverflowError):
-                incomplete(period, "La période d'une violation n'est pas vérifiable")
-                continue
-            if record_start > end or record_end < start:
+            if not record_period:
+                incomplete_interval("L'identifiant de la période d'une violation est indisponible")
                 continue
             rule = _value(record, "validationRuleId", "validationRule")
             if not rule:
-                incomplete(period, "L'identifiant d'une règle est indisponible")
+                incomplete_interval("L'identifiant d'une règle est indisponible")
                 continue
-            normalized = _with_legacy_aliases(record)
-            key = (
-                _value(record, "organisationUnitId", "organisationUnit"), rule, record_period,
-                _value(record, "attributeOptionComboId", "attributeOptionCombo"),
-                _identifier(record.get("categoryOptionCombo")), record.get("dayInPeriod"),
-                _observation_value(record, "leftSideValue", "leftsideValue"),
-                _observation_value(record, "rightSideValue", "rightsideValue"),
-            )
-            if key not in seen:
-                seen.add(key)
-                results.append(normalized)
+            results.append(_with_legacy_aliases(record))
     result = pd.DataFrame(results)
     result.attrs.update(
         source="calculated", failed_periods=failed, truncated_periods=truncated,
-        errors=errors, scope_ou_id=requested_ou, max_results=limit,
+        errors=errors, scope_ou_id=requested_ou, max_results=effective_limit,
+        request_method=method, request_params=params,
         start_date=exact_start.isoformat() if exact_start is not None else None,
         end_date=exact_end.isoformat() if exact_end is not None else None,
     )

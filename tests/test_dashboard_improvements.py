@@ -100,7 +100,7 @@ class DashboardImprovementTests(unittest.TestCase):
             self.assertNotIn("categorisation_result", app.session_state)
 
             self.analyse(app)
-            self.assertEqual(app.session_state["_fixture_validation_calls"], 12)
+            self.assertEqual(app.session_state["_fixture_validation_calls"], 4)
 
     def test_analysis_time_and_full_export_survive_view_search_and_sort(self):
         app = self.new_app()
@@ -129,7 +129,7 @@ class DashboardImprovementTests(unittest.TestCase):
             self.run_app(app)
             self.assertTrue(self.categorisation_view(app).empty)
             pd.testing.assert_frame_equal(app.session_state["_test_export_frame"], full_export)
-            self.assertEqual(app.session_state["_fixture_validation_calls"], 6)
+            self.assertEqual(app.session_state["_fixture_validation_calls"], 2)
             self.assertEqual(app.session_state["_fixture_data_loads"], 1)
             self.assertTrue(any("export" in item.value.casefold() and "compl" in item.value.casefold() for item in app.caption))
 

@@ -19,6 +19,7 @@ from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from validation_filters import date_range_months, monthly_bounds, reference_month
+from validation_scope import assign_validation_zones
 from validation_details import (
     DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
     filter_validation_details, style_importance, validation_detail_identifiers,
@@ -165,26 +166,25 @@ def normalize_orgunit_columns(df):
 def _extract_identifier(value):
     """Extrait un identifiant stable depuis un champ DHIS2 (dict ou string)."""
     if isinstance(value, dict):
-        return str(
-            value.get("id")
-            or value.get("uid")
-            or value.get("displayName")
-            or value.get("name")
-            or ""
-        ).strip()
-    if value is None:
-        return ""
-    return str(value).strip()
+        for key in ('id', 'uid', 'displayName', 'name'):
+            identifier = _extract_identifier(value.get(key))
+            if identifier:
+                return identifier
+        return ''
+    if value is None or pd.isna(value):
+        return ''
+    text = str(value).strip()
+    return '' if text.casefold() in {'nan', 'none', 'null', '<na>', 'nat'} else text
 
-def build_violation_signature_set(df_val):
+def build_violation_signatures(df_val):
     """
-    Construit un ensemble de signatures de violations pour comparer T-1 vs T.
+    Construit les signatures de violations pour comparer T-1 vs T.
     On exclut volontairement la période pour détecter les erreurs réellement corrigées.
     """
     if df_val is None or df_val.empty:
-        return set()
+        return []
 
-    signatures = set()
+    signatures = []
     for row in df_val.to_dict("records"):
         ou = _extract_identifier(row.get("organisationUnit"))
         rule = _extract_identifier(row.get("validationRule"))
@@ -196,8 +196,12 @@ def build_violation_signature_set(df_val):
         if not ou and not rule:
             continue
 
-        signatures.add((ou, rule, aoc, coc, ds))
+        signatures.append((ou, rule, aoc, coc, ds))
     return signatures
+
+
+def build_violation_signature_set(df_val):
+    return set(build_violation_signatures(df_val))
 
 # Fonction pour l'export Excel
 def to_excel(df):
@@ -1091,18 +1095,22 @@ def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_rea
             self.session.mount("https://", adapter)
             self.session.mount("http://", adapter)
 
-        def get(self, endpoint, params=None):
+        def _request(self, method, endpoint, params=None, data=None):
             clean_endpoint = str(endpoint).lstrip("/")
             if not clean_endpoint.startswith("api/"):
                 clean_endpoint = f"api/{clean_endpoint}"
             url = f"{self.base_url}/{clean_endpoint}"
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            if response.status_code in (401, 403):
-                raise RuntimeError("Accès DHIS2 refusé (vérifie les identifiants et permissions).")
+            response = self.session.request(method, url, params=params, json=data, timeout=self.timeout)
             response.raise_for_status()
             if not response.text:
                 return {}
             return response.json()
+
+        def get(self, endpoint, params=None):
+            return self._request("GET", endpoint, params=params)
+
+        def post(self, endpoint, data=None):
+            return self._request("POST", endpoint, data=data)
 
     return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff)
 
@@ -1222,12 +1230,14 @@ def get_validation_results(ou_id, period_list, group_id, cache_user=None, start_
     if not ou_id or ou_id == "USER_ORGUNIT" or len(str(ou_id)) < 5:
         result = pd.DataFrame()
         result.attrs['failed_periods'] = list(period_list)
+        result.attrs['errors'] = {pe: ["Identifiant de l'unité parent indisponible"] for pe in period_list}
         return result
     try:
         dhis = get_dhis2_client()
     except Exception:
         result = pd.DataFrame()
         result.attrs['failed_periods'] = list(period_list)
+        result.attrs['errors'] = {pe: ["Connexion DHIS2 non configurée pour cette session"] for pe in period_list}
         return result
     return fetch_validation_analysis(
         dhis, ou_id, period_list, group_id, start_date=start_date, end_date=end_date
@@ -1923,7 +1933,7 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'calculated-date-filters-v1', base_url, current_user_for_cache, id_final,
+            'dhis2-post-parent-v2', base_url, current_user_for_cache, id_final,
             validation_start_date, validation_end_date, tuple(validation_months),
             tuple(validation_reference_months), validation_parent_id, target_group_id,
             tuple(validation_zones_df['Zone_ID']),
@@ -1936,7 +1946,7 @@ if df_raw is not None:
         st.caption(
             f"Mois couverts : {', '.join(validation_months) or '—'}. "
             f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
-            "Les dates exactes filtrent le calcul DHIS2. Les indicateurs de déclaration restent mensuels "
+            "L'analyse est envoyée à DHIS2 avec le parent et l'intervalle complets. Les indicateurs de déclaration restent mensuels "
             "et couvrent les mois de cet intervalle. Le calcul n'enregistre aucun résultat et n'envoie aucune notification."
         )
 
@@ -1984,14 +1994,56 @@ if df_raw is not None:
                         if metadata.get('level') in (2, 3):
                             profile_by_id[str(ou_id)] = 'DPS' if metadata['level'] == 2 else 'ZS'
 
-                    # 3) Violations par zone et corrections des mêmes erreurs entre M-1 et M.
+                    # 3) Même requête que l'application DHIS2 : parent et intervalle complets.
                     rows_cat = []
-                    raw_violations = []
                     validation_warnings = []
-                    analysis_progress = st.progress(0.0, text=f"Analyse de {len(zones_resolues)} zone(s) de santé")
+                    validation_requests = []
+                    # Une nouvelle analyse doit lire DHIS2, même avec les mêmes filtres.
+                    validation_cache_user = (*current_user_for_cache, uuid4().hex)
+                    analysis_progress = st.progress(0.05, text="Analyse DHIS2 de l'intervalle sélectionné")
+                    current_violations = get_validation_results(
+                        validation_parent_id, validation_months, target_group_id, cache_user=validation_cache_user,
+                        start_date=validation_start_date, end_date=validation_end_date
+                    )
+                    analysis_progress.progress(0.4, text="Analyse DHIS2 de la référence M-1")
+                    previous_violations = get_validation_results(
+                        validation_parent_id, validation_reference_months, target_group_id,
+                        cache_user=validation_cache_user
+                    )
+                    for label, frame in [('M', current_violations), ('M-1', previous_violations)]:
+                        request_params = frame.attrs.get('request_params', {})
+                        validation_requests.append({
+                            'Période': label,
+                            'Méthode': frame.attrs.get('request_method', 'POST'),
+                            'Unité parent': validation_parent_id,
+                            'Début': request_params.get('startDate', ''),
+                            'Fin': request_params.get('endDate', ''),
+                            'Lignes reçues': len(frame),
+                        })
+                        for period in frame.attrs.get('failed_periods', []):
+                            reasons = frame.attrs.get('errors', {}).get(period) or ["Analyse DHIS2 indisponible"]
+                            validation_warnings.append(f"{label} ({period}) : {' ; '.join(reasons)}")
+
+                    analysis_progress.progress(0.65, text="Rattachement des résultats DHIS2 aux zones de santé")
+                    identifiers = validation_detail_identifiers(current_violations)
+                    previous_identifiers = validation_detail_identifiers(previous_violations)
+                    all_unit_ids = tuple(dict.fromkeys(identifiers['org_ids'] + previous_identifiers['org_ids']))
+                    rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
+                        tuple(identifiers['rule_ids']), all_unit_ids, cache_user=current_user_for_cache
+                    )
+                    all_violations, current_scope_warnings = assign_validation_zones(
+                        current_violations, validation_zones_df, unit_metadata, validation_parent_id
+                    )
+                    previous_violations, previous_scope_warnings = assign_validation_zones(
+                        previous_violations, validation_zones_df, unit_metadata, validation_parent_id
+                    )
+                    validation_warnings.extend(f"M : {message}" for message in current_scope_warnings)
+                    validation_warnings.extend(f"M-1 : {message}" for message in previous_scope_warnings)
+                    incomplete_now = bool(all_violations.attrs.get('failed_periods') or current_scope_warnings)
+                    incomplete_prev = bool(previous_violations.attrs.get('failed_periods') or previous_scope_warnings)
                     for zone_index, (zone_name, zone_id) in enumerate(zones_resolues, start=1):
                         analysis_progress.progress(
-                            (zone_index - 1) / len(zones_resolues) * 0.9,
+                            0.7 + (zone_index - 1) / len(zones_resolues) * 0.25,
                             text=f"Zone {zone_index}/{len(zones_resolues)} : {zone_name}"
                         )
                         zone_metrics = metrics_by_id.get(zone_id, {})
@@ -2017,56 +2069,25 @@ if df_raw is not None:
                             })
                             continue
 
-                        df_val_zone = get_validation_results(
-                            zone_id, validation_months, target_group_id, cache_user=current_user_for_cache,
-                            start_date=validation_start_date, end_date=validation_end_date
-                        )
-                        df_val_prev_zone = get_validation_results(
-                            zone_id, validation_reference_months, target_group_id, cache_user=current_user_for_cache
-                        )
-                        if not df_val_zone.empty:
-                            zone_violations = df_val_zone.copy()
-                            zone_violations.attrs = {}
-                            zone_violations['_zone_id'] = zone_id
-                            zone_violations['_zone_name'] = zone_name
-                            raw_violations.append(zone_violations)
+                        df_val_zone = all_violations.loc[all_violations['_zone_id'].eq(zone_id)]
+                        df_val_prev_zone = previous_violations.loc[previous_violations['_zone_id'].eq(zone_id)]
 
-                        # Comparaison des mêmes erreurs entre T-1 et T
+                        # Compter chaque ligne serveur ; les signatures servent seulement aux corrections.
                         sig_now = build_violation_signature_set(df_val_zone)
-                        sig_prev = build_violation_signature_set(df_val_prev_zone)
-                        failed_now = df_val_zone.attrs.get('failed_periods', [])
-                        failed_prev = df_val_prev_zone.attrs.get('failed_periods', [])
-                        violations_actuelles = np.nan if failed_now else len(sig_now)
-                        violations_mois_precedent = np.nan if failed_prev else len(sig_prev)
-                        violations_corrigees = np.nan if failed_now or failed_prev else len(sig_prev - sig_now)
-                        errors = []
-                        for label, frame, failed in [('M', df_val_zone, failed_now), ('M-1', df_val_prev_zone, failed_prev)]:
-                            truncated = frame.attrs.get('truncated_periods', [])
-                            if truncated:
-                                errors.append(f"Résultats {label} limités pour : {', '.join(truncated)}")
-                            unavailable = [pe for pe in failed if pe not in truncated]
-                            if unavailable:
-                                errors.append(f"Analyse {label} indisponible : {', '.join(unavailable)}")
-                        if errors:
-                            validation_warnings.append(f"{zone_name} : {' ; '.join(errors)}")
+                        previous_signatures = build_violation_signatures(df_val_prev_zone)
+                        violations_actuelles = np.nan if incomplete_now else len(df_val_zone)
+                        violations_mois_precedent = np.nan if incomplete_prev else len(df_val_prev_zone)
+                        violations_corrigees = np.nan if incomplete_now or incomplete_prev else sum(
+                            signature not in sig_now for signature in previous_signatures
+                        )
 
                         rows_cat.append({**row_cat,
                             'Violations_Actuelles': violations_actuelles,
                             'Violations_Mois_Precedent': violations_mois_precedent,
                             'Violations_Corrigees': violations_corrigees,
-                            'Erreur_Validation': '; '.join(errors),
+                            'Erreur_Validation': '; '.join(validation_warnings),
                         })
 
-                    analysis_progress.progress(0.9, text="Chargement des libellés et détails des règles")
-                    all_violations = pd.concat(raw_violations, ignore_index=True) if raw_violations else pd.DataFrame()
-                    identifiers = validation_detail_identifiers(all_violations)
-                    preliminary_details = build_validation_details(all_violations)
-                    missing_unit_ids = preliminary_details.loc[
-                        preliminary_details[VIOLATION_COLUMNS[1]].eq(preliminary_details['_ou_id']), '_ou_id'
-                    ].dropna().unique().tolist()
-                    rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
-                        tuple(identifiers['rule_ids']), tuple(missing_unit_ids), cache_user=current_user_for_cache
-                    )
                     violations_details = build_validation_details(all_violations, rule_metadata, unit_metadata)
                     analysis_progress.progress(1.0, text=f"{len(zones_resolues)} zone(s) traitée(s)")
                     st.session_state['categorisation_result'] = {
@@ -2074,6 +2095,7 @@ if df_raw is not None:
                         'data': pd.DataFrame(rows_cat),
                         'violations': violations_details,
                         'validation_warnings': validation_warnings,
+                        'validation_requests': validation_requests,
                         'detail_warnings': detail_warnings,
                         'reporting_warnings': reporting_warnings,
                         'filters': {
@@ -2082,6 +2104,8 @@ if df_raw is not None:
                             'Unité d’organisation parent': validation_parent_label,
                             'ID unité parent': validation_parent_id,
                             'Groupe de règles': selected_vr_name,
+                            'Compte DHIS2': st.session_state.get('dhis2_user', ''),
+                            'Source des violations': 'DHIS2 /api/dataAnalysis/validationRules',
                             'Mois des indicateurs de déclaration': validation_period_id,
                             'Période de référence M-1': ';'.join(validation_reference_months),
                         },
@@ -2105,6 +2129,20 @@ if df_raw is not None:
                 f"Du {applied_filters.get('Date de début', '')} au {applied_filters.get('Date de fin', '')}."
             )
             st.caption(validation_applied_label)
+            with st.expander("Vérifier la requête envoyée à DHIS2"):
+                st.caption(
+                    f"Compte DHIS2 : {applied_filters.get('Compte DHIS2', '')}. "
+                    "Source : /api/dataAnalysis/validationRules. "
+                    f"Groupe : {applied_filters.get('Groupe de règles', selected_vr_name)}."
+                )
+                st.dataframe(
+                    pd.DataFrame(saved_validation.get('validation_requests', [])),
+                    hide_index=True, use_container_width=True,
+                )
+                st.caption(
+                    "Pour comparer avec SNIS, utilisez le même compte, le même parent, "
+                    "les mêmes dates et le même groupe de règles."
+                )
             for message in saved_validation.get('reporting_warnings', []):
                 st.warning(message)
             analysed_at = saved_validation.get('analysed_at')
@@ -2182,8 +2220,8 @@ if df_raw is not None:
             for message in saved_validation.get('detail_warnings', []):
                 st.info(message)
             st.caption(
-                "Chaque ligne correspond à une violation par unité d'organisation et période M. "
-                "Les compteurs de catégorisation regroupent les violations identiques entre les mois."
+                "Les lignes, périodes et valeurs sont celles renvoyées par DHIS2 pour l'intervalle M. "
+                "Chaque ligne est conservée et comptée ; les signatures servent uniquement à comparer les corrections avec M-1."
             )
             detail_query = st.text_input("Rechercher dans les violations", key="validation_detail_search")
             detail_importance = st.selectbox(

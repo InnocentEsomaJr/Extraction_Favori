@@ -19,33 +19,37 @@ import test_dashboard_filters as filter_test
 VALIDATION_CLIENT = '''
 def get_dhis2_client():
     class Client:
-        def get(self, endpoint, params=None):
+        def post(self, endpoint, data=None):
             if endpoint != "dataAnalysis/validationRules":
                 raise AssertionError("Appel fixture non prévu : " + endpoint)
+            from validation_filters import date_range_months
+            params = data
             queries = list(st.session_state.get("_fixture_detail_queries", []))
             queries.append(dict(params))
             st.session_state["_fixture_detail_queries"] = queries
-            period = params["startDate"][:7].replace("-", "")
-            if period.endswith("12"):
-                return []
-            selected = {
-                "ZoneAAAAAAA": ("CentreAAAAA", "RuleAAAAAAA", 0, 3),
-                "ZoneBBBBBBB": ("CentreBBBBB", "RuleBBBBBBB", 12, 10),
-                "ZoneCCCCCCC": ("CentreCCCCC", "RuleCCCCCCC", 25, 0),
-            }.get(params["ou"])
-            if selected is None:
-                raise AssertionError("Périmètre fixture non prévu")
-            centre, rule, left, right = selected
-            if params.get("vrg") and rule != "RuleAAAAAAA":
-                return []
-            province = "ProvinceBBB" if params["ou"] == "ZoneCCCCCCC" else "ProvinceAAA"
-            return [{
-                "id": period + rule, "periodId": period,
-                "organisationUnitId": centre, "validationRuleId": rule,
-                "organisationUnitPath": f"/CountryAAAA/{province}/{params['ou']}/{centre}",
-                "leftSideValue": left, "rightSideValue": right,
-                "attributeOptionComboId": "AttributeAA",
-            }]
+            units = [
+                ("CountryAAAA", "ProvinceAAA", "ZoneAAAAAAA", "CentreAAAAA", "RuleAAAAAAA", 0, 3),
+                ("CountryAAAA", "ProvinceAAA", "ZoneBBBBBBB", "CentreBBBBB", "RuleBBBBBBB", 12, 10),
+                ("CountryAAAA", "ProvinceBBB", "ZoneCCCCCCC", "CentreCCCCC", "RuleCCCCCCC", 25, 0),
+                ("CountryBBBB", "ProvinceCCC", "ZoneDDDDDDD", "CentreDDDDD", "RuleDDDDDDD", 1, 0),
+            ]
+            results = []
+            for period in date_range_months(params["startDate"], params["endDate"]):
+                if period.endswith("12"):
+                    continue
+                for country, province, zone, centre, rule, left, right in units:
+                    if params["ou"] not in (country, province, zone):
+                        continue
+                    if params.get("vrg") and rule != "RuleAAAAAAA":
+                        continue
+                    results.append({
+                        "id": period + rule, "periodId": period,
+                        "organisationUnitId": centre, "validationRuleId": rule,
+                        "organisationUnitPath": f"/{country}/{province}/{zone}/{centre}",
+                        "leftSideValue": left, "rightSideValue": right,
+                        "attributeOptionComboId": "AttributeAA",
+                    })
+            return results
     return Client()
 '''
 
@@ -70,6 +74,7 @@ def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
         "CentreAAAAA": {"id": "CentreAAAAA", "displayName": "Centre Étoile", "path": "/CountryAAAA/ProvinceAAA/ZoneAAAAAAA/CentreAAAAA"},
         "CentreBBBBB": {"id": "CentreBBBBB", "displayName": "Centre B", "path": "/CountryAAAA/ProvinceAAA/ZoneBBBBBBB/CentreBBBBB"},
         "CentreCCCCC": {"id": "CentreCCCCC", "displayName": "Centre C", "path": "/CountryAAAA/ProvinceBBB/ZoneCCCCCCC/CentreCCCCC"},
+        "CentreDDDDD": {"id": "CentreDDDDD", "displayName": "Centre D", "path": "/CountryBBBB/ProvinceCCC/ZoneDDDDDDD/CentreDDDDD"},
     }
     return {uid: rules[uid] for uid in rule_ids if uid in rules}, {uid: orgs[uid] for uid in org_ids if uid in orgs}, []
 '''
@@ -79,6 +84,24 @@ MISSING_METADATA = '''
 def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
     st.session_state["_fixture_detail_metadata_calls"] = st.session_state.get("_fixture_detail_metadata_calls", 0) + 1
     return {}, {}, ["Métadonnées de règles et d'unités indisponibles"]
+'''
+
+
+PATHLESS_VALIDATION_CLIENT = VALIDATION_CLIENT.replace(
+    '                        "organisationUnitPath": f"/{country}/{province}/{zone}/{centre}",\n',
+    '',
+)
+
+
+FORBIDDEN_VALIDATION_CLIENT = '''
+def get_dhis2_client():
+    class Client:
+        def post(self, endpoint, data=None):
+            import requests
+            response = requests.Response()
+            response.status_code = 403
+            raise requests.HTTPError("Accès refusé", response=response)
+    return Client()
 '''
 
 
@@ -119,11 +142,11 @@ class DashboardValidationDetailTests(unittest.TestCase):
         app.run(timeout=30)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
 
-    def new_app(self, metadata=DETAIL_METADATA):
+    def new_app(self, metadata=DETAIL_METADATA, client=VALIDATION_CLIENT):
         source = dashboard_test.app_fixture_source({
             "get_organisation_catalog": filter_test.CATALOG_FIXTURE,
             "get_data": filter_test.DATA_FIXTURE,
-            "get_dhis2_client": VALIDATION_CLIENT,
+            "get_dhis2_client": client,
             "get_validation_detail_metadata": metadata,
         })
         app = AppTest.from_string(source, default_timeout=30)
@@ -162,7 +185,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertIn("déclarée", high["Détails"])
             self.assertEqual(frame.loc[frame["Importance"].eq("LOW"), "Valeur droite"].iloc[0], 0)
             queries = len(app.session_state["_fixture_detail_queries"])
-            self.assertEqual(queries, 6)
+            self.assertEqual(queries, 2)
             self.assertEqual(app.session_state["_fixture_detail_metadata_calls"], 1)
 
             self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
@@ -201,7 +224,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.run_app(app)
             frame = self.analyse(app)
             self.assertEqual(set(frame["Unité d’organisation"]), {"Centre Étoile", "Centre B"})
-            self.assertEqual(set(query["ou"] for query in app.session_state["_fixture_detail_queries"]), {"ZoneAAAAAAA", "ZoneBBBBBBB"})
+            self.assertEqual(set(query["ou"] for query in app.session_state["_fixture_detail_queries"]), {"ProvinceAAA"})
 
             self.widget(app, "selectbox", "Province :").select("ProvinceBBB")
             self.run_app(app)
@@ -224,11 +247,58 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertEqual(len(frame), 2)
             self.assertEqual(frame["Unité d’organisation"].tolist(), ["Centre Étoile", "Centre Étoile"])
             self.assertEqual(set(frame["Période"]), {f"Janvier {year}", f"Février {year}"})
+            summary = app.session_state["_test_export_frame"]
+            self.assertEqual(sorted(summary["Règles violées (M)"].tolist()), [0, 0, 2])
             queries = app.session_state["_fixture_detail_queries"]
             self.assertTrue(all(query.get("vrg") == "groupAAAAAA" for query in queries))
-            self.assertTrue(all(query["persist"] == "false" and query["notification"] == "false" for query in queries))
+            self.assertTrue(all(query["persist"] is False and query["notification"] is False for query in queries))
             current_dates = {query["startDate"] for query in queries if query["startDate"].startswith(year)}
-            self.assertEqual(current_dates, {f"{year}-01-01", f"{year}-02-01"})
+            self.assertEqual(current_dates, {f"{year}-01-01"})
+            self.assertEqual(queries[0]["endDate"], f"{year}-02-28")
+
+    def test_post_response_without_paths_is_displayed_and_assigned_using_metadata(self):
+        self.assertNotIn("organisationUnitPath", PATHLESS_VALIDATION_CLIENT)
+        app = self.new_app(client=PATHLESS_VALIDATION_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            frame = self.analyse(app)
+            self.assertEqual(len(frame), 3)
+            self.assertEqual(set(frame["Unité d’organisation"]), {"Centre Étoile", "Centre B", "Centre C"})
+            summary = app.session_state["_test_export_frame"]
+            self.assertEqual(summary["Règles violées (M)"].tolist(), [1, 1, 1])
+            self.assertEqual(app.session_state["categorisation_result"]["validation_warnings"], [])
+            requests = app.session_state["categorisation_result"]["validation_requests"]
+            self.assertEqual([request["Méthode"] for request in requests], ["POST", "POST"])
+            self.assertEqual([request["Unité parent"] for request in requests], ["CountryAAAA", "CountryAAAA"])
+            self.assertEqual(requests[0]["Lignes reçues"], 3)
+            self.assertTrue(any(
+                item.label == "Vérifier la requête envoyée à DHIS2" for item in app.expander
+            ))
+
+            queries = list(app.session_state["_fixture_detail_queries"])
+            repeated = self.analyse(app)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 2)
+            pd.testing.assert_frame_equal(repeated, frame)
+
+            queries = list(app.session_state["_fixture_detail_queries"])
+            self.widget(app, "button", "Actualiser les données").click()
+            self.run_app(app)
+            self.assertNotIn("categorisation_result", app.session_state)
+            self.analyse(app)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 2)
+
+    def test_forbidden_analysis_explains_the_http_failure_and_never_reports_a_healthy_zero(self):
+        app = self.new_app(client=FORBIDDEN_VALIDATION_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            frame = self.analyse(app)
+            self.assertTrue(frame.empty)
+            summary = app.session_state["_test_export_frame"]
+            self.assertTrue(summary["Règles violées (M)"].isna().all())
+            saved = app.session_state["categorisation_result"]
+            self.assertTrue(any("403" in str(message) for message in saved["validation_warnings"]))
+            self.assertTrue(any("403" in str(item.value) for item in app.text))
+            self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
 
     def test_missing_metadata_preserves_identifiers_and_actual_values(self):
         app = self.new_app(metadata=MISSING_METADATA)

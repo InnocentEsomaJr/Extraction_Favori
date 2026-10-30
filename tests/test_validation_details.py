@@ -57,7 +57,7 @@ class ValidationDetailsTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "_ou_id"], "OuBBBBBBB")
         self.assertEqual(result.loc[0, "Unité d’organisation"], "Centre frais")
         self.assertEqual(result.loc[0, "Règle de validation"], "Règle fraîche")
-        self.assertEqual(result.loc[0, "Période"], "Octobre 2026")
+        self.assertEqual(result.loc[0, "Période"], "October 2026")
         self.assertEqual(result.loc[0, "Valeur gauche"], 0)
         self.assertEqual(result.loc[0, "Valeur droite"], 4.5)
         self.assertEqual(result.loc[0, "Opérateur"], ">")
@@ -84,7 +84,7 @@ class ValidationDetailsTests(unittest.TestCase):
             "Février 2026", "2026", "Troisième trimestre 2026", "Janvier 2026", "2026-09-01",
         ])
 
-    def test_duplicates_are_removed_without_merging_periods_values_or_combinations(self):
+    def test_all_server_rows_are_preserved_including_identical_observations(self):
         base = self.row()
         rows = [
             base, copy.deepcopy(base), self.row(period="202610"), self.row(leftsideValue=1),
@@ -92,22 +92,41 @@ class ValidationDetailsTests(unittest.TestCase):
             self.row(dayInPeriod=0), self.row(dayInPeriod=1),
         ]
         result = build_validation_details(rows)
-        self.assertEqual(len(result), 7)
-        self.assertEqual(result["_period_id"].tolist().count("202609"), 6)
+        self.assertEqual(len(result), 8)
+        self.assertEqual(result["_period_id"].tolist().count("202609"), 7)
+        self.assertEqual(result.iloc[0].to_dict(), result.iloc[1].to_dict())
 
     def test_nested_iso_precedes_database_id_but_flat_period_remains_priority(self):
         result = build_validation_details([
             self.row(period={"id": 12345, "iso": "202609"}),
             self.row(period={"id": 12345, "iso": "202609"}, periodId="202610"),
+            self.row(period={"id": 12345, "isoDate": "202611"}),
         ])
-        self.assertEqual(result["_period_id"].tolist(), ["202609", "202610"])
-        self.assertEqual(result["Période"].tolist(), ["Septembre 2026", "Octobre 2026"])
+        self.assertEqual(result["_period_id"].tolist(), ["202609", "202610", "202611"])
+        self.assertEqual(result["Période"].tolist(), ["Septembre 2026", "Octobre 2026", "Novembre 2026"])
 
-    def test_result_uid_deduplicates_repeated_observation_but_retains_other_period(self):
+    def test_result_uid_does_not_remove_any_server_row(self):
         rows = [self.row(id="ResultAAA"), self.row(id="ResultAAA"), self.row(id="ResultAAA", period="202610")]
         result = build_validation_details(rows)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result["_result_id"].tolist(), ["ResultAAA", "ResultAAA"])
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result["_result_id"].tolist(), ["ResultAAA", "ResultAAA", "ResultAAA"])
+
+    def test_explicit_empty_source_rule_description_is_not_replaced_by_metadata(self):
+        rules, units = self.metadata()
+        result = build_validation_details([
+            self.row(validationRuleDescription=""), self.row(validationRuleDescription=None), self.row(),
+        ], rules, units)
+        self.assertEqual(result["Règle de validation"].tolist(), ["", "", "Doses administrées"])
+
+    def test_server_period_label_has_priority_over_local_month_formatting(self):
+        result = build_validation_details([
+            self.row(periodId="202609", periodDisplayName="September 2026"),
+            self.row(periodId="202609", periodDisplayName="Septembre 2026"),
+            self.row(periodId="2026Q3", periodDisplayName="July - September 2026"),
+        ])
+        self.assertEqual(result["Période"].tolist(), [
+            "September 2026", "Septembre 2026", "July - September 2026",
+        ])
 
     def test_homonyms_stay_distinct_by_unit_rule_ids(self):
         rows = [self.row(), self.row(organisationUnit="OuBBBBBBB"), self.row(validationRule="RuleBBBBB")]

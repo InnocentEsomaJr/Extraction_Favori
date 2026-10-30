@@ -37,11 +37,35 @@ def dashboard_functions(*names, **overrides):
 
 
 class ValidationApiTests(unittest.TestCase):
+    def test_client_posts_validation_json_using_the_authenticated_session(self):
+        session = mock.Mock()
+        response = session.request.return_value
+        response.status_code = 200
+        response.text = "[]"
+        response.json.return_value = []
+        requests_module = mock.Mock()
+        requests_module.Session.return_value = session
+        build_client = dashboard_functions(
+            "_build_dhis2_client", requests=requests_module,
+            Retry=mock.Mock(), HTTPAdapter=mock.Mock(),
+        )["_build_dhis2_client"]
+        client = build_client("https://fixture.invalid/", "fixture-user", "fixture-password")
+        payload = {
+            "ou": "ZoneAAAAAAA", "startDate": "2026-09-01", "endDate": "2026-09-30",
+            "persist": False, "notification": False,
+        }
+        self.assertEqual(client.post("dataAnalysis/validationRules", data=payload), [])
+        self.assertEqual(session.auth, ("fixture-user", "fixture-password"))
+        session.request.assert_called_once_with(
+            "POST", "https://fixture.invalid/api/dataAnalysis/validationRules",
+            params=None, json=payload, timeout=(10, 90),
+        )
+
     def test_empty_success_is_distinct_from_failed_and_malformed_periods(self):
         class Client:
-            def get(self, endpoint, params=None):
+            def post(self, endpoint, data=None):
                 self.assert_endpoint(endpoint)
-                period = params["startDate"][:7].replace("-", "")
+                period = data["startDate"][:7].replace("-", "")
                 if period == "202501":
                     return []
                 if period == "202502":
@@ -59,9 +83,15 @@ class ValidationApiTests(unittest.TestCase):
         empty = get_results("ZoneAAAAAAA", ["202501"], None)
         self.assertTrue(empty.empty)
         self.assertEqual(empty.attrs["failed_periods"], [])
-        partial = get_results("ZoneAAAAAAA", ["202501", "202502", "202503", "202504"], "groupA")
-        self.assertEqual(len(partial), 1)
-        self.assertEqual(partial.attrs["failed_periods"], ["202503", "202504"])
+        available = get_results("ZoneAAAAAAA", ["202502"], "groupA")
+        self.assertEqual(len(available), 1)
+        self.assertEqual(available.attrs["failed_periods"], [])
+        failed = get_results("ZoneAAAAAAA", ["202503", "202504"], "groupA")
+        self.assertTrue(failed.empty)
+        self.assertEqual(failed.attrs["failed_periods"], ["202503", "202504"])
+        malformed = get_results("ZoneAAAAAAA", ["202504"], None)
+        self.assertTrue(malformed.empty)
+        self.assertEqual(malformed.attrs["failed_periods"], ["202504"])
 
     def test_bad_identifiers_and_client_failure_are_unavailable(self):
         unavailable = mock.Mock(side_effect=RuntimeError("client indisponible"))
@@ -163,12 +193,12 @@ def get_validation_groups(cache_user=None):
 
 def get_dhis2_client():
     class Client:
-        def get(self, endpoint, params=None):
+        def post(self, endpoint, data=None):
             if endpoint != "dataAnalysis/validationRules":
                 raise AssertionError("Appel fixture non prévu")
             st.session_state["_fixture_validation_calls"] = st.session_state.get("_fixture_validation_calls", 0) + 1
             targets = list(st.session_state.get("_fixture_validation_targets", []))
-            targets.append(params["ou"])
+            targets.append(data["ou"])
             st.session_state["_fixture_validation_targets"] = targets
             return []
     return Client()

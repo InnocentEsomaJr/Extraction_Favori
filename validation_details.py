@@ -98,10 +98,12 @@ def _period(row):
     source = row.get("period")
     item = _object(source)
     identifier = _id(_first(
-        row.get("periodId"), item.get("iso"), item.get("id"),
+        row.get("periodId"), item.get("iso"), item.get("isoDate"), item.get("id"),
         source if not isinstance(source, dict) else None,
         row.get("_requested_period"), item.get("name"), item.get("startDate"),
     ))
+    if "periodDisplayName" in row:
+        return identifier, _text(row["periodDisplayName"])
     explicit_name = _text(_first(row.get("periodDisplayName"), item.get("displayName"), item.get("name")))
     match = re.fullmatch(r"(\d{4})(\d{2})", identifier)
     if match and 1 <= int(match[2]) <= 12:
@@ -149,21 +151,6 @@ def _number(value):
     return numeric if not pd.isna(numeric) and math.isfinite(float(numeric)) else float("nan")
 
 
-def _freeze(value):
-    if _missing(value):
-        return None
-    if isinstance(value, dict):
-        return tuple(sorted((str(key), _freeze(item)) for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return str(value)
-
-
-def _value_key(value):
-    numeric = _number(value)
-    return float(numeric) if not pd.isna(numeric) else _freeze(value)
-
-
 def _combo(row, key):
     source = row.get(key)
     identifier = _id(_first(row.get(key + "Id"), source))
@@ -183,38 +170,32 @@ def _side(embedded, metadata, key):
 def build_validation_details(results, rule_metadata=None, org_metadata=None):
     """Normalise les résultats plats d'analyse et les anciens résultats imbriqués.
 
-    Les observations de périodes différentes sont conservées. Les IDs et
-    combinaisons servent à dédupliquer les répétitions, jamais les libellés.
+    Chaque ligne et son ordre sont conservés, même si les valeurs ou
+    identifiants se répètent. Les libellés présents dans la réponse d'analyse
+    priment sur les métadonnées ajoutées pour compléter les anciens formats.
     Les expressions sont affichées comme du texte et ne sont pas exécutées.
     """
-    records, seen = [], set()
+    records = []
     for row in _records(results):
         rule_id, ou_id = _rule_id(row), _ou_id(row)
         rule, ou = _object(row.get("validationRule")), _object(row.get("organisationUnit"))
         metadata_rule, metadata_ou = _metadata(rule_metadata, rule_id), _metadata(org_metadata, ou_id)
         period_id, period_name = _period(row)
         zone_id, zone_name = _zone(row, ou_id, ou, metadata_ou, org_metadata)
-        rule_name = _text(_first(
-            row.get("validationRuleDescription"), row.get("validationRuleDisplayName"),
-            _name(rule), _name(metadata_rule), rule.get("description"), metadata_rule.get("description"), rule_id,
-        )) or "Non renseignée"
+        if "validationRuleDescription" in row:
+            # L'écran DHIS2 affiche aussi les descriptions explicitement vides.
+            rule_name = _text(row["validationRuleDescription"])
+        else:
+            rule_name = _text(_first(
+                row.get("validationRuleDisplayName"), _name(rule), _name(metadata_rule),
+                rule.get("description"), metadata_rule.get("description"), rule_id,
+            )) or "Non renseignée"
         ou_name = _text(_first(row.get("organisationUnitDisplayName"), _name(ou), _name(metadata_ou), ou_id)) or "Non renseignée"
         raw_left = _first(row.get("leftSideValue"), row.get("leftsideValue"), row.get("leftValue"))
         raw_right = _first(row.get("rightSideValue"), row.get("rightsideValue"), row.get("rightValue"))
         attribute_id, attribute_name = _combo(row, "attributeOptionCombo")
         category_id, category_name = _combo(row, "categoryOptionCombo")
         result_id = _id(_first(row.get("id"), row.get("uid"), row.get("_result_id")))
-        day = _freeze(row.get("dayInPeriod"))
-        context_key = (period_id, attribute_id or attribute_name, category_id or category_name, day)
-        identity = (
-            ("id", result_id, *context_key)
-            if result_id else
-            ("observation", ou_id or ou_name, rule_id or rule_name, *context_key, _value_key(raw_left), _value_key(raw_right))
-        )
-        if identity in seen:
-            continue
-        seen.add(identity)
-
         importance = _text(_first(row.get("importance"), rule.get("importance"), metadata_rule.get("importance")))
         importance = importance.upper() if importance.upper() in {"HIGH", "MEDIUM", "LOW"} else importance
         operator = _text(_first(row.get("operator"), rule.get("operator"), metadata_rule.get("operator")))

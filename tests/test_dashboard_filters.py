@@ -168,8 +168,12 @@ class DashboardFilterTests(unittest.TestCase):
         frame = app.session_state["_test_export_frame"]
         self.assertEqual(len(frame), len(expected_ids))
         self.assertEqual(frame["Barème datasets"].tolist(), ["ZS"] * len(expected_ids))
-        self.assertEqual(set(app.session_state["_fixture_validation_targets"]), set(expected_ids))
-        self.assertEqual(len(app.session_state["_fixture_validation_targets"]), 2 * len(expected_ids))
+        parent = (
+            self.widget(app, "selectbox", "Zone de santé de l’analyse").value
+            or self.widget(app, "selectbox", "Province de l’analyse").value
+            or app.session_state["validation_country"]
+        )
+        self.assertEqual(app.session_state["_fixture_validation_targets"], [parent, parent])
         return frame
 
     def test_country_loads_and_validates_all_health_zones_including_homonyms(self):

@@ -82,7 +82,7 @@ nouvelle analyse pour éviter un résultat périmé, tout comme un changement de
 sources. La déconnexion efface ce résultat.
 Dans l'onglet de catégorisation, les calendriers **Date de début** et **Date de fin**
 définissent l'intervalle M. La référence M-1 reste le mois entier précédant celui de
-la date de début ; les signatures de violations sont dédupliquées entre les mois.
+la date de début. Chaque ligne renvoyée par DHIS2 est conservée et comptée.
 
 Le bloc **Unité d’organisation parent** permet de choisir le pays, puis une province
 et éventuellement une zone de santé. Les parents possibles restent les niveaux pays,
@@ -128,18 +128,37 @@ Le CSV télécharge les lignes affichées ; la feuille Excel `Details_Violations
 l'onglet d'aperçu « Règles détaillées » gardent tous les détails du périmètre analysé.
 La feuille `Contexte_Validation` indique les dates appliquées, le parent et son ID,
 le groupe de règles, les mois des indicateurs, la référence M-1 et le barème utilisé.
-Une violation présente sur deux périodes conserve deux lignes, tandis que les compteurs
-de la synthèse regroupent les signatures identiques entre les mois.
+Les lignes conservent l'ordre, les périodes, les valeurs et les libellés renvoyés par DHIS2,
+y compris les règles dont la description est vide. Une violation présente sur deux
+périodes conserve deux lignes et compte deux fois dans la synthèse. Les signatures
+sans période servent uniquement à comparer les corrections entre M-1 et M.
 
-Les analyses M et M-1 sont calculées à la demande par `GET dataAnalysis/validationRules`,
-avec `persist=false` et `notification=false`. Elles ne modifient pas les données DHIS2
+Les analyses M et M-1 sont calculées à la demande par `POST /api/dataAnalysis/validationRules`,
+avec un corps JSON contenant `ou`, `startDate`, `endDate`, `persist: false`,
+`notification: false` et éventuellement `vrg`, comme l'application officielle DHIS2.
+Une seule requête couvre le parent sélectionné et l'intervalle complet ; la requête
+M-1 utilise le même parent et le mois de référence entier. Les unités descendantes
+sont sélectionnées par DHIS2. Les chemins hiérarchiques ne sont pas obligatoires
+dans la réponse ; les métadonnées servent à répartir les lignes par zone de santé.
+Si ce rattachement manque, les lignes restent affichées et les comptes par zone
+restent indisponibles. Un ancien serveur répondant HTTP 404, 405 ou 501 au POST
+est interrogé en GET avec les mêmes paramètres. Un refus 401/403 reste une erreur.
+Ces analyses ne modifient pas les données DHIS2
 et ne déclenchent pas de notifications. Le nombre de règles corrigées correspond aux
 signatures de M-1 absentes des résultats M calculés lors de la même analyse.
-Les résultats calculés sont mis en cache pendant une heure ; **Actualiser les données**
-permet de relancer ensuite l'analyse à partir de nouvelles requêtes au serveur.
-Référence : [analyse des règles de validation DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/data-validation.html#validation-rule-analysis).
+Chaque clic sur **Lancer l'analyse des violations** effectue de nouvelles requêtes
+DHIS2. Les résultats restent en session pendant la consultation, sans nouvel appel
+lors d'une recherche, d'un tri ou d'un export. **Actualiser les données** recharge
+aussi les indicateurs de déclaration et les métadonnées.
+L'expandeur **Vérifier la requête envoyée à DHIS2** présente le compte, le parent,
+les dates, le groupe et le nombre de lignes reçues pour M et M-1. Les erreurs
+indiquent la méthode et le statut HTTP, sans afficher les identifiants de connexion.
+Références : [appel dans l'application officielle](https://github.com/dhis2/data-quality-app/blob/54a3bf8ed25e051fbea00ceef715df81812b3e62/src/pages/ValidationRulesAnalysis/ValidationRulesAnalysis.jsx),
+[conversion des résultats serveur](https://github.com/dhis2/data-quality-app/blob/54a3bf8ed25e051fbea00ceef715df81812b3e62/src/pages/ValidationRulesAnalysis/convert-element-from-api-response.js).
 
-Une réponse atteignant la limite de 500 résultats demandés est signalée comme partielle.
+Aucune limite personnalisée n'est envoyée par défaut, comme dans l'application DHIS2.
+Une réponse atteignant 500 lignes déclenche un avertissement prudent de limite possible,
+selon le seuil de l'application officielle ; le serveur peut appliquer sa propre limite.
 Les lignes reçues restent consultables, mais le décompte et les scores concernés restent
 indisponibles. Un groupe de règles plus précis peut réduire le nombre de résultats.
 Si les libellés ou instructions ne sont pas accessibles, les identifiants disponibles
@@ -241,6 +260,7 @@ Extraction_Favori/
 |- validation_api.py
 |- validation_details.py
 |- validation_filters.py
+|- validation_scope.py
 |- tests/
 |- requirements.txt
 |- .streamlit/
