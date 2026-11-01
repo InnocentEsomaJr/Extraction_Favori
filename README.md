@@ -90,15 +90,25 @@ Une province affiche ses zones, le pays affiche toutes ses zones accessibles et
 une zone sélectionnée affiche uniquement ses propres indicateurs. Les jointures
 utilisent les IDs DHIS2, y compris en présence de noms identiques.
 
-Sa source est Analytics DHIS2 pour les datasets du favori choisi. Si le favori ne
-demande que les taux, la requête qualité complète les cinq métriques nécessaires :
+Pour les mêmes mois, le tableau reprend en priorité les chiffres déjà calculés
+dans Complétude, Promptitude et Analyse Comparative : taux, rapports réels et
+nombre de datasets à complétude ≥95 %. Une zone peut être sélectionnée dans la
+province ou le pays déjà chargé, sans relancer une seconde requête. Un dataset
+inutilisé dont les cellules sont vides ne supprime plus les chiffres de cette synthèse.
+Les ID exacts et un rattachement non ambigu sont obligatoires ; un zéro créé en
+l'absence de toute donnée brute n'est pas réutilisé comme mesure.
+
+Si les mois ou les zones demandés ne sont pas disponibles dans cette synthèse,
+Analytics DHIS2 complète seulement les métriques manquantes, pour le périmètre
+et la période choisis. Si le favori ne demande que les taux, cette requête complète
+les cinq métriques nécessaires :
 rapports réels, attendus, reçus à temps, taux de complétude et taux de promptitude.
 Les indicateurs génériques ne sont pas assimilés à ces comptes. Les trois comptes
 servent aux taux pondérés ; le score qualité reste leur moyenne et sa note /20
 conserve le barème convenu. Les autres onglets gardent la sélection du favori.
 
-Les données de déclaration existantes sont réutilisées seulement si leur origine
-reporting, leurs métriques, leur période et leur périmètre correspondent. Sinon,
+Les données de déclaration existantes sont réutilisées seulement si leurs unités,
+leurs métriques et leurs mois correspondent à la sélection. Sinon,
 une requête qualité dédiée complète la source. Un favori sans dataset de reporting,
 une réponse manquante ou des comptes incomplets sont signalés dans
 **Voir les données manquantes du tableau qualité**, sans fabriquer de valeurs.

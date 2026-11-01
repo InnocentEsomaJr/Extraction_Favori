@@ -17,7 +17,7 @@ from reporting_metrics import (
     aggregate_validation_metrics, clean_ou_id, has_complete_reporting_metrics,
     reporting_quality_warnings,
 )
-from quality_score import build_quality_rows
+from quality_score import build_quality_rows, metrics_from_dashboard_summary
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
@@ -2053,26 +2053,48 @@ if df_raw is not None:
 
         # Le tableau qualité suit les filtres sans attendre les appels des règles de validation.
         quality_warnings = []
+        quality_source_description = 'Synthèse des onglets Complétude, Promptitude et Analyse Comparative'
         if validation_dates_valid and not validation_zones_df.empty:
-            same_reporting_scope = validation_ou_dimension == ou_dimension and validation_period_id == period_id
-            certified_reporting_columns = [
-                column for column in target_df.attrs.get('reporting_columns', []) if column in target_df
+            same_reporting_months = validation_period_id == period_id
+            quality_metrics = (
+                metrics_from_dashboard_summary(df_synth, target_df, validation_zones_df)
+                if same_reporting_months else
+                aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
+            )
+            quality_metric_columns = [
+                'Complétude_Globale', 'Promptitude_Globale', 'Actual_Reports', 'Nombre_Datasets_95',
             ]
-            certified_reporting_source = target_df[
-                ['Organisation unit', 'Organisation unit ID'] + certified_reporting_columns
-            ]
-            if same_reporting_scope and has_complete_reporting_metrics(certified_reporting_source):
-                quality_reporting_source = certified_reporting_source
-            else:
-                quality_reporting_source = get_quality_reporting_data(
-                    id_final, period=validation_period_id, cache_user=current_user_for_cache,
-                    ou_dimension=validation_ou_dimension,
+            quality_reporting_source = target_df.loc[
+                target_df['Organisation unit ID'].isin(validation_zones_df['Zone_ID'])
+            ].copy() if same_reporting_months else pd.DataFrame()
+            if quality_metrics[quality_metric_columns].isna().any().any():
+                same_reporting_scope = same_reporting_months and validation_ou_dimension == ou_dimension
+                certified_reporting_columns = [
+                    column for column in target_df.attrs.get('reporting_columns', []) if column in target_df
+                ]
+                certified_reporting_source = target_df[
+                    ['Organisation unit', 'Organisation unit ID'] + certified_reporting_columns
+                ]
+                if same_reporting_scope and has_complete_reporting_metrics(certified_reporting_source):
+                    quality_reporting_source = certified_reporting_source
+                else:
+                    quality_reporting_source = get_quality_reporting_data(
+                        id_final, period=validation_period_id, cache_user=current_user_for_cache,
+                        ou_dimension=validation_ou_dimension,
+                    )
+                if quality_reporting_source is None:
+                    quality_reporting_source = pd.DataFrame()
+                extra_metrics = aggregate_validation_metrics(quality_reporting_source, validation_zones_df)
+                quality_metrics = quality_metrics.set_index('Zone_ID').combine_first(
+                    extra_metrics.set_index('Zone_ID')
+                ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
+                quality_source_description = (
+                    'Synthèse affichée complétée par Analytics DHIS2' if same_reporting_months else
+                    'Analytics DHIS2 — métriques de reporting des datasets'
                 )
-            if quality_reporting_source is None:
-                quality_reporting_source = pd.DataFrame()
-            quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
-            quality_metrics = aggregate_validation_metrics(quality_reporting_source, validation_zones_df)
-            quality_warnings.extend(reporting_quality_warnings(quality_reporting_source, quality_metrics, validation_zones_df))
+                if quality_metrics[quality_metric_columns].isna().any().any():
+                    quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
+                    quality_warnings.extend(reporting_quality_warnings(quality_reporting_source, quality_metrics, validation_zones_df))
         else:
             quality_reporting_source = pd.DataFrame()
             quality_metrics = pd.DataFrame()
@@ -2322,6 +2344,7 @@ if df_raw is not None:
                 f"Parent : {validation_parent_label}. Du {validation_start_date.isoformat()} au {validation_end_date.isoformat()}. "
                 "Les indicateurs sont actualisés automatiquement selon ces filtres ; les rapports couvrent les mois entiers."
             )
+            st.caption(f"Source des indicateurs : {quality_source_description}.")
             validation_applied_label = (
                 f"Parent : {validation_parent_label}. "
                 f"Du {validation_start_date.isoformat()} au {validation_end_date.isoformat()}."
@@ -2334,7 +2357,7 @@ if df_raw is not None:
                     'ID unité parent': validation_parent_id,
                     'Favori DHIS2': id_final,
                     'Mois des indicateurs de déclaration': validation_period_id,
-                    'Source des indicateurs': 'Analytics DHIS2 — métriques de reporting des datasets',
+                    'Source des indicateurs': quality_source_description,
                     'Barème datasets': profil_bareme,
                     'Analyse des violations': 'Non lancée',
                     'Contrôle des corrections': 'Non effectué',
@@ -2361,7 +2384,7 @@ if df_raw is not None:
             applied_filters = dict(saved_validation.get('filters', {}))
             applied_filters['Barème datasets'] = profil_bareme
             applied_filters['Favori DHIS2'] = id_final
-            applied_filters['Source des indicateurs'] = 'Analytics DHIS2 — métriques de reporting des datasets'
+            applied_filters['Source des indicateurs'] = quality_source_description
             applied_filters['Analyse M effectuée le'] = saved_validation.get('analysed_at', '')
             applied_filters['Contrôle des corrections effectué le'] = saved_validation.get('corrections_checked_at') or 'Non effectué'
             df_validation_context_export = pd.DataFrame(

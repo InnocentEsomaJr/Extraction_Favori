@@ -78,6 +78,52 @@ def get_dhis2_client():
 '''
 
 
+SCREENSHOT_CATALOG = filter_test.CATALOG_FIXTURE.replace('"ZS Commune", pa', '"Ango", pa')
+SCREENSHOT_DATA = QUALITY_DATA.replace(
+    '"ProvinceAAA", 100, 90, 75', '"ProvinceAAA", 100, 100, 68',
+).replace(
+    '"ProvinceAAA", 200, 100, 80', '"ProvinceAAA", 200, 80, 60',
+).replace('range(10)', 'range(9)').replace(
+    '    return pd.DataFrame(rows)',
+    '''    frame = pd.DataFrame(rows)
+    for metric in ["Actual reports", "Expected reports", "Actual reports on time", "Reporting rate", "Reporting rate on time"]:
+        frame["Dataset inutilisé " + metric] = np.nan
+    return frame''',
+)
+
+FAILED_EXTRA_REPORTING = '''
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
+    attempts = list(st.session_state.get("_extra_quality_attempts", []))
+    attempts.append({"period": period, "ou_dimension": ou_dimension})
+    st.session_state["_extra_quality_attempts"] = attempts
+    return None
+'''
+
+FOUR_CURRENT_VIOLATIONS = '''
+def get_dhis2_client():
+    class Client:
+        def post(self, endpoint, data=None):
+            queries = list(st.session_state.get("_screenshot_validation_queries", []))
+            queries.append(dict(data))
+            st.session_state["_screenshot_validation_queries"] = queries
+            rows = []
+            for number, (left, right) in enumerate([(84, 59), (20, 18), (567, 566), (6, 5)]):
+                centre = f"Centre{number:05d}"
+                rows.append({
+                    "organisationUnitId": centre,
+                    "organisationUnitDisplayName": f"Centre {number}",
+                    "organisationUnitPath": f"/CountryAAAA/ProvinceAAA/{data['ou']}/{centre}",
+                    "validationRuleId": f"Rule{number:07d}",
+                    "validationRuleDescription": f"Règle {number}",
+                    "periodId": data["startDate"][:7].replace("-", ""),
+                    "leftSideValue": left, "rightSideValue": right, "operator": "<=",
+                    "importance": "MEDIUM",
+                })
+            return rows
+    return Client()
+'''
+
+
 class DynamicQualityDashboardTests(unittest.TestCase):
     def widget(self, app, kind, label):
         return next(widget for widget in getattr(app, kind) if widget.label == label)
@@ -86,9 +132,9 @@ class DynamicQualityDashboardTests(unittest.TestCase):
         app.run(timeout=30)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
 
-    def new_app(self, client=detail_test.VALIDATION_CLIENT, reporting=QUALITY_REPORTING, data=QUALITY_DATA):
+    def new_app(self, client=detail_test.VALIDATION_CLIENT, reporting=QUALITY_REPORTING, data=QUALITY_DATA, catalog=filter_test.CATALOG_FIXTURE):
         source = dashboard_test.app_fixture_source({
-            "get_organisation_catalog": filter_test.CATALOG_FIXTURE,
+            "get_organisation_catalog": catalog,
             "get_data": data,
             "get_quality_reporting_data": reporting,
             "get_dhis2_client": client,
@@ -225,7 +271,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             self.assertEqual(context['Date de début'], start.isoformat())
             self.assertEqual(context['Date de fin'], end.isoformat())
             self.assertEqual(context['Mois des indicateurs de déclaration'], f'{year}01')
-            self.assertIn('Analytics DHIS2', context['Source des indicateurs'])
+            self.assertTrue(any(label in context['Source des indicateurs'] for label in ['Analytics', 'Synthèse']))
             self.assertEqual(context['Analyse des violations'], 'Non lancée')
             self.assertNotIn('_fixture_detail_queries', app.session_state)
 
@@ -277,6 +323,64 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             self.assertTrue(frame['Score de qualité'].isna().all())
             self.assertTrue(frame[TOTAL_COL].isna().all())
             self.assertGreater(len(app.warning) + len(app.info), 0)
+
+    def test_visible_comparative_values_feed_ango_quality_without_an_extra_failed_query(self):
+        app = self.new_app(
+            data=SCREENSHOT_DATA, catalog=SCREENSHOT_CATALOG,
+            reporting=FAILED_EXTRA_REPORTING, client=FOUR_CURRENT_VIOLATIONS,
+        )
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_zone(app, 'ProvinceAAA', 'ZoneAAAAAAA')
+            current = self.summary(app)
+            self.assertEqual(current['Zone de santé'].tolist(), ['Ango'])
+            self.assertEqual(current['Complétude globale (%)'].tolist(), [100])
+            self.assertEqual(current['Promptitude globale (%)'].tolist(), [68])
+            self.assertEqual(current['Reports_Actual'].tolist(), [900])
+            self.assertEqual(current['Nombre de datasets complétude ≥95 %'].tolist(), [9])
+            self.assertEqual(current['Score de qualité'].tolist(), [84])
+            self.assertEqual(current['Score de qualité /20'].tolist(), [15])
+            self.assertNotIn('_extra_quality_attempts', app.session_state)
+
+            self.widget(app, 'button', "Lancer l'analyse des violations").click()
+            self.run_app(app)
+            analysed = self.summary(app)
+            self.assertEqual(analysed['Règles violées (M)'].tolist(), [4])
+            self.assertEqual(analysed['Score de qualité'].tolist(), [84])
+            self.assertEqual(analysed['Nombre de datasets complétude ≥95 %'].tolist(), [9])
+            self.assertEqual(len(app.session_state['_screenshot_validation_queries']), 1)
+            self.assertNotIn('_extra_quality_attempts', app.session_state)
+
+            self.select_zone(app, 'ProvinceAAA', 'ZoneBBBBBBB')
+            other = self.summary(app)
+            self.assertEqual(other['Reports_Actual'].tolist(), [720])
+            self.assertEqual(other['Complétude globale (%)'].tolist(), [40])
+            self.assertEqual(other['Promptitude globale (%)'].tolist(), [30])
+            self.assertEqual(other['Score de qualité'].tolist(), [35])
+            self.assertTrue(other['Règles violées (M)'].isna().all())
+            self.assertEqual(len(app.session_state['_screenshot_validation_queries']), 1)
+            self.assertNotIn('_extra_quality_attempts', app.session_state)
+
+    def test_month_outside_the_visible_dashboard_loads_its_own_reporting_values(self):
+        app = self.new_app()
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_zone(app, 'ProvinceAAA', 'ZoneAAAAAAA')
+            self.assertEqual(self.summary(app)['Reports_Actual'].tolist(), [900])
+            self.assertNotIn('_quality_requests', app.session_state)
+            year = int(self.widget(app, 'selectbox', "Choisir l'année :").value)
+            self.widget(app, 'date_input', 'Date de début').set_value(date(year, 2, 1))
+            self.widget(app, 'date_input', 'Date de fin').set_value(date(year, 2, 28))
+            self.run_app(app)
+            frame = self.summary(app)
+            self.assertEqual(frame['Reports_Actual'].tolist(), [400])
+            self.assertEqual(frame['Complétude globale (%)'].tolist(), [40])
+            self.assertEqual(frame['Promptitude globale (%)'].tolist(), [30])
+            self.assertEqual(frame['Score de qualité'].tolist(), [35])
+            self.assertEqual(app.session_state['_quality_requests'][-1], {
+                'period': f'{year}02', 'ou_dimension': 'ZoneAAAAAAA',
+            })
+            self.assertNotIn('_fixture_detail_queries', app.session_state)
 
 
 if __name__ == '__main__':
