@@ -120,7 +120,8 @@ class ValidationDateFilterTests(unittest.TestCase):
             self.widget(app, "date_input", "Date de fin").set_value(date(year, 1, 11))
             self.run_app(app)
             self.assertNotIn("categorisation_result", app.session_state)
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(sorted(app.session_state["_test_export_frame"]["Reports_Actual"].tolist()), [100, 200, 300])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.assertEqual(app.session_state["_fixture_detail_queries"], queries)
 
     def test_cross_year_dates_load_matching_months_for_reporting_denominators(self):

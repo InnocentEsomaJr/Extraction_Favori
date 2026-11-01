@@ -84,6 +84,30 @@ Dans l'onglet de catégorisation, les calendriers **Date de début** et **Date d
 définissent l'intervalle M. La référence M-1 reste le mois entier précédant celui de
 la date de début. Chaque ligne renvoyée par DHIS2 est conservée et comptée.
 
+Le **Tableau de score qualité** apparaît automatiquement, avant toute analyse des
+violations. Il suit les filtres pays, province, zone et dates de cet onglet.
+Une province affiche ses zones, le pays affiche toutes ses zones accessibles et
+une zone sélectionnée affiche uniquement ses propres indicateurs. Les jointures
+utilisent les IDs DHIS2, y compris en présence de noms identiques.
+
+Sa source est Analytics DHIS2 pour les datasets du favori choisi. Si le favori ne
+demande que les taux, la requête qualité complète les cinq métriques nécessaires :
+rapports réels, attendus, reçus à temps, taux de complétude et taux de promptitude.
+Les indicateurs génériques ne sont pas assimilés à ces comptes. Les trois comptes
+servent aux taux pondérés ; le score qualité reste leur moyenne et sa note /20
+conserve le barème convenu. Les autres onglets gardent la sélection du favori.
+
+Les données de déclaration existantes sont réutilisées seulement si leur origine
+reporting, leurs métriques, leur période et leur périmètre correspondent. Sinon,
+une requête qualité dédiée complète la source. Un favori sans dataset de reporting,
+une réponse manquante ou des comptes incomplets sont signalés dans
+**Voir les données manquantes du tableau qualité**, sans fabriquer de valeurs.
+L'écran affiche « — » pour les données indisponibles ; les exports restent numériques.
+Les notes de qualité, complétude, promptitude et datasets restent consultables si
+une analyse des violations échoue. Les colonnes de violations et le total /100
+attendent leurs analyses respectives ; changer de périmètre retire les anciens
+résultats des règles sans retirer les nouveaux indicateurs de déclaration.
+
 Deux actions sont séparées :
 
 1. **Lancer l'analyse des violations** interroge uniquement la période filtrée M.
@@ -288,6 +312,7 @@ Extraction_Favori/
 |- categorisation.py
 |- categorisation_view.py
 |- reporting_metrics.py
+|- quality_score.py
 |- geography.py
 |- scoped_analytics.py
 |- validation_api.py

@@ -237,3 +237,150 @@ def aggregate_validation_metrics(reporting_df, targets):
             metrics["Nombre_Datasets_95"] = count_datasets_95(rows, rate_columns, target_id=target_id)
         records.append({"Zone_ID": target_id, **metrics})
     return pd.DataFrame(records, columns=output_columns)
+
+
+def _quality_count_columns(frame):
+    """Repère les trois métriques de comptes, avec leurs préfixes de dataset."""
+    families = {
+        "rapports réels": "actual reports",
+        "rapports attendus": "expected reports",
+        "rapports à temps": "actual reports on time",
+    }
+    columns = {label: {} for label in families}
+    if not isinstance(frame, pd.DataFrame):
+        return columns
+    for column in frame.columns:
+        name = _normalise_name(column)
+        for label, suffix in families.items():
+            if name == suffix or name.endswith(" " + suffix):
+                dataset = name[:-len(suffix)].strip(" -_")
+                columns[label].setdefault(dataset, []).append(column)
+    return columns
+
+
+def has_complete_reporting_metrics(frame):
+    """Indique si chaque dataset possède les trois comptes nécessaires et uniques.
+
+    Ce contrôle porte sur les colonnes, pas sur les valeurs ni le périmètre.
+    Une cellule absente reste à diagnostiquer avec ``reporting_quality_warnings``.
+    """
+    families = _quality_count_columns(frame)
+    if not all(bool(columns) for columns in families.values()):
+        return False
+    dataset_keys = [set(columns) for columns in families.values()]
+    if any(keys != dataset_keys[0] for keys in dataset_keys[1:]):
+        return False
+    if any(len(columns) != 1 for mapping in families.values() for columns in mapping.values()):
+        return False
+    # Un dataset seulement représenté par un taux doit aussi déclencher la
+    # récupération de ses comptes, même si un autre dataset est déjà complet.
+    for column in frame.columns:
+        name = _normalise_name(column)
+        for suffix in ("reporting rate on time", "reporting rate"):
+            if name == suffix or name.endswith(" " + suffix):
+                dataset = name[:-len(suffix)].strip(" -_")
+                if dataset not in dataset_keys[0]:
+                    return False
+                break
+    return True
+
+
+def reporting_quality_warnings(reporting_df, metrics, targets):
+    """Explique les indicateurs de déclaration manquants sans modifier leur calcul.
+
+    Les zones sont recherchées exclusivement par leur ID. Les messages restent
+    propres aux données de déclaration et ne dépendent pas des violations DHIS2.
+    Une source incomplète n'est ni complétée par zéro ni remplacée par une moyenne.
+    """
+    if not isinstance(targets, pd.DataFrame) or targets.empty or "Zone_ID" not in targets:
+        return []
+    selected = targets.copy()
+    selected["Zone_ID"] = selected["Zone_ID"].map(clean_ou_id)
+    selected = selected.loc[selected["Zone_ID"].ne("")].drop_duplicates("Zone_ID")
+    if selected.empty:
+        return []
+    source = reporting_df if isinstance(reporting_df, pd.DataFrame) else pd.DataFrame()
+    families = _quality_count_columns(source)
+    messages = []
+    missing_families = [label for label, columns in families.items() if not columns]
+    if missing_families:
+        messages.append(
+            "La source de déclaration ne fournit pas les métriques nécessaires : "
+            + ", ".join(missing_families) + "."
+        )
+    if "Organisation unit ID" not in source:
+        messages.append(
+            "Les identifiants des unités sont absents de la source de déclaration ; "
+            "les données ne peuvent pas être rattachées aux zones sélectionnées."
+        )
+        return messages
+    source_ids = source["Organisation unit ID"].map(clean_ou_id)
+    metric_frame = metrics if isinstance(metrics, pd.DataFrame) else pd.DataFrame()
+    metric_ids = (
+        metric_frame["Zone_ID"].map(clean_ou_id) if "Zone_ID" in metric_frame
+        else pd.Series("", index=metric_frame.index, dtype=object)
+    )
+    metric_labels = {
+        "Complétude_Globale": "complétude",
+        "Promptitude_Globale": "promptitude",
+        "Actual_Reports": "rapports réels",
+        "Nombre_Datasets_95": "nombre de datasets à complétude ≥95 %",
+    }
+    all_datasets = set().union(*(set(columns) for columns in families.values()))
+    incomplete_datasets = [
+        dataset or "dataset sans libellé" for dataset in sorted(all_datasets)
+        if any(dataset not in columns or len(columns[dataset]) != 1 for columns in families.values())
+    ]
+    if not missing_families and incomplete_datasets:
+        messages.append(
+            "Les trois métriques de comptes ne sont pas toutes présentes ou uniques pour les datasets : "
+            + ", ".join(incomplete_datasets) + "."
+        )
+    for target in selected.to_dict("records"):
+        identifier = target["Zone_ID"]
+        name = target.get("Zone")
+        label = str(name).strip() if _normalise_name(name) else identifier
+        zone_label = f"{label} ({identifier})" if label != identifier else identifier
+        rows = source.loc[source_ids.eq(identifier)]
+        if rows.empty:
+            messages.append(f"{zone_label} : aucune donnée de déclaration reçue pour cette zone et cette période.")
+            continue
+        reasons = []
+        missing_values, invalid_values = [], []
+        for family, dataset_columns in families.items():
+            columns = [column for group in dataset_columns.values() for column in group]
+            if not columns:
+                continue
+            raw = rows[columns]
+            numeric = raw.apply(pd.to_numeric, errors="coerce").astype(float)
+            if (raw.isna() | raw.astype(str).apply(lambda column: column.str.strip().eq(""))).any().any():
+                missing_values.append(family)
+            if (
+                (numeric.isna() & raw.notna() & raw.astype(str).apply(lambda column: column.str.strip().ne(""))).any().any()
+                or ((~np.isfinite(numeric)) & numeric.notna()).any().any()
+                or numeric.lt(0).any().any()
+            ):
+                invalid_values.append(family)
+        if missing_values:
+            reasons.append("valeurs manquantes pour " + ", ".join(missing_values))
+        if invalid_values:
+            reasons.append("comptes invalides pour " + ", ".join(invalid_values))
+        expected_columns = [column for group in families["rapports attendus"].values() for column in group]
+        if expected_columns:
+            expected = rows[expected_columns].apply(pd.to_numeric, errors="coerce").astype(float)
+            if expected.notna().all().all() and np.isfinite(expected).all().all() and expected.eq(0).all().all():
+                reasons.append("aucun rapport attendu ; les taux ne sont pas calculables")
+        final_rows = metric_frame.loc[metric_ids.eq(identifier)]
+        if len(final_rows) != 1:
+            reasons.append("synthèse de déclaration absente ou ambiguë pour cet identifiant")
+        elif not reasons:
+            unavailable = []
+            for column, metric_label in metric_labels.items():
+                value = pd.to_numeric(pd.Series([final_rows.iloc[0].get(column)]), errors="coerce").iloc[0]
+                if pd.isna(value) or not np.isfinite(value) or value < 0:
+                    unavailable.append(metric_label)
+            if unavailable:
+                reasons.append("indicateurs non calculables : " + ", ".join(unavailable))
+        if reasons:
+            messages.append(f"{zone_label} : {' ; '.join(reasons)}.")
+    return messages

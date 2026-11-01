@@ -98,7 +98,8 @@ class DashboardImprovementTests(unittest.TestCase):
             self.assertNotEqual(app.session_state["_fixture_data_loads_key"], first_key)
             for name in ["_fixture_catalog_loads", "_fixture_data_loads", "_fixture_group_loads"]:
                 self.assertEqual(app.session_state[name], 2)
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100, 100, 100])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.assertNotIn("categorisation_result", app.session_state)
 
             self.analyse(app)

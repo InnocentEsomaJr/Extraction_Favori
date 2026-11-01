@@ -13,9 +13,13 @@ from categorisation import (
     NOTE_COLS, TOTAL_COL, build_baremes_df, calculer_categorisation,
     style_context_tab5, style_note_20,
 )
-from reporting_metrics import aggregate_validation_metrics, clean_ou_id
+from reporting_metrics import (
+    aggregate_validation_metrics, clean_ou_id, has_complete_reporting_metrics,
+    reporting_quality_warnings,
+)
+from quality_score import build_quality_rows
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
-from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
+from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from validation_filters import date_range_months, monthly_bounds, reference_month
@@ -203,6 +207,60 @@ def build_violation_signatures(df_val):
 def build_violation_signature_set(df_val):
     return set(build_violation_signatures(df_val))
 
+def render_quality_table(df_cat, corrections_checked=False):
+    historical_columns = {
+        'Zone de santé': 'Zone de santé',
+        'Complétude_Globale': 'Complétude globale (%)',
+        'Promptitude_Globale': 'Promptitude globale (%)',
+        'Actual_Reports': 'Reports_Actual',
+        'Violations_Mois_Precedent': 'Règles violées (M-1)',
+        'Violations_Corrigees': 'Règles corrigées (M-1 -> M)',
+        'Violations_Actuelles': 'Règles violées (M)',
+        'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
+        'Score_Qualite': 'Score de qualité',
+    }
+    added_columns = [
+        'Score de qualité /20', 'Barème datasets',
+        'Nombre de datasets complétude ≥95 %', 'Règles restantes (M-1 -> M)',
+        *[c for c in NOTE_COLS if c != 'Score de qualité /20'],
+        TOTAL_COL, 'Statut catégorisation',
+    ]
+    df_display = df_cat[list(historical_columns) + added_columns].rename(columns=historical_columns)
+    view_query = st.text_input("Rechercher une zone", key="categorisation_search")
+    view_left, view_right = st.columns(2)
+    with view_left:
+        view_status = st.selectbox("Afficher les résultats", VIEW_STATUS_OPTIONS, key="categorisation_status")
+    with view_right:
+        view_sort = st.selectbox("Trier les résultats", VIEW_SORT_OPTIONS, key="categorisation_sort")
+    df_visible = filter_categorisation(df_display, query=view_query, status=view_status, sort_by=view_sort)
+    st.caption(
+        f"{len(df_visible)} zone(s) affichée(s) sur {len(df_display)}. "
+        "L'export Excel, l'aperçu et les indicateurs conservent l'analyse complète."
+    )
+    if df_visible.empty:
+        st.info("Aucune zone ne correspond à cette recherche et à ces filtres.")
+    st.dataframe(
+        _build_styler(df_visible, missing_text="—", **style_context_tab5()) if not df_visible.empty else df_visible,
+        use_container_width=True,
+        hide_index=True,
+    )
+    invalid_scores = df_cat[TOTAL_COL].isna()
+    if invalid_scores.any() and corrections_checked:
+        st.warning(
+            f"{int(invalid_scores.sum())} unité(s) sans score total : consultez la colonne "
+            "« Statut catégorisation ». Pour un barème non identifié, choisissez DPS ou ZS."
+        )
+    col_res1, col_res2, col_res3, col_res4 = st.columns(4)
+    detected = df_cat['Violations_Actuelles'].sum(min_count=1)
+    corrected = df_cat['Violations_Corrigees'].sum(min_count=1)
+    col_res1.metric("Violations détectées (données disponibles)", '—' if pd.isna(detected) else int(detected))
+    col_res2.metric("Règles corrigées (données disponibles)", '—' if pd.isna(corrected) else int(corrected))
+    average_score = df_cat[TOTAL_COL].mean()
+    col_res3.metric("Score moyen de catégorisation /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
+    col_res4.metric("Unités avec score complet", f"{int((~invalid_scores).sum())} / {len(df_cat)}")
+
+    return df_display.copy()
+
 # Fonction pour l'export Excel
 def to_excel(df):
     output = io.BytesIO()
@@ -220,7 +278,8 @@ def _build_styler(
     highlight_max_cols=None,
     ratio_alert_col=None,
     ratio_alert_threshold=10.0,
-    note_cols=None
+    note_cols=None,
+    missing_text="",
 ):
     """Construit un Styler pandas avec les mêmes règles de couleurs que le dashboard."""
     if df is None or df.empty:
@@ -239,7 +298,7 @@ def _build_styler(
     for c in int_cols:
         format_map[c] = "{:.0f}"
     if format_map:
-        styler = styler.format(format_map, na_rep="")
+        styler = styler.format(format_map, na_rep=missing_text)
 
     if taux_cols:
         styler = styler.map(style_taux, subset=taux_cols)
@@ -1199,6 +1258,33 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
         return None
 
 @st.cache_data(ttl=3600)
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
+    """Charge les cinq mesures de déclaration des datasets du favori, sans analyse de règles."""
+    _ = cache_user
+    try:
+        dhis = get_dhis2_client()
+        visualization = dhis.get(
+            f"visualizations/{favori_id}",
+            params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
+        )
+        params, labels = build_quality_reporting_query(visualization, period, ou_dimension)
+        result = analytics_to_reporting_frame(dhis.get('analytics.json', params=params), labels)
+        result.attrs['quality_source'] = 'Reporting DHIS2 des datasets du favori'
+        return result
+    except ValueError as error:
+        warning = str(error)
+    except requests.exceptions.Timeout:
+        warning = "Les indicateurs de déclaration DHIS2 n'ont pas répondu dans le délai autorisé."
+    except requests.exceptions.HTTPError as error:
+        status = error.response.status_code if error.response is not None else 'inconnu'
+        warning = f"Les indicateurs de déclaration DHIS2 sont indisponibles (HTTP {status})."
+    except Exception:
+        warning = "Impossible de charger les indicateurs de déclaration DHIS2 pour ce périmètre."
+    result = pd.DataFrame()
+    result.attrs['quality_warnings'] = [warning]
+    return result
+
+@st.cache_data(ttl=3600)
 def get_organisation_catalog(cache_user=None):
     """Catalogue des pays, provinces et zones, indépendant des lignes du favori."""
     _ = cache_user
@@ -1943,7 +2029,7 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'dhis2-separate-corrections-v3', base_url, current_user_for_cache, id_final,
+            'quality-reporting-v4', base_url, current_user_for_cache, id_final,
             validation_start_date, validation_end_date, tuple(validation_months),
             tuple(validation_reference_months), validation_parent_id, target_group_id,
             tuple(validation_zones_df['Zone_ID']),
@@ -1953,6 +2039,43 @@ if df_raw is not None:
         saved_validation = st.session_state.get("categorisation_result")
         if saved_validation and saved_validation.get("context") != validation_context:
             st.session_state.pop("categorisation_result", None)
+        quality_view_context = (
+            id_final, current_user_for_cache, validation_parent_id,
+            validation_start_date, validation_end_date,
+        )
+        if st.session_state.get('quality_view_context') != quality_view_context:
+            st.session_state.update({
+                'quality_view_context': quality_view_context,
+                'categorisation_search': '',
+                'categorisation_status': 'Toutes',
+                'categorisation_sort': 'Ordre initial',
+            })
+
+        # Le tableau qualité suit les filtres sans attendre les appels des règles de validation.
+        quality_warnings = []
+        if validation_dates_valid and not validation_zones_df.empty:
+            same_reporting_scope = validation_ou_dimension == ou_dimension and validation_period_id == period_id
+            certified_reporting_columns = [
+                column for column in target_df.attrs.get('reporting_columns', []) if column in target_df
+            ]
+            certified_reporting_source = target_df[
+                ['Organisation unit', 'Organisation unit ID'] + certified_reporting_columns
+            ]
+            if same_reporting_scope and has_complete_reporting_metrics(certified_reporting_source):
+                quality_reporting_source = certified_reporting_source
+            else:
+                quality_reporting_source = get_quality_reporting_data(
+                    id_final, period=validation_period_id, cache_user=current_user_for_cache,
+                    ou_dimension=validation_ou_dimension,
+                )
+            if quality_reporting_source is None:
+                quality_reporting_source = pd.DataFrame()
+            quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
+            quality_metrics = aggregate_validation_metrics(quality_reporting_source, validation_zones_df)
+            quality_warnings.extend(reporting_quality_warnings(quality_reporting_source, quality_metrics, validation_zones_df))
+        else:
+            quality_reporting_source = pd.DataFrame()
+            quality_metrics = pd.DataFrame()
         st.caption(
             f"Mois couverts : {', '.join(validation_months) or '—'}. "
             f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
@@ -2000,23 +2123,8 @@ if df_raw is not None:
                         reporting_warnings = list(saved_validation.get('reporting_warnings', []))
                         metrics_by_id = saved_validation['metrics_by_id']
                     else:
-                        if validation_ou_dimension == ou_dimension and validation_period_id == period_id:
-                            validation_reporting_source = target_df
-                        else:
-                            validation_reporting_source = get_data(
-                                id_final, period=validation_period_id, cache_user=current_user_for_cache,
-                                ou_dimension=validation_ou_dimension
-                            )
-                            if validation_reporting_source is not None:
-                                validation_reporting_source = normalize_orgunit_columns(validation_reporting_source)
-                        if validation_reporting_source is None or 'Organisation unit ID' not in validation_reporting_source:
-                            reporting_warnings.append(
-                                "Les indicateurs de déclaration sont indisponibles pour cet intervalle et ce parent. "
-                                "Les violations restent consultables ; les scores incomplets restent vides."
-                            )
-                            validation_reporting_source = pd.DataFrame()
-                        validation_metrics = aggregate_validation_metrics(validation_reporting_source, validation_zones_df)
-                        metrics_by_id = validation_metrics.set_index('Zone_ID').to_dict('index')
+                        reporting_warnings = list(quality_warnings)
+                        metrics_by_id = quality_metrics.set_index('Zone_ID').to_dict('index')
 
                     profile_by_id = {}
                     for ou_id, metadata in hierarchy_by_id.items():
@@ -2120,6 +2228,7 @@ if df_raw is not None:
                         actual_val = float(zone_metrics.get('Actual_Reports', np.nan))
                         score_qualite = round((comp_val + prompt_val) / 2, 1)
                         row_cat = {
+                            'Zone_ID': zone_id,
                             'Zone de santé': zone_name,
                             'Complétude_Globale': comp_val,
                             'Promptitude_Globale': prompt_val,
@@ -2207,11 +2316,52 @@ if df_raw is not None:
                 st.error("L'ID de la zone de santé sélectionnée est manquant dans les données sources.")
 
         saved_validation = st.session_state.get('categorisation_result')
+        if validation_dates_valid and not validation_zones_df.empty:
+            st.subheader("Tableau de score qualité")
+            st.caption(
+                f"Parent : {validation_parent_label}. Du {validation_start_date.isoformat()} au {validation_end_date.isoformat()}. "
+                "Les indicateurs sont actualisés automatiquement selon ces filtres ; les rapports couvrent les mois entiers."
+            )
+            validation_applied_label = (
+                f"Parent : {validation_parent_label}. "
+                f"Du {validation_start_date.isoformat()} au {validation_end_date.isoformat()}."
+            )
+            df_validation_context_export = pd.DataFrame([
+                {'Paramètre': key, 'Valeur': value} for key, value in {
+                    'Date de début': validation_start_date.isoformat(),
+                    'Date de fin': validation_end_date.isoformat(),
+                    'Unité d’organisation parent': validation_parent_label,
+                    'ID unité parent': validation_parent_id,
+                    'Favori DHIS2': id_final,
+                    'Mois des indicateurs de déclaration': validation_period_id,
+                    'Source des indicateurs': 'Analytics DHIS2 — métriques de reporting des datasets',
+                    'Barème datasets': profil_bareme,
+                    'Analyse des violations': 'Non lancée',
+                    'Contrôle des corrections': 'Non effectué',
+                }.items()
+            ])
+            quality_rows = build_quality_rows(
+                quality_metrics, validation_zones_df,
+                saved_validation['data'] if saved_validation and saved_validation.get('context') == validation_context else None,
+            )
+            df_cat = calculer_categorisation(quality_rows, profil=profil_bareme)
+            if quality_warnings:
+                st.warning("Certains indicateurs de déclaration sont indisponibles. Les données disponibles restent affichées.")
+                with st.expander("Voir les données manquantes du tableau qualité"):
+                    for message in dict.fromkeys(quality_warnings):
+                        st.text(message)
+            df_tab5_export = render_quality_table(
+                df_cat, corrections_checked=bool(saved_validation and saved_validation.get('corrections_checked', False))
+            )
+            if not saved_validation:
+                st.info("Le tableau qualité utilise les indicateurs de déclaration disponibles. Lancez l'analyse des violations pour compléter M, puis le contrôle des corrections pour M-1 et le total /100.")
+
         if saved_validation and saved_validation.get('context') == validation_context:
-            df_cat = calculer_categorisation(saved_validation['data'], profil=profil_bareme)
             st.subheader(f"Résultats : {selected_vr_name}")
             applied_filters = dict(saved_validation.get('filters', {}))
             applied_filters['Barème datasets'] = profil_bareme
+            applied_filters['Favori DHIS2'] = id_final
+            applied_filters['Source des indicateurs'] = 'Analytics DHIS2 — métriques de reporting des datasets'
             applied_filters['Analyse M effectuée le'] = saved_validation.get('analysed_at', '')
             applied_filters['Contrôle des corrections effectué le'] = saved_validation.get('corrections_checked_at') or 'Non effectué'
             df_validation_context_export = pd.DataFrame(
@@ -2270,57 +2420,6 @@ if df_raw is not None:
                 "Les nouvelles notes et le total /100 sont ajoutés à droite des colonnes existantes. "
                 "Une cellule vide indique qu'une donnée nécessaire au calcul est indisponible."
             )
-            historical_columns = {
-                'Zone de santé': 'Zone de santé',
-                'Complétude_Globale': 'Complétude globale (%)',
-                'Promptitude_Globale': 'Promptitude globale (%)',
-                'Actual_Reports': 'Reports_Actual',
-                'Violations_Mois_Precedent': 'Règles violées (M-1)',
-                'Violations_Corrigees': 'Règles corrigées (M-1 -> M)',
-                'Violations_Actuelles': 'Règles violées (M)',
-                'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
-                'Score_Qualite': 'Score de qualité',
-            }
-            added_columns = [
-                'Score de qualité /20', 'Barème datasets',
-                'Nombre de datasets complétude ≥95 %', 'Règles restantes (M-1 -> M)',
-                *[c for c in NOTE_COLS if c != 'Score de qualité /20'],
-                TOTAL_COL, 'Statut catégorisation',
-            ]
-            df_display = df_cat[list(historical_columns) + added_columns].rename(columns=historical_columns)
-            df_tab5_export = df_display.copy()
-            view_query = st.text_input("Rechercher une zone", key="categorisation_search")
-            view_left, view_right = st.columns(2)
-            with view_left:
-                view_status = st.selectbox("Afficher les résultats", VIEW_STATUS_OPTIONS, key="categorisation_status")
-            with view_right:
-                view_sort = st.selectbox("Trier les résultats", VIEW_SORT_OPTIONS, key="categorisation_sort")
-            df_visible = filter_categorisation(df_display, query=view_query, status=view_status, sort_by=view_sort)
-            st.caption(
-                f"{len(df_visible)} zone(s) affichée(s) sur {len(df_display)}. "
-                "L'export Excel, l'aperçu et les indicateurs conservent l'analyse complète."
-            )
-            if df_visible.empty:
-                st.info("Aucune zone ne correspond à cette recherche et à ces filtres.")
-            st.dataframe(
-                _build_styler(df_visible, **style_context_tab5()) if not df_visible.empty else df_visible,
-                use_container_width=True,
-                hide_index=True,
-            )
-            invalid_scores = df_cat[TOTAL_COL].isna()
-            if invalid_scores.any() and saved_validation.get('corrections_checked', False):
-                st.warning(
-                    f"{int(invalid_scores.sum())} unité(s) sans score total : consultez la colonne "
-                    "« Statut catégorisation ». Pour un barème non identifié, choisissez DPS ou ZS."
-                )
-            col_res1, col_res2, col_res3, col_res4 = st.columns(4)
-            detected = df_cat['Violations_Actuelles'].sum(min_count=1)
-            corrected = df_cat['Violations_Corrigees'].sum(min_count=1)
-            col_res1.metric("Violations détectées (données disponibles)", '—' if pd.isna(detected) else int(detected))
-            col_res2.metric("Règles corrigées (données disponibles)", '—' if pd.isna(corrected) else int(corrected))
-            average_score = df_cat[TOTAL_COL].mean()
-            col_res3.metric("Score moyen de catégorisation /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
-            col_res4.metric("Unités avec score complet", f"{int((~invalid_scores).sum())} / {len(df_cat)}")
 
             st.divider()
             st.subheader("Détail des règles violées")

@@ -115,13 +115,37 @@ def _enrich_labels(labels, metadata):
     return enriched
 
 
-def build_analytics_query(visualization, period, ou_dimension):
+def _complete_reporting_metrics(labels):
+    """Demande les comptes et taux des seuls datasets présents dans le favori."""
+    datasets = {}
+    for identifier, label in labels.items():
+        dataset_id, metric = _metric_parts(identifier)
+        if dataset_id is None:
+            continue
+        suffix = METRIC_LABELS[metric]
+        prefix = label[:-len(suffix)].strip() if label.endswith(suffix) else dataset_id
+        datasets.setdefault(dataset_id, prefix or dataset_id)
+    if not datasets:
+        raise ValueError(
+            "Le favori ne contient aucun dataset de reporting identifiable. "
+            "Choisissez un favori avec des taux de déclaration pour calculer le tableau qualité."
+        )
+    completed = dict(labels)
+    for dataset_id, prefix in datasets.items():
+        for metric, suffix in METRIC_LABELS.items():
+            completed.setdefault(f"{dataset_id}.{metric}", f"{prefix} {suffix}")
+    return completed
+
+
+def build_analytics_query(visualization, period, ou_dimension, *, complete_reporting_metrics=False):
     """Retourne ``(paramètres GET répétés, libellés par identifiant dx)``.
 
     Les dimensions de données et les filtres supplémentaires explicites sont
     conservés. Les dimensions organisationnelles et temporelles du favori sont
     remplacées par le périmètre choisi. Une dimension supplémentaire sans
     sélection précise est refusée plutôt qu'agrégée implicitement.
+    Le mode ``complete_reporting_metrics`` ajoute les cinq mesures de reporting
+    par dataset déjà sélectionné, pour alimenter le tableau de score qualité.
     """
     if not isinstance(visualization, dict):
         raise ValueError("La définition du favori DHIS2 est invalide.")
@@ -176,6 +200,8 @@ def build_analytics_query(visualization, period, ou_dimension):
             raise ValueError(f"La dimension {dimension_id} du favori nécessite une sélection explicite.")
     if not labels:
         raise ValueError("Le favori ne contient aucun élément de données exploitable.")
+    if complete_reporting_metrics:
+        labels = _complete_reporting_metrics(labels)
     labels = _unique_labels(labels)
     params = [
         ("dimension", "dx:" + ";".join(labels)),
@@ -194,6 +220,34 @@ def build_analytics_query(visualization, period, ou_dimension):
     return params, labels
 
 
+def build_quality_reporting_query(visualization, period, ou_dimension):
+    """Limite la source du score qualité aux cinq mesures de chaque dataset.
+
+    Un indicateur générique au libellé similaire ne représente pas un nombre
+    de rapports. Les filtres du favori restent inchangés ; seuls les éléments
+    dx de reporting alimentent ce tableau.
+    """
+    params, labels = build_analytics_query(
+        visualization, period, ou_dimension, complete_reporting_metrics=True,
+    )
+    reporting = {identifier: label for identifier, label in labels.items() if _metric_parts(identifier)[0] is not None}
+    prefixes = {}
+    for identifier, label in reporting.items():
+        dataset_id, metric = _metric_parts(identifier)
+        prefixes.setdefault(dataset_id, label[:-len(METRIC_LABELS[metric])].strip())
+    # Une collision avec un indicateur retiré ne doit pas désaligner le préfixe
+    # des comptes et des taux appartenant à un même dataset.
+    reporting = _unique_labels({
+        identifier: f"{prefixes[_metric_parts(identifier)[0]]} {METRIC_LABELS[_metric_parts(identifier)[1]]}"
+        for identifier in reporting
+    })
+    params = [
+        (key, 'dx:' + ';'.join(reporting)) if key == 'dimension' and value.startswith('dx:') else (key, value)
+        for key, value in params
+    ]
+    return params, reporting
+
+
 def analytics_to_reporting_frame(response, labels=None):
     """Transforme une réponse Analytics ``ou,dx,value`` sans agréger localement."""
     if not isinstance(response, dict) or not isinstance(response.get("rows"), list):
@@ -202,7 +256,12 @@ def analytics_to_reporting_frame(response, labels=None):
     metadata = (response.get("metaData") or {}).get("items") or {}
     requested_labels = _enrich_labels(requested_labels, metadata)
     if not response["rows"]:
-        return pd.DataFrame(columns=ORG_COLUMNS + list(_unique_labels(requested_labels).values()))
+        requested_labels = _unique_labels(requested_labels)
+        result = pd.DataFrame(columns=ORG_COLUMNS + list(requested_labels.values()))
+        result.attrs['reporting_columns'] = [
+            label for identifier, label in requested_labels.items() if _metric_parts(identifier)[0] is not None
+        ]
+        return result
     headers = [header.get("name", header.get("column")) for header in response.get("headers", [])]
     if set(headers) != {"ou", "dx", "value"} or len(headers) != 3:
         raise ValueError("La réponse Analytics doit contenir uniquement les dimensions ou, dx et value.")
@@ -229,4 +288,7 @@ def analytics_to_reporting_frame(response, labels=None):
     wide.index.name = "Organisation unit ID"
     result = wide.reset_index()
     result.insert(0, "Organisation unit", result["Organisation unit ID"].map(lambda identifier: _name(metadata.get(identifier, {})) or identifier))
+    result.attrs['reporting_columns'] = [
+        label for identifier, label in requested_labels.items() if _metric_parts(identifier)[0] is not None
+    ]
     return result

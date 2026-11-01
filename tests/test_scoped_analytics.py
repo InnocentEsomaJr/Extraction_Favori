@@ -2,7 +2,9 @@ import unittest
 
 import pandas as pd
 
-from scoped_analytics import analytics_to_reporting_frame, build_analytics_query
+from scoped_analytics import (
+    METRIC_LABELS, analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query,
+)
 
 
 class AnalyticsQueryTests(unittest.TestCase):
@@ -86,6 +88,131 @@ class AnalyticsQueryTests(unittest.TestCase):
         self.assertEqual(labels["DatasetAAAA.ACTUAL_REPORTS"], "Même nom (DatasetAAAA) Actual reports")
 
 
+class QualityReportingQueryTests(unittest.TestCase):
+    def favorite(self, metric='REPORTING_RATE'):
+        return {
+            'dataDimensionItems': [{
+                'reportingRate': {
+                    'dataSet': {'id': 'DatasetAAAA', 'displayName': 'Consultations'},
+                    'metric': metric,
+                },
+            }],
+            'filters': [{'dimension': 'pe', 'items': [{'id': '202401'}]}],
+            'organisationUnits': [{'id': 'OldZoneAAAA'}],
+        }
+
+    def test_default_does_not_change_the_original_favorite_selection(self):
+        params, labels = build_analytics_query(self.favorite(), '202609', 'ZoneAAAAAAA')
+        self.assertEqual(list(labels), ['DatasetAAAA.REPORTING_RATE'])
+        self.assertIn(('dimension', 'dx:DatasetAAAA.REPORTING_RATE'), params)
+
+    def test_rate_only_favorite_requests_the_counts_needed_for_the_quality_score(self):
+        params, labels = build_analytics_query(
+            self.favorite(), '202609', 'ZoneAAAAAAA', complete_reporting_metrics=True,
+        )
+        expected_ids = {f'DatasetAAAA.{metric}' for metric in METRIC_LABELS}
+        self.assertEqual(set(labels), expected_ids)
+        self.assertEqual(set(labels.values()), {f'Consultations {suffix}' for suffix in METRIC_LABELS.values()})
+        dimension = next(value for key, value in params if key == 'dimension' and value.startswith('dx:'))
+        self.assertEqual(set(dimension[3:].split(';')), expected_ids)
+        self.assertIn(('dimension', 'ou:ZoneAAAAAAA'), params)
+        self.assertIn(('filter', 'pe:202609'), params)
+        self.assertNotIn('OldZoneAAAA', str(params))
+        self.assertNotIn('202401', str(params))
+
+    def test_counts_only_favorite_can_also_complete_its_reporting_family(self):
+        _, labels = build_analytics_query(
+            self.favorite('ACTUAL_REPORTS'), '202609', 'ZoneAAAAAAA', complete_reporting_metrics=True,
+        )
+        self.assertEqual(len(labels), 5)
+        self.assertEqual(labels['DatasetAAAA.REPORTING_RATE_ON_TIME'], 'Consultations Reporting rate on time')
+        self.assertEqual(labels['DatasetAAAA.EXPECTED_REPORTS'], 'Consultations Expected reports')
+
+    def test_extra_filters_and_aggregation_options_are_preserved_for_each_selected_scope(self):
+        favorite = self.favorite()
+        favorite['filters'].append({'dimension': 'CategoryAAA', 'items': [{'id': 'OptionAAAAA'}]})
+        favorite.update(aggregationType='SUM', completedOnly=False)
+        for scope in ['LEVEL-3;CountryAAAA', 'LEVEL-3;ProvinceAAA', 'ZoneAAAAAAA']:
+            with self.subTest(scope=scope):
+                params, _ = build_analytics_query(
+                    favorite, ['202609', '202610'], scope, complete_reporting_metrics=True,
+                )
+                self.assertIn(('dimension', 'ou:' + scope), params)
+                self.assertIn(('filter', 'pe:202609;202610'), params)
+                self.assertIn(('filter', 'CategoryAAA:OptionAAAAA'), params)
+                self.assertIn(('aggregationType', 'SUM'), params)
+                self.assertIn(('completedOnly', 'false'), params)
+
+    def test_existing_metrics_are_never_requested_twice(self):
+        favorite = AnalyticsQueryTests().favorite()
+        favorite['columns'] = [{
+            'dimension': 'dx', 'items': [{'id': 'DatasetAAAA.ACTUAL_REPORTS'}],
+        }]
+        params, labels = build_analytics_query(
+            favorite, '202609', 'ZoneAAAAAAA', complete_reporting_metrics=True,
+        )
+        self.assertEqual(len(labels), 5)
+        dimension = next(value for key, value in params if key == 'dimension' and value.startswith('dx:'))
+        self.assertEqual(len(dimension[3:].split(';')), 5)
+
+    def test_homonymous_datasets_keep_distinct_and_matching_metric_prefixes(self):
+        favorite = {'dataDimensionItems': [{
+            'reportingRate': {'dataSet': {'id': uid, 'displayName': 'Consultations'}, 'metric': 'REPORTING_RATE'},
+        } for uid in ['DatasetAAAA', 'DatasetBBBB']]}
+        _, labels = build_analytics_query(
+            favorite, '202609', 'ZoneAAAAAAA', complete_reporting_metrics=True,
+        )
+        self.assertEqual(len(set(labels.values())), 10)
+        for uid in ['DatasetAAAA', 'DatasetBBBB']:
+            for metric, suffix in METRIC_LABELS.items():
+                self.assertEqual(labels[f'{uid}.{metric}'], f'Consultations ({uid}) {suffix}')
+
+    def test_generic_indicators_are_not_mistaken_for_dataset_ids(self):
+        favorite = {'dataDimensionItems': [{
+            'indicator': {'id': 'IndicatorAA', 'displayName': 'Complétude générale'},
+        }]}
+        with self.assertRaisesRegex(ValueError, 'aucun dataset de reporting'):
+            build_analytics_query(favorite, '202609', 'ZoneAAAAAAA', complete_reporting_metrics=True)
+        _, labels = build_analytics_query(favorite, '202609', 'ZoneAAAAAAA')
+        self.assertEqual(labels, {'IndicatorAA': 'Complétude générale'})
+
+    def test_quality_source_excludes_generic_counts_with_a_similar_label(self):
+        favorite = self.favorite()
+        favorite['dataDimensionItems'].extend([
+            {'indicator': {'id': 'IndicatorAA', 'displayName': 'Consultations Actual reports'}},
+            {'dataElement': {'id': 'ElementAAAA', 'displayName': 'Autre donnée'}},
+        ])
+        params, labels = build_quality_reporting_query(favorite, '202609', 'ZoneAAAAAAA')
+        self.assertEqual(set(labels), {f'DatasetAAAA.{metric}' for metric in METRIC_LABELS})
+        self.assertNotIn('IndicatorAA', str(params))
+        self.assertNotIn('ElementAAAA', str(params))
+        self.assertEqual(labels['DatasetAAAA.ACTUAL_REPORTS'], 'Consultations Actual reports')
+        self.assertEqual(labels['DatasetAAAA.EXPECTED_REPORTS'], 'Consultations Expected reports')
+
+    def test_quality_source_keeps_reporting_prefixes_aligned_after_label_collisions(self):
+        favorite = self.favorite()
+        favorite['dataDimensionItems'].append({
+            'indicator': {'id': 'IndicatorAA', 'displayName': 'Consultations Reporting rate'},
+        })
+        _, labels = build_quality_reporting_query(favorite, '202609', 'ZoneAAAAAAA')
+        prefixes = {
+            labels[f'DatasetAAAA.{metric}'][:-len(suffix)].strip()
+            for metric, suffix in METRIC_LABELS.items()
+        }
+        self.assertEqual(len(prefixes), 1)
+
+    def test_quality_source_preserves_the_selected_scope_period_and_other_filters(self):
+        favorite = self.favorite()
+        favorite['filters'].append({'dimension': 'CategoryAAA', 'items': [{'id': 'OptionAAAAA'}]})
+        favorite.update(skipRounding=True, completedOnly=False)
+        params, _ = build_quality_reporting_query(favorite, '202609;202610', 'LEVEL-3;ProvinceAAA')
+        self.assertIn(('dimension', 'ou:LEVEL-3;ProvinceAAA'), params)
+        self.assertIn(('filter', 'pe:202609;202610'), params)
+        self.assertIn(('filter', 'CategoryAAA:OptionAAAAA'), params)
+        self.assertIn(('skipRounding', 'true'), params)
+        self.assertIn(('completedOnly', 'false'), params)
+
+
 class AnalyticsFrameTests(unittest.TestCase):
     def response(self):
         return {
@@ -151,6 +278,26 @@ class AnalyticsFrameTests(unittest.TestCase):
         frame = analytics_to_reporting_frame({"rows": []}, {"set.ACTUAL_REPORTS": "DS Actual reports"})
         self.assertTrue(frame.empty)
         self.assertEqual(frame.columns.tolist(), ["Organisation unit", "Organisation unit ID", "DS Actual reports"])
+
+    def test_reporting_column_metadata_excludes_generic_indicators_with_matching_names(self):
+        response = self.response()
+        response['rows'].append(['IndicatorAA', 'ZoneAAAAAAA', '999'])
+        labels = {
+            'DatasetAAAA.ACTUAL_REPORTS': 'DS Actual reports',
+            'DatasetAAAA.EXPECTED_REPORTS': 'DS Expected reports',
+            'IndicatorAA': 'Faux Actual reports',
+        }
+        frame = analytics_to_reporting_frame(response, labels)
+        self.assertEqual(frame.attrs['reporting_columns'], ['DS Actual reports', 'DS Expected reports'])
+        self.assertIn('Faux Actual reports', frame.columns)
+        self.assertNotIn('Faux Actual reports', frame.attrs['reporting_columns'])
+
+    def test_empty_response_also_certifies_only_dataset_reporting_columns(self):
+        frame = analytics_to_reporting_frame({'rows': []}, {
+            'DatasetAAAA.ACTUAL_REPORTS': 'DS Actual reports', 'IndicatorAA': 'Faux Actual reports',
+        })
+        self.assertTrue(frame.empty)
+        self.assertEqual(frame.attrs['reporting_columns'], ['DS Actual reports'])
 
 
 if __name__ == "__main__":

@@ -172,6 +172,9 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
         data[prefix + "Reporting rate on time"] = [100]
     return pd.DataFrame(data)
 
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
+    return get_data(favori_id, period=period, cache_user=cache_user, ou_dimension=ou_dimension)
+
 def get_organisation_catalog(cache_user=None):
     from geography import build_geography_catalog
     country = {"id": "CountryAAAA", "displayName": "Pays test", "level": 1}
@@ -250,7 +253,8 @@ class CategorisationAppTests(unittest.TestCase):
         app = self.new_app()
         with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Tout réseau est interdit dans ce test")):
             self.run_app(app)
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
             self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
@@ -274,7 +278,8 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["_fixture_validation_calls"], calls)
             self.widget(app, "selectbox", "Sélectionner le Groupe de Règles de Validation :").select("Groupe test")
             self.run_app(app)
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
             self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
@@ -282,7 +287,8 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["_test_export_frame"][TOTAL_COL].tolist(), [95])
             self.widget(app, "selectbox", "Mois fin :").select("Février")
             self.run_app(app)
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
 
     def test_country_requests_real_zone_level_and_uses_zs_profile(self):
         app = self.new_app()

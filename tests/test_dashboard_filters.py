@@ -247,7 +247,8 @@ class DashboardFilterTests(unittest.TestCase):
             self.assertNotEqual(app.session_state["filter_zone_main"], "ZoneBBBBBBB")
             self.assertNotIn("ZS B", self.widget(app, "selectbox", "Zone de santé :").options)
             self.assertEqual(app.session_state["_fixture_loaded_ids"], ["ZoneCCCCCCC"])
-            self.assertTrue(app.session_state["_test_export_frame"].empty)
+            self.assertEqual(app.session_state["_test_export_frame"]["Reports_Actual"].tolist(), [300])
+            self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
 
             app.session_state["_fixture_validation_targets"] = []
             frame = self.analyse(app, ["ZoneCCCCCCC"])
