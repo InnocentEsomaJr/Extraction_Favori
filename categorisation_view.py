@@ -19,7 +19,7 @@ VIEW_SORT_OPTIONS = [
     "Score décroissant",
     "Nom de zone",
 ]
-SEARCH_COLUMNS = ["Zone de santé", "Barème datasets", "Statut catégorisation", "Province"]
+SEARCH_COLUMNS = ["Zone de santé", "Province / DPS", "Barème datasets", "Statut catégorisation", "Province"]
 
 
 def _normalize_text(value):
@@ -71,9 +71,10 @@ def filter_categorisation(df, query="", status="Toutes", sort_by="Ordre initial"
             TOTAL_COL, ascending=sort_by == "Score croissant", kind="stable",
             na_position="last", key=lambda values: pd.to_numeric(values, errors="coerce"),
         )
-    elif sort_by == "Nom de zone" and "Zone de santé" in result.columns:
+    elif sort_by == "Nom de zone" and any(column in result for column in ["Zone de santé", "Province / DPS"]):
+        unit_column = "Zone de santé" if "Zone de santé" in result else "Province / DPS"
         result = result.sort_values(
-            "Zone de santé", kind="stable", na_position="last",
+            unit_column, kind="stable", na_position="last",
             key=lambda values: values.map(
                 lambda value: None if pd.isna(value) else _normalize_text(value)
             ),

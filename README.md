@@ -42,7 +42,7 @@ Le dashboard est organisé en 5 onglets:
 - `Ratio / 100 rapports` calculé par:
   - `(Règles violées (M) / Reports_Actual) * 100`
 - `Score de qualité`
-- `Score de qualité /20`, placé juste après `Score de qualité` dans le tableau et l'export Excel.
+- `Score de qualité /20`, repère historique conservé avec la moyenne des deux taux.
   Le barème s'applique au score de qualité (moyenne de la complétude et de la promptitude) :
   - moins de 50 % : **0**
   - de 50 à moins de 60 % : **5**
@@ -86,8 +86,11 @@ la date de début. Chaque ligne renvoyée par DHIS2 est conservée et comptée.
 
 Le **Tableau de score qualité** apparaît automatiquement, avant toute analyse des
 violations. Il suit les filtres pays, province, zone et dates de cet onglet.
-Une province affiche ses zones, le pays affiche toutes ses zones accessibles et
-une zone sélectionnée affiche uniquement ses propres indicateurs. Les jointures
+Une province affiche ses zones, le pays affiche ses DPS par défaut (avec le choix
+**Détail du tableau qualité → Zones de santé** pour afficher toutes les ZS) et
+une zone sélectionnée affiche uniquement ses propres indicateurs. Les DPS utilisent
+les métriques Analytics de niveau 2 et le barème DPS ; les zones utilisent le niveau 3
+et le barème ZS. Les jointures
 utilisent les IDs DHIS2, y compris en présence de noms identiques.
 
 Pour les mêmes mois, le tableau reprend en priorité les chiffres déjà calculés
@@ -104,8 +107,10 @@ et la période choisis. Si le favori ne demande que les taux, cette requête com
 les cinq métriques nécessaires :
 rapports réels, attendus, reçus à temps, taux de complétude et taux de promptitude.
 Les indicateurs génériques ne sont pas assimilés à ces comptes. Les trois comptes
-servent aux taux pondérés ; le score qualité reste leur moyenne et sa note /20
-conserve le barème convenu. Les autres onglets gardent la sélection du favori.
+servent aux taux pondérés ; la moyenne historique de complétude et promptitude,
+avec sa note /20, reste distincte du score qualité /100. Les autres onglets gardent
+la sélection du favori. Les datasets entièrement vides pour une unité sont ignorés
+pour cette unité ; une valeur manquante dans un dataset actif reste indisponible.
 
 Les données de déclaration existantes sont réutilisées seulement si leurs unités,
 leurs métriques et leurs mois correspondent à la sélection. Sinon,
@@ -118,7 +123,24 @@ une analyse des violations échoue. Les colonnes de violations et le total /100
 attendent leurs analyses respectives ; changer de périmètre retire les anciens
 résultats des règles sans retirer les nouveaux indicateurs de déclaration.
 
-Deux actions sont séparées :
+Le tableau aligne chaque mesure avec sa note, dans l'ordre : complétude globale,
+promptitude globale, nombre de datasets ≥95 %, violations pour 100 rapports et
+corrections de M-1, puis le **Score qualité /100** (colonne `Score catégorisation /100`
+dans les exports). La moyenne des deux taux est conservée à droite comme repère.
+
+**Calculer tous les scores (M et M-1)** traite chaque DPS ou ZS du tableau avec
+les mêmes dates et le même groupe de règles, en interrogeant séparément chaque
+unité pour M puis M-1. Une réponse vide réussie donne zéro violation ; une erreur
+affecte seulement l'unité concernée. Les autres résultats et les indicateurs de
+déclaration restent affichés. Aucun échec ne déclenche de relance automatique.
+Les erreurs détaillées et les requêtes par unité restent consultables.
+
+Exemple Aba : 100 % de complétude, 100 % de promptitude, 9 datasets ≥95 %, 5
+violations sur 134 rapports et 2 anciennes violations toujours présentes donnent
+20 + 20 + 15 + 20 + 0 = **75/100**. Le ratio exact (3,73/100) sert au barème.
+Si les 2 anciennes violations sont corrigées, la note des corrections passe à 20.
+
+Les deux actions existantes restent séparées :
 
 1. **Lancer l'analyse des violations** interroge uniquement la période filtrée M.
    Le détail, le compteur M, le ratio et la note des violations sont disponibles

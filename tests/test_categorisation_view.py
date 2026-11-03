@@ -62,6 +62,15 @@ class CategorisationViewTests(unittest.TestCase):
         frame = pd.DataFrame({"Zone de santé": ["Équateur", "bumba", None, "equateur"]}, index=[4, 3, 2, 1])
         self.assertEqual(filter_categorisation(frame, sort_by="Nom de zone").index.tolist(), [3, 4, 1, 2])
 
+    def test_dps_search_and_name_sort_keep_the_province_scope(self):
+        frame = pd.DataFrame({
+            "Province / DPS": ["Haut Uélé", "Bas Uele", "Équateur"],
+            TOTAL_COL: [75.0, 0.0, float("nan")],
+        })
+        self.assertEqual(filter_categorisation(frame, query="haut uele").index.tolist(), [0])
+        self.assertEqual(filter_categorisation(frame, sort_by="Nom de zone").index.tolist(), [1, 2, 0])
+        self.assertEqual(filter_categorisation(frame, status="Scores complets").index.tolist(), [0, 1])
+
     def test_combined_filters_preserve_columns_types_and_source(self):
         frame = self.frame()
         before = frame.copy(deep=True)

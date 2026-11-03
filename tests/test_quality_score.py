@@ -3,7 +3,7 @@ import unittest
 import pandas as pd
 
 from categorisation import calculer_categorisation
-from quality_score import build_quality_rows, metrics_from_dashboard_summary
+from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
 
 
 class QualityRowsTests(unittest.TestCase):
@@ -179,6 +179,92 @@ class DashboardSummaryMetricsTests(unittest.TestCase):
                     pd.DataFrame([self.summary(**{'Nombre des data set complétude >/=95%': count})]), source, self.targets(),
                 )
                 self.assertTrue(pd.isna(result.iloc[0]['Nombre_Datasets_95']))
+
+
+class ReportingFallbackMetricsTests(unittest.TestCase):
+    def targets(self):
+        return pd.DataFrame([
+            {'Zone_ID': 'ProvinceAAA', 'Zone': 'DPS A', 'Profil_Bareme': 'DPS'},
+            {'Zone_ID': 'ProvinceBBB', 'Zone': 'DPS B', 'Profil_Bareme': 'DPS'},
+        ])
+
+    def raw(self):
+        rows = []
+        for identifier, dataset_count, actual, on_time in [
+            ('ProvinceAAA', 9, 10, 8), ('ProvinceBBB', 6, 5, 4),
+        ]:
+            row = {'Organisation unit ID': identifier, 'Organisation unit': identifier}
+            for number in range(dataset_count):
+                row.update({
+                    f'Dataset {number} Actual reports': actual,
+                    f'Dataset {number} Expected reports': 10,
+                    f'Dataset {number} Actual reports on time': on_time,
+                    f'Dataset {number} Reporting rate': actual / 10 * 100,
+                    f'Dataset {number} Reporting rate on time': on_time / 10 * 100,
+                })
+            rows.append(row)
+        frame = pd.DataFrame(rows)
+        for suffix in ['Actual reports', 'Expected reports', 'Actual reports on time', 'Reporting rate', 'Reporting rate on time']:
+            frame['Dataset inutilisé ' + suffix] = float('nan')
+        return frame
+
+    def test_inactive_datasets_are_excluded_separately_for_each_dps(self):
+        source, targets = self.raw(), self.targets()
+        before = source.copy(deep=True)
+        result = metrics_from_reporting_source(source, targets).set_index('Zone_ID')
+        self.assertEqual(result.loc['ProvinceAAA'].tolist(), [100, 80, 90, 9])
+        self.assertEqual(result.loc['ProvinceBBB'].tolist(), [50, 40, 30, 0])
+        pd.testing.assert_frame_equal(source, before)
+        rows = build_quality_rows(result.reset_index(), targets)
+        self.assertEqual(rows['Profil_Bareme'].tolist(), ['DPS', 'DPS'])
+        scores = calculer_categorisation(rows)
+        self.assertEqual(scores['Score datasets /20'].tolist(), [10, 0])
+
+    def test_all_absent_is_missing_but_observed_zeros_remain_zero(self):
+        frame = self.raw()
+        value_columns = [column for column in frame if column not in ['Organisation unit', 'Organisation unit ID']]
+        frame[value_columns] = float('nan')
+        result = metrics_from_reporting_source(frame, self.targets())
+        self.assertTrue(result.iloc[:, 1:].isna().all().all())
+        frame = self.raw()
+        for column in frame:
+            if column.endswith(('Actual reports', 'Actual reports on time', 'Reporting rate', 'Reporting rate on time')):
+                frame[column] = frame[column].where(frame[column].isna(), 0)
+        result = metrics_from_reporting_source(frame, self.targets())
+        self.assertEqual(result.iloc[:, 1:].to_numpy().tolist(), [[0, 0, 0, 0], [0, 0, 0, 0]])
+
+    def test_missing_one_family_does_not_erase_other_metrics(self):
+        source = self.raw().drop(columns=[column for column in self.raw() if column.endswith('Actual reports on time')])
+        result = metrics_from_reporting_source(source, self.targets()).iloc[0]
+        self.assertEqual(result['Actual_Reports'], 90)
+        self.assertEqual(result['Complétude_Globale'], 100)
+        self.assertEqual(result['Nombre_Datasets_95'], 9)
+        self.assertTrue(pd.isna(result['Promptitude_Globale']))
+
+    def test_missing_cell_in_an_active_dataset_is_not_ignored(self):
+        source = self.raw()
+        source.loc[0, 'Dataset 0 Actual reports'] = float('nan')
+        result = metrics_from_reporting_source(source, self.targets())
+        self.assertTrue(result.loc[0, ['Actual_Reports', 'Complétude_Globale', 'Nombre_Datasets_95']].isna().all())
+        self.assertEqual(result.loc[0, 'Promptitude_Globale'], 80)
+        self.assertEqual(result.loc[1, 'Complétude_Globale'], 50)
+
+    def test_malformed_negative_or_infinite_values_only_affect_their_target(self):
+        for value in ['illisible', -1, float('inf')]:
+            with self.subTest(value=value):
+                source = self.raw().astype(object)
+                source.loc[0, 'Dataset 0 Expected reports'] = value
+                result = metrics_from_reporting_source(source, self.targets())
+                self.assertEqual(result.loc[0, 'Actual_Reports'], 90)
+                self.assertTrue(result.loc[0, ['Complétude_Globale', 'Promptitude_Globale', 'Nombre_Datasets_95']].isna().all())
+                self.assertEqual(result.loc[1, 'Actual_Reports'], 30)
+                self.assertEqual(result.loc[1, 'Promptitude_Globale'], 40)
+
+    def test_missing_id_cannot_be_joined_by_label(self):
+        source = self.raw().drop(columns='Organisation unit ID')
+        source['Organisation unit'] = ['DPS A', 'DPS B']
+        result = metrics_from_reporting_source(source, self.targets())
+        self.assertTrue(result.iloc[:, 1:].isna().all().all())
 
 
 if __name__ == '__main__':

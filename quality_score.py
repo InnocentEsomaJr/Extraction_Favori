@@ -5,7 +5,7 @@ import math
 import pandas as pd
 
 from geography import labels_for_units
-from reporting_metrics import clean_ou_id
+from reporting_metrics import aggregate_validation_metrics, clean_ou_id
 
 
 REPORTING_METRIC_COLUMNS = [
@@ -128,6 +128,59 @@ def metrics_from_dashboard_summary(summary_df, source_df, targets):
     return result
 
 
+def metrics_from_reporting_source(source_df, targets):
+    """Calcule le reporting d'une cible, en excluant ses seuls datasets absents.
+
+    Un dataset entièrement vide pour une DPS peut être actif dans une autre.
+    Son exclusion se fait donc par ID, avant les calculs pondérés. Une cellule
+    manquante dans un dataset actif reste indisponible ; elle ne devient pas
+    zéro. Les familles de comptes sont évaluées séparément.
+    """
+    empty = metrics_from_dashboard_summary(pd.DataFrame(), source_df, targets)
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return empty
+    source_ids = _explicit_unit_ids(source_df)
+    if source_ids is None:
+        return empty
+    suffixes = [
+        'actual reports on time', 'reporting rate on time',
+        'actual reports', 'expected reports', 'reporting rate',
+    ]
+    datasets = {}
+    for column in source_df.columns:
+        name = ' '.join(str(column).casefold().split())
+        for suffix in suffixes:
+            if name == suffix or name.endswith(' ' + suffix):
+                key = name[:-len(suffix)].strip(' -_')
+                datasets.setdefault(key, []).append(column)
+                break
+    records = []
+    for target in empty['Zone_ID']:
+        rows = source_df.loc[source_ids.eq(target)].copy()
+        if rows.empty:
+            records.append(empty.loc[empty['Zone_ID'].eq(target)].iloc[0].to_dict())
+            continue
+        inactive_columns = []
+        for columns in datasets.values():
+            provided = rows[columns].notna() & rows[columns].astype(str).apply(lambda col: col.str.strip().ne(''))
+            if not provided.any().any():
+                inactive_columns.extend(columns)
+        rows = rows.drop(columns=inactive_columns)
+        rows['Organisation unit ID'] = target
+        selected = targets.loc[targets['Zone_ID'].map(clean_ou_id).eq(target)]
+        metrics = aggregate_validation_metrics(rows, selected)
+        summary = metrics.rename(columns={
+            'Zone_ID': 'Organisation unit ID',
+            'Complétude_Globale': 'Complétude_Globale (%)',
+            'Promptitude_Globale': 'Promptitude_Globale (%)',
+            'Actual_Reports': 'Reports_Actual',
+            'Nombre_Datasets_95': 'Nombre des data set complétude >/=95%',
+        })
+        verified = metrics_from_dashboard_summary(summary, rows, selected)
+        records.extend(verified.to_dict('records'))
+    return pd.DataFrame(records, columns=REPORTING_METRIC_COLUMNS)
+
+
 def build_quality_rows(metrics, zones, validation_data=None):
     """Prépare les données numériques du périmètre, sans réutiliser une autre ZS.
 
@@ -142,6 +195,10 @@ def build_quality_rows(metrics, zones, validation_data=None):
     validation_map = {
         clean_ou_id(row.get('Zone_ID')): row for row in validation_data.to_dict('records')
     } if validation_data is not None else {}
+    profiles = {
+        clean_ou_id(row.get('Zone_ID')): row.get('Profil_Bareme', 'ZS')
+        for row in zones.to_dict('records')
+    } if zones is not None else {}
     rows = []
     for zone_id, label in labels.items():
         source = metric_map.get(zone_id, {})
@@ -155,7 +212,7 @@ def build_quality_rows(metrics, zones, validation_data=None):
             'Actual_Reports': _number(source.get('Actual_Reports')),
             'Score_Qualite': round((completeness + timeliness) / 2, 1),
             'Nombre_Datasets_95': _number(source.get('Nombre_Datasets_95')),
-            'Profil_Bareme': 'ZS',
+            'Profil_Bareme': profiles.get(zone_id, 'ZS'),
             'Erreur_Validation': validation.get('Erreur_Validation') or '',
             'Erreur_Corrections': validation.get('Erreur_Corrections') or '',
             'Controle_Corrections_Effectue': bool(validation.get('Controle_Corrections_Effectue', False)),

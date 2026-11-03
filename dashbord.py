@@ -17,13 +17,14 @@ from reporting_metrics import (
     aggregate_validation_metrics, clean_ou_id, has_complete_reporting_metrics,
     reporting_quality_warnings,
 )
-from quality_score import build_quality_rows, metrics_from_dashboard_summary
+from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
+from quality_scope import quality_target_catalog, assign_quality_units
+from quality_batch import run_quality_batch
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from validation_filters import date_range_months, monthly_bounds, reference_month
-from validation_scope import assign_validation_zones
 from validation_details import (
     DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
     filter_validation_details, style_importance, validation_detail_identifiers,
@@ -207,9 +208,9 @@ def build_violation_signatures(df_val):
 def build_violation_signature_set(df_val):
     return set(build_violation_signatures(df_val))
 
-def render_quality_table(df_cat, corrections_checked=False):
+def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de santé'):
     historical_columns = {
-        'Zone de santé': 'Zone de santé',
+        'Zone de santé': unit_label,
         'Complétude_Globale': 'Complétude globale (%)',
         'Promptitude_Globale': 'Promptitude globale (%)',
         'Actual_Reports': 'Reports_Actual',
@@ -226,7 +227,20 @@ def render_quality_table(df_cat, corrections_checked=False):
         TOTAL_COL, 'Statut catégorisation',
     ]
     df_display = df_cat[list(historical_columns) + added_columns].rename(columns=historical_columns)
-    view_query = st.text_input("Rechercher une zone", key="categorisation_search")
+    ordered_columns = [
+        unit_label, 'Complétude globale (%)', 'Score complétude /20',
+        'Promptitude globale (%)', 'Score promptitude /20',
+        'Nombre de datasets complétude ≥95 %', 'Score datasets /20',
+        'Règles violées (M)', 'Reports_Actual', 'Ratio / 100 rapports', 'Score violations /20',
+        'Règles violées (M-1)', 'Règles corrigées (M-1 -> M)',
+        'Règles restantes (M-1 -> M)', 'Score corrections /20', TOTAL_COL,
+    ]
+    df_display = df_display[ordered_columns + [column for column in df_display if column not in ordered_columns]]
+    st.caption(
+        "Score qualité /100 = complétude + promptitude + datasets + violations /100 rapports + corrections de M-1. "
+        "Chaque critère est noté sur 20. Le score de qualité historique (moyenne des deux taux) est conservé à droite."
+    )
+    view_query = st.text_input("Rechercher une zone" if unit_label == 'Zone de santé' else "Rechercher une DPS", key="categorisation_search")
     view_left, view_right = st.columns(2)
     with view_left:
         view_status = st.selectbox("Afficher les résultats", VIEW_STATUS_OPTIONS, key="categorisation_status")
@@ -234,15 +248,26 @@ def render_quality_table(df_cat, corrections_checked=False):
         view_sort = st.selectbox("Trier les résultats", VIEW_SORT_OPTIONS, key="categorisation_sort")
     df_visible = filter_categorisation(df_display, query=view_query, status=view_status, sort_by=view_sort)
     st.caption(
-        f"{len(df_visible)} zone(s) affichée(s) sur {len(df_display)}. "
+        f"{len(df_visible)} unité(s) affichée(s) sur {len(df_display)}. "
         "L'export Excel, l'aperçu et les indicateurs conservent l'analyse complète."
     )
     if df_visible.empty:
-        st.info("Aucune zone ne correspond à cette recherche et à ces filtres.")
+        st.info("Aucune unité ne correspond à cette recherche et à ces filtres.")
     st.dataframe(
         _build_styler(df_visible, missing_text="—", **style_context_tab5()) if not df_visible.empty else df_visible,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            TOTAL_COL: st.column_config.NumberColumn(
+                "Score qualité /100", help="Somme des cinq notes sur 20.", format="%.0f",
+            ),
+            'Score de qualité': st.column_config.NumberColumn(
+                "Moyenne des deux taux (%)", help="Moyenne historique de la complétude et de la promptitude, distincte du total /100.",
+            ),
+            'Score de qualité /20': st.column_config.NumberColumn(
+                "Note de la moyenne /20", help="Repère historique, exclu de la somme des cinq critères.", format="%.0f",
+            ),
+        },
     )
     invalid_scores = df_cat[TOTAL_COL].isna()
     if invalid_scores.any() and corrections_checked:
@@ -256,7 +281,7 @@ def render_quality_table(df_cat, corrections_checked=False):
     col_res1.metric("Violations détectées (données disponibles)", '—' if pd.isna(detected) else int(detected))
     col_res2.metric("Règles corrigées (données disponibles)", '—' if pd.isna(corrected) else int(corrected))
     average_score = df_cat[TOTAL_COL].mean()
-    col_res3.metric("Score moyen de catégorisation /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
+    col_res3.metric("Score qualité moyen /100", '—' if pd.isna(average_score) else f"{average_score:.1f}")
     col_res4.metric("Unités avec score complet", f"{int((~invalid_scores).sum())} / {len(df_cat)}")
 
     return df_display.copy()
@@ -1994,7 +2019,19 @@ if df_raw is not None:
                 validation_province_labels[validation_province_id] if validation_province_id else
                 country_labels[validation_country_id]
             )
-            st.caption(f"Parent sélectionné : {validation_parent_label} — {len(validation_zones_df)} zone(s) de santé.")
+            quality_detail_level = (
+                st.selectbox(
+                    "Détail du tableau qualité", ["DPS / provinces", "Zones de santé"],
+                    key='quality_detail_level',
+                ) if not validation_province_id and not validation_zone_id else 'Zones de santé'
+            )
+            validation_zones_df = quality_target_catalog(
+                organisation_catalog, validation_country_id, validation_province_id, validation_zone_id,
+                target_level=3 if quality_detail_level == 'Zones de santé' else None,
+            )
+            quality_is_dps = bool(not validation_zones_df.empty and validation_zones_df['Profil_Bareme'].eq('DPS').all())
+            quality_unit_label = 'Province / DPS' if quality_is_dps else 'Zone de santé'
+            st.caption(f"Parent sélectionné : {validation_parent_label} — {len(validation_zones_df)} unité(s) ({quality_unit_label}).")
         with dates_column:
             validation_start_date = st.date_input(
                 "Date de début", value=None, format="YYYY-MM-DD", key='validation_start_date'
@@ -2011,11 +2048,11 @@ if df_raw is not None:
         if not validation_dates_valid:
             st.error("Renseignez les deux dates ; la date de début doit être antérieure ou égale à la date de fin.")
         if validation_zones_df.empty:
-            st.warning("Aucune zone de santé accessible pour cette unité parent.")
+            st.warning("Aucune unité accessible pour cette unité parent.")
         validation_months = date_range_months(validation_start_date, validation_end_date) if validation_dates_valid else []
         validation_reference_months = [reference_month(validation_start_date)] if validation_dates_valid else []
         validation_period_id = ';'.join(validation_months)
-        validation_ou_dimension = validation_zone_id or f"LEVEL-3;{validation_parent_id}"
+        validation_ou_dimension = validation_zone_id or f"LEVEL-{2 if quality_is_dps else 3};{validation_parent_id}"
         profil_bareme = st.selectbox(
             "Barème du nombre de datasets à complétude ≥95 % :",
             ["Automatique", "DPS", "ZS"],
@@ -2029,7 +2066,7 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'quality-reporting-v4', base_url, current_user_for_cache, id_final,
+            'quality-hierarchy-v5', base_url, current_user_for_cache, id_final,
             validation_start_date, validation_end_date, tuple(validation_months),
             tuple(validation_reference_months), validation_parent_id, target_group_id,
             tuple(validation_zones_df['Zone_ID']),
@@ -2041,7 +2078,7 @@ if df_raw is not None:
             st.session_state.pop("categorisation_result", None)
         quality_view_context = (
             id_final, current_user_for_cache, validation_parent_id,
-            validation_start_date, validation_end_date,
+            validation_start_date, validation_end_date, tuple(validation_zones_df['Zone_ID']),
         )
         if st.session_state.get('quality_view_context') != quality_view_context:
             st.session_state.update({
@@ -2084,7 +2121,7 @@ if df_raw is not None:
                     )
                 if quality_reporting_source is None:
                     quality_reporting_source = pd.DataFrame()
-                extra_metrics = aggregate_validation_metrics(quality_reporting_source, validation_zones_df)
+                extra_metrics = metrics_from_reporting_source(quality_reporting_source, validation_zones_df)
                 quality_metrics = quality_metrics.set_index('Zone_ID').combine_first(
                     extra_metrics.set_index('Zone_ID')
                 ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
@@ -2117,13 +2154,23 @@ if df_raw is not None:
         with correction_action:
             run_correction_check = st.button(
                 "Contrôler les corrections du mois précédent",
-                disabled=not saved_validation or not saved_validation.get('current_analysis_succeeded', False),
+                disabled=not saved_validation or not saved_validation.get('current_analysis_succeeded', False) or saved_validation.get('batch_analysis', False),
                 help="Charger M-1 et comparer ses violations avec l'analyse M déjà affichée.",
             )
+        run_batch_analysis = st.button(
+            "Calculer tous les scores (M et M-1)",
+            disabled=not validation_dates_valid or validation_zones_df.empty,
+            help="Analyser chaque DPS ou zone affichée, puis le mois précédent. Une unité indisponible n'efface pas les autres.",
+        )
+        st.caption(
+            "Le calcul de tous les scores traite chaque unité du tableau séparément. "
+            "Une réponse DHIS2 sans violation donne 0 ; une erreur reste signalée comme indisponible."
+        )
 
-        if run_current_analysis or run_correction_check:
+        if run_current_analysis or run_correction_check or run_batch_analysis:
+            check_previous = run_correction_check or run_batch_analysis
             can_run_validation = bool(validation_parent_id)
-            if run_current_analysis:
+            if run_current_analysis or run_batch_analysis:
                 st.session_state['validation_detail_search'] = ''
                 st.session_state['validation_detail_importance'] = 'Toutes'
                 st.session_state.pop('validation_selected_row', None)
@@ -2131,7 +2178,7 @@ if df_raw is not None:
             if can_run_validation:
                 with st.spinner('Contrôle des corrections en cours...' if run_correction_check else 'Analyse de la période filtrée en cours...'):
 
-                    # 1) Le catalogue sélectionné contient exclusivement des zones de santé.
+                    # 1) Les cibles sont les DPS du pays ou les ZS de la DPS sélectionnée.
                     validation_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
                     zones_resolues = [(validation_labels[ou_id], ou_id) for ou_id in validation_zones_df['Zone_ID']]
 
@@ -2167,7 +2214,17 @@ if df_raw is not None:
                     # Une nouvelle analyse doit lire DHIS2, même avec les mêmes filtres.
                     validation_cache_user = (*current_user_for_cache, uuid4().hex)
                     analysis_progress = st.progress(0.05, text="Lecture de la période filtrée M")
-                    if run_current_analysis:
+                    current_batch = previous_batch = None
+                    if run_batch_analysis:
+                        current_batch = run_quality_batch(
+                            validation_zones_df, validation_months, target_group_id, get_validation_results,
+                            cache_user=validation_cache_user, start_date=validation_start_date, end_date=validation_end_date,
+                            on_progress=lambda position, total, uid, name: analysis_progress.progress(
+                                0.05 + 0.25 * (position - 1) / total, text=f"M : {position}/{total} — {name}"
+                            ),
+                        )
+                        current_violations = current_batch['raw']
+                    elif run_current_analysis:
                         current_violations = get_validation_results(
                             validation_parent_id, validation_months, target_group_id, cache_user=validation_cache_user,
                             start_date=validation_start_date, end_date=validation_end_date
@@ -2178,14 +2235,26 @@ if df_raw is not None:
                     analysis_frames = [('M', current_violations)]
                     correction_warnings = []
                     correction_detail_warnings = []
-                    if run_correction_check:
+                    if run_batch_analysis:
+                        previous_batch = run_quality_batch(
+                            validation_zones_df, validation_reference_months, target_group_id, get_validation_results,
+                            cache_user=validation_cache_user, label='M-1',
+                            on_progress=lambda position, total, uid, name: analysis_progress.progress(
+                                0.3 + 0.3 * (position - 1) / total, text=f"M-1 : {position}/{total} — {name}"
+                            ),
+                        )
+                        previous_violations = previous_batch['raw']
+                        validation_requests = current_batch['requests'] + previous_batch['requests']
+                        validation_warnings = list(current_batch['warnings'])
+                        correction_warnings = list(previous_batch['warnings'])
+                    elif run_correction_check:
                         analysis_progress.progress(0.4, text="Analyse DHIS2 du mois précédent M-1")
                         previous_violations = get_validation_results(
                             validation_parent_id, validation_reference_months, target_group_id,
                             cache_user=validation_cache_user
                         )
                         analysis_frames.append(('M-1', previous_violations))
-                    for label, frame in analysis_frames:
+                    for label, frame in ([] if run_batch_analysis else analysis_frames):
                         request_params = frame.attrs.get('request_params', {})
                         request_failed = bool(frame.attrs.get('failed_periods'))
                         validation_requests.append({
@@ -2208,7 +2277,7 @@ if df_raw is not None:
                     identifiers = validation_detail_identifiers(current_violations)
                     previous_identifiers = validation_detail_identifiers(previous_violations)
                     all_unit_ids = tuple(dict.fromkeys(identifiers['org_ids'] + previous_identifiers['org_ids']))
-                    if run_current_analysis:
+                    if run_current_analysis or run_batch_analysis:
                         rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
                             tuple(identifiers['rule_ids']), all_unit_ids, cache_user=current_user_for_cache
                         )
@@ -2223,21 +2292,43 @@ if df_raw is not None:
                             )
                             unit_metadata.update(previous_metadata)
                             correction_detail_warnings.extend(previous_metadata_warnings)
-                    if run_current_analysis:
-                        all_violations, current_scope_warnings = assign_validation_zones(
+                    batch_current_errors = batch_previous_errors = {}
+                    if run_batch_analysis:
+                        assigned_batches = []
+                        for batch in [current_batch, previous_batch]:
+                            assigned_frames, errors_by_id = [], {}
+                            for unit_id, frame in batch['frames_by_id'].items():
+                                assigned, scope_issues = assign_quality_units(
+                                    frame, validation_zones_df.loc[validation_zones_df['Zone_ID'].eq(unit_id)],
+                                    unit_metadata, unit_id,
+                                )
+                                errors_by_id[unit_id] = batch['errors_by_id'][unit_id] + scope_issues
+                                assigned.attrs = {}
+                                assigned_frames.append(assigned)
+                            assigned_batches.append((pd.concat(assigned_frames, ignore_index=True), errors_by_id))
+                        (all_violations, batch_current_errors), (previous_violations, batch_previous_errors) = assigned_batches
+                        current_scope_warnings = []
+                        previous_scope_warnings = []
+                        for unit_id, issues in batch_current_errors.items():
+                            validation_warnings.extend(f"{validation_labels[unit_id]} : {issue}" for issue in issues if issue not in current_batch['errors_by_id'][unit_id])
+                        for unit_id, issues in batch_previous_errors.items():
+                            correction_warnings.extend(f"{validation_labels[unit_id]} : {issue}" for issue in issues if issue not in previous_batch['errors_by_id'][unit_id])
+                    elif run_current_analysis:
+                        all_violations, current_scope_warnings = assign_quality_units(
                             current_violations, validation_zones_df, unit_metadata, validation_parent_id
                         )
                     else:
                         all_violations = saved_validation['current_assigned'].copy()
                         current_scope_warnings = list(saved_validation['current_scope_warnings'])
-                    previous_violations, previous_scope_warnings = assign_validation_zones(
-                        previous_violations, validation_zones_df, unit_metadata, validation_parent_id
-                    )
+                    if not run_batch_analysis:
+                        previous_violations, previous_scope_warnings = assign_quality_units(
+                            previous_violations, validation_zones_df, unit_metadata, validation_parent_id
+                        )
                     validation_warnings.extend(f"M : {message}" for message in current_scope_warnings)
                     correction_warnings.extend(f"M-1 : {message}" for message in previous_scope_warnings)
                     incomplete_now = bool(all_violations.attrs.get('failed_periods') or current_scope_warnings)
                     incomplete_prev = bool(
-                        not run_correction_check or previous_violations.attrs.get('failed_periods') or previous_scope_warnings
+                        not check_previous or previous_violations.attrs.get('failed_periods') or previous_scope_warnings
                     )
                     for zone_index, (zone_name, zone_id) in enumerate(zones_resolues, start=1):
                         analysis_progress.progress(
@@ -2266,7 +2357,7 @@ if df_raw is not None:
                                 'Violations_Corrigees': np.nan,
                                 'Erreur_Validation': "Identifiant DHIS2 indisponible",
                                 'Erreur_Corrections': '',
-                                'Controle_Corrections_Effectue': run_correction_check,
+                                'Controle_Corrections_Effectue': check_previous,
                             })
                             continue
 
@@ -2276,9 +2367,11 @@ if df_raw is not None:
                         # Compter chaque ligne serveur ; les signatures servent seulement aux corrections.
                         sig_now = build_violation_signature_set(df_val_zone)
                         previous_signatures = build_violation_signatures(df_val_prev_zone)
-                        violations_actuelles = np.nan if incomplete_now else len(df_val_zone)
-                        violations_mois_precedent = np.nan if incomplete_prev else len(df_val_prev_zone)
-                        violations_corrigees = np.nan if incomplete_now or incomplete_prev else sum(
+                        unit_incomplete_now = bool(batch_current_errors.get(zone_id)) if run_batch_analysis else incomplete_now
+                        unit_incomplete_prev = bool(batch_previous_errors.get(zone_id)) if run_batch_analysis else incomplete_prev
+                        violations_actuelles = np.nan if unit_incomplete_now else len(df_val_zone)
+                        violations_mois_precedent = np.nan if unit_incomplete_prev else len(df_val_prev_zone)
+                        violations_corrigees = np.nan if unit_incomplete_now or unit_incomplete_prev else sum(
                             signature not in sig_now for signature in previous_signatures
                         )
 
@@ -2286,9 +2379,9 @@ if df_raw is not None:
                             'Violations_Actuelles': violations_actuelles,
                             'Violations_Mois_Precedent': violations_mois_precedent,
                             'Violations_Corrigees': violations_corrigees,
-                            'Erreur_Validation': '; '.join(validation_warnings),
-                            'Erreur_Corrections': '; '.join(correction_warnings),
-                            'Controle_Corrections_Effectue': run_correction_check,
+                            'Erreur_Validation': '; '.join(batch_current_errors[zone_id] if run_batch_analysis else validation_warnings),
+                            'Erreur_Corrections': '; '.join(batch_previous_errors[zone_id] if run_batch_analysis else correction_warnings),
+                            'Controle_Corrections_Effectue': check_previous,
                         })
 
                     violations_details = (
@@ -2305,13 +2398,14 @@ if df_raw is not None:
                         'current_scope_warnings': current_scope_warnings,
                         'metrics_by_id': metrics_by_id,
                         'profile_by_id': profile_by_id,
-                        'current_analysis_succeeded': not bool(current_violations.attrs.get('failed_periods')),
+                        'current_analysis_succeeded': any(current_batch['succeeded_by_id'].values()) if run_batch_analysis else not bool(current_violations.attrs.get('failed_periods')),
+                        'batch_analysis': run_batch_analysis,
                         'rule_metadata': rule_metadata,
                         'unit_metadata': unit_metadata,
-                        'corrections_checked': run_correction_check,
+                        'corrections_checked': check_previous,
                         'correction_warnings': correction_warnings,
                         'correction_detail_warnings': correction_detail_warnings,
-                        'corrections_checked_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds') if run_correction_check else None,
+                        'corrections_checked_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds') if check_previous else None,
                         'validation_warnings': validation_warnings,
                         'validation_requests': validation_requests,
                         'detail_warnings': detail_warnings,
@@ -2328,7 +2422,7 @@ if df_raw is not None:
                             'Période de référence M-1': ';'.join(validation_reference_months),
                             'Contrôle des corrections': (
                                 'Indisponible' if correction_warnings else 'Effectué'
-                            ) if run_correction_check else 'Non effectué',
+                            ) if check_previous else 'Non effectué',
                         },
                         'analysed_at': saved_validation['analysed_at'] if run_correction_check else datetime.now(KINSHASA_TZ).isoformat(timespec='seconds'),
                     }
@@ -2374,7 +2468,8 @@ if df_raw is not None:
                     for message in dict.fromkeys(quality_warnings):
                         st.text(message)
             df_tab5_export = render_quality_table(
-                df_cat, corrections_checked=bool(saved_validation and saved_validation.get('corrections_checked', False))
+                df_cat, corrections_checked=bool(saved_validation and saved_validation.get('corrections_checked', False)),
+                unit_label=quality_unit_label,
             )
             if not saved_validation:
                 st.info("Le tableau qualité utilise les indicateurs de déclaration disponibles. Lancez l'analyse des violations pour compléter M, puis le contrôle des corrections pour M-1 et le total /100.")
@@ -2440,7 +2535,7 @@ if df_raw is not None:
                 for message in saved_validation.get('correction_detail_warnings', []):
                     st.info(message)
             st.caption(
-                "Les nouvelles notes et le total /100 sont ajoutés à droite des colonnes existantes. "
+                "Le tableau aligne les cinq critères avec leurs notes, puis le total /100. "
                 "Une cellule vide indique qu'une donnée nécessaire au calcul est indisponible."
             )
 

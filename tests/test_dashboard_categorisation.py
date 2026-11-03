@@ -229,7 +229,12 @@ def app_fixture_source(replacements=None):
             return self.generic_visit(node)
 
     transformed = ast.fix_missing_locations(Boundaries().visit(tree))
-    source = ast.unparse(transformed) + '\nst.session_state["_test_export_frame"] = df_tab5_export.copy()\n'
+    # Les scénarios historiques vérifient la vue explicite par ZS ; les tests
+    # de hiérarchie sélectionnent la nouvelle vue DPS dans leur session.
+    source = ('import streamlit as st\n'
+              'if "quality_detail_level" not in st.session_state:\n'
+              '    st.session_state["quality_detail_level"] = "Zones de santé"\n'
+              + ast.unparse(transformed) + '\nst.session_state["_test_export_frame"] = df_tab5_export.copy()\n')
     # AppTest écrit son fichier temporaire avec l'encodage système de Windows.
     return source.encode("ascii", errors="backslashreplace").decode("ascii")
 
@@ -263,9 +268,10 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertEqual(frame[TOTAL_COL].tolist(), [100])
             self.assertEqual(frame["Barème datasets"].tolist(), ["ZS"])
             self.assertEqual(frame.columns[:9].tolist(), [
-                "Zone de santé", "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
-                "Règles violées (M-1)", "Règles corrigées (M-1 -> M)", "Règles violées (M)",
-                "Ratio / 100 rapports", "Score de qualité",
+                "Zone de santé", "Complétude globale (%)", "Score complétude /20",
+                "Promptitude globale (%)", "Score promptitude /20",
+                "Nombre de datasets complétude ≥95 %", "Score datasets /20",
+                "Règles violées (M)", "Reports_Actual",
             ])
             calls = app.session_state["_fixture_validation_calls"]
             self.widget(app, "selectbox", "Barème du nombre de datasets à complétude ≥95 % :").select("DPS")
