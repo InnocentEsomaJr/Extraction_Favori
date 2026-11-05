@@ -134,6 +134,21 @@ PREVIOUS_FAILURE_CLIENT = VALIDATION_CLIENT.replace(
                     raise requests.HTTPError("Accès refusé au mois précédent", response=response)''',
 )
 
+PREVIOUS_VISIBLE_CLIENT = VALIDATION_CLIENT.replace(
+    '                if period.endswith("12"):\n                    continue',
+    '                if period.endswith("12"):\n                    pass',
+)
+
+CURRENT_FAILURE_PREVIOUS_SUCCESS_CLIENT = PREVIOUS_VISIBLE_CLIENT.replace(
+    '            for period in date_range_months(params["startDate"], params["endDate"]):',
+    '''            for period in date_range_months(params["startDate"], params["endDate"]):
+                if not period.endswith("12"):
+                    import requests
+                    response = requests.Response()
+                    response.status_code = 504
+                    raise requests.HTTPError("Période courante indisponible", response=response)''',
+)
+
 
 def excel_sheet(data, sheet_name):
     """Lit les cellules exportées sans dépendre d'un moteur Excel installé."""
@@ -215,7 +230,10 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertIn("déclarée", high["Détails"])
             self.assertEqual(frame.loc[frame["Importance"].eq("LOW"), "Valeur droite"].iloc[0], 0)
             queries = len(app.session_state["_fixture_detail_queries"])
-            self.assertEqual(queries, 1)
+            self.assertEqual(queries, 3)
+            self.assertEqual({query['ou'] for query in app.session_state['_fixture_detail_queries']}, {
+                'ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC',
+            })
             self.assertEqual(app.session_state["_fixture_detail_metadata_calls"], 1)
 
             self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
@@ -254,7 +272,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.run_app(app)
             frame = self.analyse(app)
             self.assertEqual(set(frame["Unité d’organisation"]), {"Centre Étoile", "Centre B"})
-            self.assertEqual(set(query["ou"] for query in app.session_state["_fixture_detail_queries"]), {"ProvinceAAA"})
+            self.assertEqual(set(query["ou"] for query in app.session_state["_fixture_detail_queries"]), {"ZoneAAAAAAA", "ZoneBBBBBBB"})
 
             self.widget(app, "selectbox", "Province :").select("ProvinceBBB")
             self.run_app(app)
@@ -298,16 +316,16 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertEqual(summary["Règles violées (M)"].tolist(), [1, 1, 1])
             self.assertEqual(app.session_state["categorisation_result"]["validation_warnings"], [])
             requests = app.session_state["categorisation_result"]["validation_requests"]
-            self.assertEqual([request["Méthode"] for request in requests], ["POST"])
-            self.assertEqual([request["Unité parent"] for request in requests], ["CountryAAAA"])
-            self.assertEqual(requests[0]["Lignes reçues"], 3)
+            self.assertEqual([request["Méthode"] for request in requests], ["POST"] * 3)
+            self.assertEqual({request["Unité parent"] for request in requests}, {"ZoneAAAAAAA", "ZoneBBBBBBB", "ZoneCCCCCCC"})
+            self.assertEqual([request["Lignes reçues"] for request in requests], [1, 1, 1])
             self.assertTrue(any(
                 item.label == "Vérifier la requête envoyée à DHIS2" for item in app.expander
             ))
 
             queries = list(app.session_state["_fixture_detail_queries"])
             repeated = self.analyse(app)
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 1)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 3)
             pd.testing.assert_frame_equal(repeated, frame)
 
             queries = list(app.session_state["_fixture_detail_queries"])
@@ -315,7 +333,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.run_app(app)
             self.assertNotIn("categorisation_result", app.session_state)
             self.analyse(app)
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 1)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), len(queries) + 3)
 
     def test_forbidden_analysis_explains_the_http_failure_and_never_reports_a_healthy_zero(self):
         app = self.new_app(client=FORBIDDEN_VALIDATION_CLIENT)
@@ -329,7 +347,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertTrue(any("403" in str(message) for message in saved["validation_warnings"]))
             self.assertTrue(any("403" in str(item.value) for item in app.text))
             self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
-            self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+            self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
 
     def test_read_timeout_is_unavailable_without_displaying_a_zero_violation_count(self):
         app = self.new_app(client=TIMEOUT_VALIDATION_CLIENT)
@@ -347,7 +365,7 @@ class DashboardValidationDetailTests(unittest.TestCase):
                 "0 violation(s) affichée(s) sur 0" in str(item.value) for item in app.caption
             ))
             self.assertFalse(any("Aucune règle violée détectée" in str(item.value) for item in app.success))
-            self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+            self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
 
     def test_successful_empty_analysis_keeps_a_real_zero_and_a_success_message(self):
         app = self.new_app(client=EMPTY_VALIDATION_CLIENT)
@@ -378,7 +396,8 @@ class DashboardValidationDetailTests(unittest.TestCase):
             current = app.session_state["_test_export_frame"].copy(deep=True)
             saved = app.session_state["categorisation_result"]
             timestamp = saved["analysed_at"]
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 1)
+            current_source = saved["violations"].copy(deep=True)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 3)
             self.assertFalse(saved["corrections_checked"])
             self.assertFalse(self.widget(app, "button", control_label).disabled)
             self.assertTrue(current["Règles violées (M-1)"].isna().all())
@@ -390,11 +409,14 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.run_app(app)
             checked = app.session_state["categorisation_result"]
             summary = app.session_state["_test_export_frame"]
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
             self.assertTrue(checked["corrections_checked"])
             self.assertTrue(checked.get("corrections_checked_at"))
             self.assertEqual(checked["analysed_at"], timestamp)
-            pd.testing.assert_frame_equal(self.detail_view(app), details)
+            self.assertEqual(self.widget(app, "selectbox", "Période des violations affichées").value, "Mois précédent (M-1)")
+            self.assertTrue(self.detail_view(app).empty)
+            self.assertTrue(checked["previous_violations"].empty)
+            pd.testing.assert_frame_equal(checked["violations"], current_source)
             for column in [
                 "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
                 "Règles violées (M)", "Ratio / 100 rapports", "Score de qualité",
@@ -403,19 +425,23 @@ class DashboardValidationDetailTests(unittest.TestCase):
                 pd.testing.assert_series_equal(summary[column], current[column])
             self.assertEqual(summary["Règles violées (M-1)"].tolist(), [0, 0, 0])
             self.assertTrue(summary[TOTAL_COL].notna().all())
-            self.assertEqual([request["Période"] for request in checked["validation_requests"]], ["M", "M-1"])
+            self.assertEqual([request["Période"] for request in checked["validation_requests"]], ["M"] * 3 + ["M-1"] * 3)
+
+            self.widget(app, "selectbox", "Période des violations affichées").select("Période filtrée (M)")
+            self.run_app(app)
+            pd.testing.assert_frame_equal(self.detail_view(app), details)
 
             self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
             self.run_app(app)
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
 
             self.analyse(app)
             renewed = app.session_state["categorisation_result"]
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 3)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 9)
             self.assertFalse(renewed["corrections_checked"])
             self.assertFalse(renewed.get("corrections_checked_at"))
             self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M-1)"].isna().all())
-            self.assertEqual([request["Période"] for request in renewed["validation_requests"]], ["M"])
+            self.assertEqual([request["Période"] for request in renewed["validation_requests"]], ["M"] * 3)
 
             self.widget(app, "selectbox", "Sélectionner le Groupe de Règles de Validation :").select("Groupe test")
             self.run_app(app)
@@ -429,16 +455,20 @@ class DashboardValidationDetailTests(unittest.TestCase):
             details = self.analyse(app).copy(deep=True)
             current = app.session_state["_test_export_frame"].copy(deep=True)
             timestamp = app.session_state["categorisation_result"]["analysed_at"]
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 1)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 3)
 
             self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
             self.run_app(app)
             saved = app.session_state["categorisation_result"]
             summary = app.session_state["_test_export_frame"]
-            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 2)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
             self.assertEqual(saved["analysed_at"], timestamp)
             self.assertEqual(saved["validation_warnings"], [])
             self.assertTrue(any("403" in str(message) for message in saved["correction_warnings"]))
+            self.assertEqual(self.widget(app, "selectbox", "Période des violations affichées").value, "Mois précédent (M-1)")
+            self.assertTrue(self.detail_view(app).empty)
+            self.widget(app, "selectbox", "Période des violations affichées").select("Période filtrée (M)")
+            self.run_app(app)
             pd.testing.assert_frame_equal(self.detail_view(app), details)
             for column in [
                 "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
@@ -450,6 +480,78 @@ class DashboardValidationDetailTests(unittest.TestCase):
             self.assertTrue(summary["Règles corrigées (M-1 -> M)"].isna().all())
             self.assertTrue(summary[TOTAL_COL].isna().all())
             self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+
+    def test_previous_rules_csv_uses_the_selected_period_and_filters_without_new_requests(self):
+        app = self.new_app(client=PREVIOUS_VISIBLE_CLIENT)
+        downloads = {}
+        filenames = {}
+        real_download = st.download_button
+
+        def capture(label, *args, **kwargs):
+            downloads[label] = kwargs.get("data", args[0] if args else None)
+            filenames[label] = kwargs.get("file_name", "")
+            return real_download(label, *args, **kwargs)
+
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")), \
+                mock.patch("streamlit.download_button", side_effect=capture):
+            self.run_app(app)
+            year = int(self.widget(app, "selectbox", "Choisir l'année :").value)
+            current = self.analyse(app).copy(deep=True)
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+            self.run_app(app)
+            self.assertEqual(self.widget(app, "selectbox", "Période des violations affichées").value, "Mois précédent (M-1)")
+            self.assertEqual(set(self.detail_view(app)["Période"]), {f"Décembre {year - 1}"})
+            self.assertEqual(set(self.detail_view(app)['État de correction']), {'Non corrigée'})
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
+
+            self.widget(app, "selectbox", "Pays des violations").select("CountryAAAA")
+            self.run_app(app)
+            self.widget(app, "selectbox", "Province des violations").select("ProvinceBBB")
+            self.run_app(app)
+            self.assertEqual(self.detail_view(app)["Unité d’organisation"].tolist(), ["Centre C"])
+            self.widget(app, "selectbox", "Zone de santé des violations").select("ZoneCCCCCCC")
+            self.run_app(app)
+            self.assertEqual(self.detail_view(app)["Unité d’organisation"].tolist(), ["Centre C"])
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
+            self.widget(app, "selectbox", "Province des violations").select("")
+            self.run_app(app)
+
+            self.widget(app, "text_input", "Rechercher dans les violations").input("etoile")
+            self.widget(app, "selectbox", "Filtrer les violations par importance").select("HIGH")
+            self.run_app(app)
+            csv_data = downloads["Télécharger les violations affichées en CSV"]
+            text = csv_data.decode("utf-8-sig") if isinstance(csv_data, bytes) else csv_data
+            csv_rows = list(csv.DictReader(io.StringIO(text)))
+            self.assertEqual(len(csv_rows), 1)
+            self.assertEqual(csv_rows[0]["Période"], f"Décembre {year - 1}")
+            self.assertEqual(csv_rows[0]["Unité d’organisation"], "Centre Étoile")
+            self.assertIn(f"{year - 1}12", filenames["Télécharger les violations affichées en CSV"])
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
+
+            self.widget(app, "text_input", "Rechercher dans les violations").input("")
+            self.widget(app, "selectbox", "Filtrer les violations par importance").select("Toutes")
+            self.widget(app, "selectbox", "Période des violations affichées").select("Période filtrée (M)")
+            self.run_app(app)
+            pd.testing.assert_frame_equal(self.detail_view(app), current)
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
+
+    def test_previous_rules_remain_available_after_the_current_period_fails(self):
+        app = self.new_app(client=CURRENT_FAILURE_PREVIOUS_SUCCESS_CLIENT)
+        with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Réseau interdit")):
+            self.run_app(app)
+            self.assertTrue(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+            self.assertTrue(self.analyse(app).empty)
+            self.assertFalse(self.widget(app, "button", "Contrôler les corrections du mois précédent").disabled)
+            self.widget(app, "button", "Contrôler les corrections du mois précédent").click()
+            self.run_app(app)
+            summary = app.session_state["_test_export_frame"]
+            self.assertEqual(len(self.detail_view(app)), 3)
+            self.assertEqual(set(self.detail_view(app)['État de correction']), {'Non vérifiable'})
+            self.assertEqual(summary["Règles violées (M-1)"].tolist(), [1, 1, 1])
+            self.assertTrue(summary["Règles violées (M)"].isna().all())
+            self.assertTrue(summary["Règles corrigées (M-1 -> M)"].isna().all())
+            self.assertTrue(summary[TOTAL_COL].isna().all())
+            self.assertEqual(len(app.session_state["_fixture_detail_queries"]), 6)
 
     def test_missing_metadata_preserves_identifiers_and_actual_values(self):
         app = self.new_app(metadata=MISSING_METADATA)

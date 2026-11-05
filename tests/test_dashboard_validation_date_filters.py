@@ -106,9 +106,11 @@ class ValidationDateFilterTests(unittest.TestCase):
             queries = list(app.session_state["_fixture_detail_queries"])
             current = [query for query in queries if query["startDate"].startswith(f"{year}-01")]
             previous = [query for query in queries if query["startDate"].startswith(f"{year - 1}-12")]
-            self.assertEqual(len(current), 1)
+            self.assertEqual(len(current), 3)
+            self.assertEqual({query['ou'] for query in current}, {'ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC'})
             self.assertTrue(all(query["startDate"] == f"{year}-01-05" and query["endDate"] == f"{year}-01-10" for query in current))
-            self.assertEqual(len(previous), 1)
+            self.assertEqual(len(previous), 3)
+            self.assertEqual({query['ou'] for query in previous}, {'ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC'})
             self.assertTrue(all(query["startDate"] == f"{year - 1}-12-01" and query["endDate"] == f"{year - 1}-12-31" for query in previous))
             self.assertEqual(len(app.session_state["_date_data_requests"]), 1)
 
@@ -173,7 +175,7 @@ class ValidationDateFilterTests(unittest.TestCase):
             summary = self.analyse(app)
             self.assertEqual(self.widget(app, "selectbox", "Pays :").value, "CountryAAAA")
             self.assertEqual(summary["Reports_Actual"].tolist(), [400])
-            self.assertEqual({query["ou"] for query in app.session_state["_fixture_detail_queries"]}, {"CountryBBBB"})
+            self.assertEqual({query["ou"] for query in app.session_state["_fixture_detail_queries"]}, {"ZoneDDDDDDD"})
             self.assertTrue(any(request["ou_dimension"] == "LEVEL-3;CountryBBBB" for request in app.session_state["_date_data_requests"]))
 
     def test_returning_to_all_provinces_resets_zone_and_restores_the_country_scope(self):
@@ -192,7 +194,7 @@ class ValidationDateFilterTests(unittest.TestCase):
             self.assertNotIn("categorisation_result", app.session_state)
             summary = self.analyse(app)
             self.assertEqual(sorted(summary["Reports_Actual"]), [100, 200, 300])
-            self.assertEqual({query["ou"] for query in app.session_state["_fixture_detail_queries"]}, {"ZoneAAAAAAA", "CountryAAAA"})
+            self.assertEqual({query["ou"] for query in app.session_state["_fixture_detail_queries"]}, {"ZoneAAAAAAA", "ZoneBBBBBBB", "ZoneCCCCCCC"})
 
     def test_invalid_tab_dates_discard_analysis_without_removing_other_dashboard_tabs(self):
         app = self.new_app()

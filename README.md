@@ -128,9 +128,13 @@ promptitude globale, nombre de datasets ≥95 %, violations pour 100 rapports et
 corrections de M-1, puis le **Score qualité /100** (colonne `Score catégorisation /100`
 dans les exports). La moyenne des deux taux est conservée à droite comme repère.
 
-**Calculer tous les scores (M et M-1)** traite chaque DPS ou ZS du tableau avec
-les mêmes dates et le même groupe de règles, en interrogeant séparément chaque
-unité pour M puis M-1. Une réponse vide réussie donne zéro violation ; une erreur
+Les trois boutons utilisent les mêmes filtres pays, province, zone et dates.
+Les analyses sont réparties par zone de santé pour éviter une requête volumineuse
+sur toute une province. Au niveau pays, les résultats sont regroupés par DPS
+(ou par ZS selon le détail choisi).
+
+**Calculer tous les scores (M et M-1)** exécute les deux périodes en une action.
+Une réponse vide réussie donne zéro violation ; une erreur
 affecte seulement l'unité concernée. Les autres résultats et les indicateurs de
 déclaration restent affichés. Aucun échec ne déclenche de relance automatique.
 Les erreurs détaillées et les requêtes par unité restent consultables.
@@ -142,15 +146,24 @@ Si les 2 anciennes violations sont corrigées, la note des corrections passe à 
 
 Les deux actions existantes restent séparées :
 
-1. **Lancer l'analyse des violations** interroge uniquement la période filtrée M.
+1. **Lancer l'analyse des violations** interroge uniquement la période filtrée M,
+   pour une zone sélectionnée, toutes les zones d'une province ou le pays.
    Le détail, le compteur M, le ratio et la note des violations sont disponibles
    sans requête M-1. Les colonnes M-1, corrections et le total /100 restent vides,
    avec le statut « contrôle des corrections non effectué ».
 2. **Contrôler les corrections du mois précédent** devient disponible après une
-   analyse M réussie. Ce bouton interroge M-1 et le compare aux résultats M déjà
-   affichés, sans relancer ni remplacer M. Il complète les corrections et le total
+   analyse M, même partiellement indisponible. Ce bouton interroge M-1 pour les
+   mêmes zones et le compare aux résultats M déjà affichés, sans relancer M.
+   Il affiche le détail de M-1 et complète les corrections et le total
    si les données nécessaires sont disponibles. Un échec M-1 conserve le détail,
    les compteurs et la note des violations M ; le contrôle peut être réessayé.
+
+**Période des violations affichées** permet de consulter M ou M-1 sans nouvelle
+requête. Le détail se filtre par pays, province, zone, importance et recherche.
+M-1 indique pour chaque ligne **Corrigée**, **Non corrigée** ou **Non vérifiable**
+si M est indisponible pour l'unité. Le CSV contient la période et les filtres
+affichés ; l'Excel conserve M et M-1 dans deux feuilles distinctes, avec un aperçu
+pour chaque période.
 
 Relancer M efface le contrôle précédent. Changer les dates, le parent ou le groupe
 de règles impose une nouvelle analyse M avant un nouveau contrôle.
@@ -303,6 +316,9 @@ DHIS2_URL = "https://votre-instance-dhis2"
 # DHIS2_TIMEOUT_READ = 120
 # DHIS2_VALIDATION_TIMEOUT_READ = 600
 # DHIS2_HTTP_RETRIES = 2
+# DHIS2_AUTH_TIMEOUT_CONNECT = 10
+# DHIS2_AUTH_TIMEOUT_READ = 60
+# DHIS2_AUTH_RETRIES = 1
 ```
 
 Le projet lit `DHIS2_URL` via `st.secrets`.
@@ -313,7 +329,12 @@ requêtes. `DHIS2_VALIDATION_TIMEOUT_READ` règle son délai de lecture, à 600 
 par défaut (ou au moins le délai général si celui-ci dépasse 600). Ce réglage
 s'applique uniquement à `dataAnalysis/validationRules`, en POST et en GET de repli.
 Les autres appels gardent `DHIS2_TIMEOUT_READ` (90 secondes par défaut).
-La connexion conserve `DHIS2_TIMEOUT_CONNECT` (10 secondes par défaut).
+La vérification des identifiants sur `/api/me` utilise séparément
+`DHIS2_AUTH_TIMEOUT_CONNECT` (10 secondes) et `DHIS2_AUTH_TIMEOUT_READ` (60 secondes).
+Elle fait au plus une seconde tentative lors d'un délai de lecture dépassé,
+d'une interruption réseau ou d'un HTTP 502/503/504. `DHIS2_AUTH_RETRIES = 0`
+désactive cette seconde tentative. Les refus 401/403 et les erreurs de certificat
+ne sont pas relancés. Le message de connexion distingue lenteur, refus et réseau.
 Dans Streamlit Cloud, ces options se règlent dans **App settings → Secrets**.
 Le délai de lecture mesure l'attente de données, pas une durée totale garantie.
 Une coupure du serveur ou d'un relais peut arriver plus tôt.

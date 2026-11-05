@@ -4,6 +4,7 @@ from datetime import date
 import unittest
 from unittest import mock
 
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from categorisation import TOTAL_COL
@@ -152,6 +153,10 @@ class QualityHierarchyAppTests(unittest.TestCase):
         self.widget(app, 'button', 'Calculer tous les scores (M et M-1)').click()
         self.run_app(app)
 
+    def detail_view(self, app):
+        frames = [table.value for table in app.dataframe if {'Règle de validation', 'Importance', 'Période'}.issubset(table.value.columns)]
+        return frames[0] if frames else pd.DataFrame()
+
     def test_country_dps_and_explicit_zone_detail_use_the_matching_level(self):
         app = self.new_app()
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
@@ -235,7 +240,7 @@ class QualityHierarchyAppTests(unittest.TestCase):
 
     def test_country_batch_keeps_successful_dps_when_another_dps_times_out(self):
         app = self.new_app()
-        app.session_state['_hierarchy_failed_ids'] = ['ProvinceBBB']
+        app.session_state['_hierarchy_failed_ids'] = ['ZoneDDDDDDD']
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
             self.run_app(app)
             self.select_country_dps(app)
@@ -246,8 +251,10 @@ class QualityHierarchyAppTests(unittest.TestCase):
             self.assertTrue(frame.loc['Autre DPS', [TOTAL_COL, 'Règles violées (M)']].isna().all())
             self.assertEqual(frame.loc['Autre DPS', 'Complétude globale (%)'], 100)
             calls = app.session_state['_hierarchy_validation']
-            self.assertEqual(set(call['ou'] for call in calls), {'ProvinceAAA', 'ProvinceBBB'})
-            self.assertNotIn('CountryAAAA', [call['ou'] for call in calls])
+            self.assertEqual(set(call['ou'] for call in calls), {
+                'ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC', 'ZoneDDDDDDD',
+            })
+            self.assertFalse({'CountryAAAA', 'ProvinceAAA', 'ProvinceBBB'}.intersection(call['ou'] for call in calls))
 
     def test_previous_month_failure_keeps_current_violations_and_other_zone_scores(self):
         app = self.new_app()
@@ -273,6 +280,43 @@ class QualityHierarchyAppTests(unittest.TestCase):
                 self.assertEqual(frame.loc[label, 'Règles violées (M-1)'], 0)
                 self.assertEqual(frame.loc[label, 'Score corrections /20'], 20)
                 self.assertEqual(frame.loc[label, TOTAL_COL], 95)
+            self.assertEqual(len(app.session_state['_hierarchy_validation']), 6)
+
+    def test_previous_button_displays_its_own_rules_and_current_view_switch_never_reloads(self):
+        app = self.new_app()
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_province(app)
+            self.widget(app, 'button', "Lancer l'analyse des violations").click()
+            self.run_app(app)
+            current_view = self.detail_view(app).copy(deep=True)
+            current_saved = app.session_state['categorisation_result']['violations'].copy(deep=True)
+            self.assertEqual(len(current_view), 5)
+            self.assertEqual(len(app.session_state['_hierarchy_validation']), 3)
+            self.assertEqual(self.widget(app, 'selectbox', 'Période des violations affichées').value, 'Période filtrée (M)')
+            self.assertTrue(self.frame(app)['Règles violées (M-1)'].isna().all())
+            self.assertTrue(self.frame(app)[TOTAL_COL].isna().all())
+            self.assertTrue(any(button.label == 'Calculer tous les scores (M et M-1)' for button in app.button))
+
+            self.widget(app, 'button', 'Contrôler les corrections du mois précédent').click()
+            self.run_app(app)
+            saved = app.session_state['categorisation_result']
+            self.assertEqual(len(app.session_state['_hierarchy_validation']), 6)
+            self.assertEqual(self.widget(app, 'selectbox', 'Période des violations affichées').value, 'Mois précédent (M-1)')
+            self.assertEqual(len(self.detail_view(app)), 2)
+            self.assertEqual(len(saved['previous_violations']), 2)
+            self.assertNotEqual(set(saved['previous_violations']['_period_id']), set(saved['violations']['_period_id']))
+            pd.testing.assert_frame_equal(saved['violations'], current_saved)
+
+            self.widget(app, 'selectbox', 'Période des violations affichées').select('Période filtrée (M)')
+            self.run_app(app)
+            pd.testing.assert_frame_equal(self.detail_view(app), current_view)
+            self.assertEqual(len(app.session_state['_hierarchy_validation']), 6)
+
+            self.widget(app, 'selectbox', 'Période des violations affichées').select('Mois précédent (M-1)')
+            self.widget(app, 'text_input', 'Rechercher dans les violations').input('Règle 1')
+            self.run_app(app)
+            self.assertEqual(self.detail_view(app)['Règle de validation'].tolist(), ['Règle 1'])
             self.assertEqual(len(app.session_state['_hierarchy_validation']), 6)
 
 

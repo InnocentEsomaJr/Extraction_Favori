@@ -18,12 +18,20 @@ from reporting_metrics import (
     reporting_quality_warnings,
 )
 from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
-from quality_scope import quality_target_catalog, assign_quality_units
+from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
+from quality_analysis import (
+    analyse_quality_period, build_validation_comparison_rows,
+    quality_request_targets, rollup_period_to_scores,
+)
+from validation_detail_view import (
+    CORRECTION_COL, enrich_detail_geography, filter_detail_geography, mark_previous_corrections,
+)
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
+from dhis_auth import check_dhis2_credentials
 from validation_filters import date_range_months, monthly_bounds, reference_month
 from validation_details import (
     DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
@@ -207,6 +215,14 @@ def build_violation_signatures(df_val):
 
 def build_violation_signature_set(df_val):
     return set(build_violation_signatures(df_val))
+
+def export_validation_detail_view(frame):
+    """Conserve la géographie et l'état de correction dans la vue et les exports."""
+    result = detail_export_frame(frame)
+    for column in ['Pays', 'Province', CORRECTION_COL]:
+        if column in frame:
+            result[column] = frame[column]
+    return result
 
 def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de santé'):
     historical_columns = {
@@ -521,7 +537,8 @@ def to_excel_dashboard_report(
     df_flop5=None,
     style_context=None,
     df_violations=None,
-    df_validation_context=None
+    df_validation_context=None,
+    df_previous_violations=None,
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -610,6 +627,15 @@ def to_excel_dashboard_report(
         detail_sheet.set_column(4, 4, 65)
         detail_sheet.set_column(5, 7, 18)
         detail_sheet.set_column(8, 8, 90)
+        if df_previous_violations is not None:
+            previous_styler = df_previous_violations.style.format(
+                {'Valeur gauche': '{:.2f}', 'Valeur droite': '{:.2f}'}, na_rep=''
+            ).map(style_importance, subset=['Importance'])
+            previous_styler.to_excel(writer, index=False, sheet_name='Details_Violations_M_1')
+            previous_sheet = writer.sheets['Details_Violations_M_1']
+            previous_sheet.freeze_panes(1, 2)
+            previous_sheet.set_column(0, len(df_previous_violations.columns) - 1, 24)
+            previous_sheet.set_column(4, 4, 65)
         if df_validation_context is not None:
             df_validation_context.to_excel(writer, index=False, sheet_name='Contexte_Validation')
             writer.sheets['Contexte_Validation'].set_column(0, 0, 34)
@@ -1139,20 +1165,13 @@ def _read_int_config_value(key, default_value):
 
 def test_dhis2_credentials(base_url, username, password):
     """Teste les identifiants utilisateur DHIS2 sur /api/me."""
-    try:
-        response = requests.get(
-            f"{base_url.rstrip('/')}/api/me",
-            auth=(username, password),
-            timeout=10
-        )
-    except Exception as e:
-        return False, f"Erreur de connexion : {e}"
-
-    if response.status_code == 200:
-        return True, None
-    if response.status_code in (401, 403):
-        return False, "Identifiants incorrects. Veuillez réessayer."
-    return False, f"Connexion DHIS2 échouée (HTTP {response.status_code})."
+    return check_dhis2_credentials(
+        base_url, username, password,
+        timeout_connect=_read_int_config_value('DHIS2_AUTH_TIMEOUT_CONNECT', 10),
+        timeout_read=_read_int_config_value('DHIS2_AUTH_TIMEOUT_READ', 60),
+        retries=_read_config_value('DHIS2_AUTH_RETRIES') or 1,
+        request_get=requests.get,
+    )
 
 @st.cache_resource
 def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=600):
@@ -1729,6 +1748,7 @@ if df_raw is not None:
     df_comparatif = pd.DataFrame()
     df_tab5_export = pd.DataFrame()
     df_violations_export = None
+    df_previous_violations_export = None
     df_validation_context_export = None
     validation_applied_label = None
     df_tab1_export = pd.DataFrame()
@@ -2066,7 +2086,7 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'quality-hierarchy-v5', base_url, current_user_for_cache, id_final,
+            'quality-actions-v6', base_url, current_user_for_cache, id_final,
             validation_start_date, validation_end_date, tuple(validation_months),
             tuple(validation_reference_months), validation_parent_id, target_group_id,
             tuple(validation_zones_df['Zone_ID']),
@@ -2138,7 +2158,7 @@ if df_raw is not None:
         st.caption(
             f"Mois couverts : {', '.join(validation_months) or '—'}. "
             f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
-            "L'analyse est envoyée à DHIS2 avec le parent et l'intervalle complets. Les indicateurs de déclaration restent mensuels "
+            "Chaque unité du périmètre est analysée séparément par DHIS2 sur l'intervalle choisi. Les indicateurs de déclaration restent mensuels "
             "et couvrent les mois de cet intervalle. Le calcul n'enregistre aucun résultat et n'envoie aucune notification."
         )
 
@@ -2154,8 +2174,8 @@ if df_raw is not None:
         with correction_action:
             run_correction_check = st.button(
                 "Contrôler les corrections du mois précédent",
-                disabled=not saved_validation or not saved_validation.get('current_analysis_succeeded', False) or saved_validation.get('batch_analysis', False),
-                help="Charger M-1 et comparer ses violations avec l'analyse M déjà affichée.",
+                disabled=not saved_validation,
+                help="Charger M-1 pour les mêmes unités, afficher ses règles et comparer avec M sans relancer M.",
             )
         run_batch_analysis = st.button(
             "Calculer tous les scores (M et M-1)",
@@ -2163,273 +2183,147 @@ if df_raw is not None:
             help="Analyser chaque DPS ou zone affichée, puis le mois précédent. Une unité indisponible n'efface pas les autres.",
         )
         st.caption(
-            "Le calcul de tous les scores traite chaque unité du tableau séparément. "
-            "Une réponse DHIS2 sans violation donne 0 ; une erreur reste signalée comme indisponible."
+            "Les trois actions suivent le pays, la province, la zone et les dates sélectionnés. "
+            "Chaque unité est traitée séparément : une erreur sur une unité ne masque pas les autres."
         )
 
         if run_current_analysis or run_correction_check or run_batch_analysis:
             check_previous = run_correction_check or run_batch_analysis
-            can_run_validation = bool(validation_parent_id)
-            if run_current_analysis or run_batch_analysis:
-                st.session_state['validation_detail_search'] = ''
-                st.session_state['validation_detail_importance'] = 'Toutes'
-                st.session_state.pop('validation_selected_row', None)
+            for key, value in {
+                'validation_detail_search': '', 'validation_detail_importance': 'Toutes',
+                'validation_detail_country': '', 'validation_detail_province': '',
+                'validation_detail_zone': '', 'validation_correction_status': 'Tous',
+                'validation_detail_period': 'Mois précédent (M-1)' if check_previous else 'Période filtrée (M)',
+            }.items():
+                st.session_state[key] = value
+            st.session_state.pop('validation_selected_row', None)
 
-            if can_run_validation:
-                with st.spinner('Contrôle des corrections en cours...' if run_correction_check else 'Analyse de la période filtrée en cours...'):
-
-                    # 1) Les cibles sont les DPS du pays ou les ZS de la DPS sélectionnée.
-                    validation_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
-                    zones_resolues = [(validation_labels[ou_id], ou_id) for ou_id in validation_zones_df['Zone_ID']]
-
-                    if not zones_resolues:
-                        st.warning("Aucune zone de santé valide trouvée.")
-                        st.stop()
-
-                    # 2) Déclarations mensuelles du même périmètre et des mois choisis.
-                    reporting_warnings = []
-                    if run_correction_check:
-                        reporting_warnings = list(saved_validation.get('reporting_warnings', []))
-                        metrics_by_id = saved_validation['metrics_by_id']
-                    else:
-                        reporting_warnings = list(quality_warnings)
-                        metrics_by_id = quality_metrics.set_index('Zone_ID').to_dict('index')
-
-                    profile_by_id = {}
-                    for ou_id, metadata in hierarchy_by_id.items():
-                        level = metadata.get('level')
-                        if level is not None and level >= 2 and clean_ou_id(metadata.get('province_id')):
-                            profile_by_id[clean_ou_id(metadata['province_id'])] = 'DPS'
-                        if level is not None and level >= 3 and clean_ou_id(metadata.get('zone_id')):
-                            profile_by_id[clean_ou_id(metadata['zone_id'])] = 'ZS'
-                        if metadata.get('level') in (2, 3):
-                            profile_by_id[str(ou_id)] = 'DPS' if metadata['level'] == 2 else 'ZS'
-                    if run_correction_check:
-                        profile_by_id = saved_validation['profile_by_id']
-
-                    # 3) Même requête que l'application DHIS2 : parent et intervalle complets.
-                    rows_cat = []
-                    validation_warnings = []
-                    validation_requests = []
-                    # Une nouvelle analyse doit lire DHIS2, même avec les mêmes filtres.
-                    validation_cache_user = (*current_user_for_cache, uuid4().hex)
-                    analysis_progress = st.progress(0.05, text="Lecture de la période filtrée M")
-                    current_batch = previous_batch = None
-                    if run_batch_analysis:
-                        current_batch = run_quality_batch(
-                            validation_zones_df, validation_months, target_group_id, get_validation_results,
-                            cache_user=validation_cache_user, start_date=validation_start_date, end_date=validation_end_date,
-                            on_progress=lambda position, total, uid, name: analysis_progress.progress(
-                                0.05 + 0.25 * (position - 1) / total, text=f"M : {position}/{total} — {name}"
-                            ),
-                        )
-                        current_violations = current_batch['raw']
-                    elif run_current_analysis:
-                        current_violations = get_validation_results(
-                            validation_parent_id, validation_months, target_group_id, cache_user=validation_cache_user,
-                            start_date=validation_start_date, end_date=validation_end_date
-                        )
-                    else:
-                        current_violations = saved_validation['current_raw'].copy()
-                    previous_violations = pd.DataFrame()
-                    analysis_frames = [('M', current_violations)]
-                    correction_warnings = []
-                    correction_detail_warnings = []
-                    if run_batch_analysis:
-                        previous_batch = run_quality_batch(
-                            validation_zones_df, validation_reference_months, target_group_id, get_validation_results,
-                            cache_user=validation_cache_user, label='M-1',
-                            on_progress=lambda position, total, uid, name: analysis_progress.progress(
-                                0.3 + 0.3 * (position - 1) / total, text=f"M-1 : {position}/{total} — {name}"
-                            ),
-                        )
-                        previous_violations = previous_batch['raw']
-                        validation_requests = current_batch['requests'] + previous_batch['requests']
-                        validation_warnings = list(current_batch['warnings'])
-                        correction_warnings = list(previous_batch['warnings'])
-                    elif run_correction_check:
-                        analysis_progress.progress(0.4, text="Analyse DHIS2 du mois précédent M-1")
-                        previous_violations = get_validation_results(
-                            validation_parent_id, validation_reference_months, target_group_id,
-                            cache_user=validation_cache_user
-                        )
-                        analysis_frames.append(('M-1', previous_violations))
-                    for label, frame in ([] if run_batch_analysis else analysis_frames):
-                        request_params = frame.attrs.get('request_params', {})
-                        request_failed = bool(frame.attrs.get('failed_periods'))
-                        validation_requests.append({
-                            'Période': label,
-                            'Méthode': frame.attrs.get('request_method', 'POST'),
-                            'Unité parent': validation_parent_id,
-                            'Début': request_params.get('startDate', ''),
-                            'Fin': request_params.get('endDate', ''),
-                            'Statut': ('Indisponible' if frame.empty else 'Partiel') if request_failed else 'Terminé',
-                            'Lignes reçues': np.nan if request_failed and frame.empty else len(frame),
-                            'Durée (s)': frame.attrs.get('elapsed_seconds', np.nan),
-                            'Délai de lecture (s)': frame.attrs.get('validation_read_timeout_seconds', np.nan),
-                        })
-                        for period in frame.attrs.get('failed_periods', []):
-                            reasons = frame.attrs.get('errors', {}).get(period) or ["Analyse DHIS2 indisponible"]
-                            warning_target = validation_warnings if label == 'M' else correction_warnings
-                            warning_target.append(f"{label} ({period}) : {' ; '.join(reasons)}")
-
-                    analysis_progress.progress(0.65, text="Rattachement des résultats DHIS2 aux zones de santé")
-                    identifiers = validation_detail_identifiers(current_violations)
-                    previous_identifiers = validation_detail_identifiers(previous_violations)
-                    all_unit_ids = tuple(dict.fromkeys(identifiers['org_ids'] + previous_identifiers['org_ids']))
-                    if run_current_analysis or run_batch_analysis:
-                        rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
-                            tuple(identifiers['rule_ids']), all_unit_ids, cache_user=current_user_for_cache
-                        )
-                    else:
-                        rule_metadata = dict(saved_validation.get('rule_metadata', {}))
-                        unit_metadata = dict(saved_validation.get('unit_metadata', {}))
-                        detail_warnings = list(saved_validation.get('detail_warnings', []))
-                        missing_previous_units = tuple(uid for uid in all_unit_ids if uid not in unit_metadata)
-                        if missing_previous_units:
-                            _, previous_metadata, previous_metadata_warnings = get_validation_detail_metadata(
-                                (), missing_previous_units, cache_user=current_user_for_cache
-                            )
-                            unit_metadata.update(previous_metadata)
-                            correction_detail_warnings.extend(previous_metadata_warnings)
-                    batch_current_errors = batch_previous_errors = {}
-                    if run_batch_analysis:
-                        assigned_batches = []
-                        for batch in [current_batch, previous_batch]:
-                            assigned_frames, errors_by_id = [], {}
-                            for unit_id, frame in batch['frames_by_id'].items():
-                                assigned, scope_issues = assign_quality_units(
-                                    frame, validation_zones_df.loc[validation_zones_df['Zone_ID'].eq(unit_id)],
-                                    unit_metadata, unit_id,
-                                )
-                                errors_by_id[unit_id] = batch['errors_by_id'][unit_id] + scope_issues
-                                assigned.attrs = {}
-                                assigned_frames.append(assigned)
-                            assigned_batches.append((pd.concat(assigned_frames, ignore_index=True), errors_by_id))
-                        (all_violations, batch_current_errors), (previous_violations, batch_previous_errors) = assigned_batches
-                        current_scope_warnings = []
-                        previous_scope_warnings = []
-                        for unit_id, issues in batch_current_errors.items():
-                            validation_warnings.extend(f"{validation_labels[unit_id]} : {issue}" for issue in issues if issue not in current_batch['errors_by_id'][unit_id])
-                        for unit_id, issues in batch_previous_errors.items():
-                            correction_warnings.extend(f"{validation_labels[unit_id]} : {issue}" for issue in issues if issue not in previous_batch['errors_by_id'][unit_id])
-                    elif run_current_analysis:
-                        all_violations, current_scope_warnings = assign_quality_units(
-                            current_violations, validation_zones_df, unit_metadata, validation_parent_id
-                        )
-                    else:
-                        all_violations = saved_validation['current_assigned'].copy()
-                        current_scope_warnings = list(saved_validation['current_scope_warnings'])
-                    if not run_batch_analysis:
-                        previous_violations, previous_scope_warnings = assign_quality_units(
-                            previous_violations, validation_zones_df, unit_metadata, validation_parent_id
-                        )
-                    validation_warnings.extend(f"M : {message}" for message in current_scope_warnings)
-                    correction_warnings.extend(f"M-1 : {message}" for message in previous_scope_warnings)
-                    incomplete_now = bool(all_violations.attrs.get('failed_periods') or current_scope_warnings)
-                    incomplete_prev = bool(
-                        not check_previous or previous_violations.attrs.get('failed_periods') or previous_scope_warnings
+            with st.spinner('Contrôle des corrections en cours...' if run_correction_check else 'Analyse des unités sélectionnées en cours...'):
+                validation_cache_user = (*current_user_for_cache, uuid4().hex)
+                analysis_progress = st.progress(0.0, text="Lecture DHIS2 des unités sélectionnées")
+                validation_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
+                request_targets = quality_request_targets(validation_zones_df, organisation_catalog)
+                if run_current_analysis or run_batch_analysis:
+                    current_batch = run_quality_batch(
+                        request_targets, validation_months, target_group_id, get_validation_results,
+                        cache_user=validation_cache_user, start_date=validation_start_date, end_date=validation_end_date,
+                        on_progress=lambda position, total, uid, name: analysis_progress.progress(
+                            0.4 * (position - 1) / total, text=f"M : {position}/{total} — {name}"
+                        ),
                     )
-                    for zone_index, (zone_name, zone_id) in enumerate(zones_resolues, start=1):
-                        analysis_progress.progress(
-                            0.7 + (zone_index - 1) / len(zones_resolues) * 0.25,
-                            text=f"Zone {zone_index}/{len(zones_resolues)} : {zone_name}"
-                        )
-                        zone_metrics = metrics_by_id.get(zone_id, {})
-                        comp_val = float(zone_metrics.get('Complétude_Globale', np.nan))
-                        prompt_val = float(zone_metrics.get('Promptitude_Globale', np.nan))
-                        actual_val = float(zone_metrics.get('Actual_Reports', np.nan))
-                        score_qualite = round((comp_val + prompt_val) / 2, 1)
-                        row_cat = {
-                            'Zone_ID': zone_id,
-                            'Zone de santé': zone_name,
-                            'Complétude_Globale': comp_val,
-                            'Promptitude_Globale': prompt_val,
-                            'Actual_Reports': actual_val,
-                            'Score_Qualite': score_qualite,
-                            'Nombre_Datasets_95': zone_metrics.get('Nombre_Datasets_95', np.nan),
-                            'Profil_Bareme': profile_by_id.get(str(zone_id)),
-                        }
-                        if not zone_id or len(str(zone_id)) < 5:
-                            rows_cat.append({**row_cat,
-                                'Violations_Actuelles': np.nan,
-                                'Violations_Mois_Precedent': np.nan,
-                                'Violations_Corrigees': np.nan,
-                                'Erreur_Validation': "Identifiant DHIS2 indisponible",
-                                'Erreur_Corrections': '',
-                                'Controle_Corrections_Effectue': check_previous,
-                            })
-                            continue
-
-                        df_val_zone = all_violations.loc[all_violations['_zone_id'].eq(zone_id)]
-                        df_val_prev_zone = previous_violations.loc[previous_violations['_zone_id'].eq(zone_id)]
-
-                        # Compter chaque ligne serveur ; les signatures servent seulement aux corrections.
-                        sig_now = build_violation_signature_set(df_val_zone)
-                        previous_signatures = build_violation_signatures(df_val_prev_zone)
-                        unit_incomplete_now = bool(batch_current_errors.get(zone_id)) if run_batch_analysis else incomplete_now
-                        unit_incomplete_prev = bool(batch_previous_errors.get(zone_id)) if run_batch_analysis else incomplete_prev
-                        violations_actuelles = np.nan if unit_incomplete_now else len(df_val_zone)
-                        violations_mois_precedent = np.nan if unit_incomplete_prev else len(df_val_prev_zone)
-                        violations_corrigees = np.nan if unit_incomplete_now or unit_incomplete_prev else sum(
-                            signature not in sig_now for signature in previous_signatures
-                        )
-
-                        rows_cat.append({**row_cat,
-                            'Violations_Actuelles': violations_actuelles,
-                            'Violations_Mois_Precedent': violations_mois_precedent,
-                            'Violations_Corrigees': violations_corrigees,
-                            'Erreur_Validation': '; '.join(batch_current_errors[zone_id] if run_batch_analysis else validation_warnings),
-                            'Erreur_Corrections': '; '.join(batch_previous_errors[zone_id] if run_batch_analysis else correction_warnings),
-                            'Controle_Corrections_Effectue': check_previous,
-                        })
-
-                    violations_details = (
-                        saved_validation['violations'] if run_correction_check else
-                        build_validation_details(all_violations, rule_metadata, unit_metadata)
+                    current_raw = current_batch['raw']
+                    current_requests = current_batch['requests']
+                    current_identifiers = validation_detail_identifiers(current_raw)
+                    rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
+                        tuple(current_identifiers['rule_ids']), tuple(current_identifiers['org_ids']),
+                        cache_user=current_user_for_cache,
                     )
-                    analysis_progress.progress(1.0, text=f"{len(zones_resolues)} zone(s) traitée(s)")
-                    st.session_state['categorisation_result'] = {
-                        'context': validation_context,
-                        'data': pd.DataFrame(rows_cat),
-                        'violations': violations_details,
-                        'current_raw': current_violations,
-                        'current_assigned': all_violations,
-                        'current_scope_warnings': current_scope_warnings,
-                        'metrics_by_id': metrics_by_id,
-                        'profile_by_id': profile_by_id,
-                        'current_analysis_succeeded': any(current_batch['succeeded_by_id'].values()) if run_batch_analysis else not bool(current_violations.attrs.get('failed_periods')),
-                        'batch_analysis': run_batch_analysis,
-                        'rule_metadata': rule_metadata,
-                        'unit_metadata': unit_metadata,
-                        'corrections_checked': check_previous,
-                        'correction_warnings': correction_warnings,
-                        'correction_detail_warnings': correction_detail_warnings,
-                        'corrections_checked_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds') if check_previous else None,
-                        'validation_warnings': validation_warnings,
-                        'validation_requests': validation_requests,
-                        'detail_warnings': detail_warnings,
-                        'reporting_warnings': reporting_warnings,
-                        'filters': {
-                            'Date de début': validation_start_date.isoformat(),
-                            'Date de fin': validation_end_date.isoformat(),
-                            'Unité d’organisation parent': validation_parent_label,
-                            'ID unité parent': validation_parent_id,
-                            'Groupe de règles': selected_vr_name,
-                            'Compte DHIS2': st.session_state.get('dhis2_user', ''),
-                            'Source des violations': 'DHIS2 /api/dataAnalysis/validationRules',
-                            'Mois des indicateurs de déclaration': validation_period_id,
-                            'Période de référence M-1': ';'.join(validation_reference_months),
-                            'Contrôle des corrections': (
-                                'Indisponible' if correction_warnings else 'Effectué'
-                            ) if check_previous else 'Non effectué',
-                        },
-                        'analysed_at': saved_validation['analysed_at'] if run_correction_check else datetime.now(KINSHASA_TZ).isoformat(timespec='seconds'),
-                    }
-                    st.rerun()
+                    current_leaves, current_request_errors, _ = analyse_quality_period(
+                        current_batch, request_targets, unit_metadata
+                    )
+                    current_assigned, current_errors, validation_warnings = rollup_period_to_scores(
+                        current_leaves, current_request_errors, request_targets, validation_zones_df
+                    )
+                    violations_details = enrich_detail_geography(
+                        build_validation_details(current_assigned, rule_metadata, unit_metadata),
+                        current_assigned, organisation_catalog, unit_metadata,
+                    )
+                    analysed_at = datetime.now(KINSHASA_TZ).isoformat(timespec='seconds')
+                else:
+                    current_raw = saved_validation['current_raw']
+                    current_assigned = saved_validation['current_assigned']
+                    current_errors = saved_validation['current_errors']
+                    current_request_errors = saved_validation['current_request_errors']
+                    current_requests = saved_validation['current_requests']
+                    validation_warnings = list(saved_validation['validation_warnings'])
+                    violations_details = saved_validation['violations']
+                    rule_metadata = dict(saved_validation['rule_metadata'])
+                    unit_metadata = dict(saved_validation['unit_metadata'])
+                    detail_warnings = list(saved_validation['detail_warnings'])
+                    analysed_at = saved_validation['analysed_at']
 
-            else:
-                st.error("L'ID de la zone de santé sélectionnée est manquant dans les données sources.")
+                previous_raw = pd.DataFrame()
+                previous_assigned = None
+                previous_details = build_validation_details(pd.DataFrame())
+                previous_errors = {}
+                previous_requests = []
+                correction_warnings = []
+                correction_detail_warnings = []
+                if check_previous:
+                    previous_batch = run_quality_batch(
+                        request_targets, validation_reference_months, target_group_id, get_validation_results,
+                        cache_user=validation_cache_user, label='M-1',
+                        on_progress=lambda position, total, uid, name: analysis_progress.progress(
+                            0.4 + 0.4 * (position - 1) / total, text=f"M-1 : {position}/{total} — {name}"
+                        ),
+                    )
+                    previous_raw = previous_batch['raw']
+                    previous_requests = previous_batch['requests']
+                    identifiers = validation_detail_identifiers(previous_raw)
+                    missing_rules = tuple(uid for uid in identifiers['rule_ids'] if uid not in rule_metadata)
+                    missing_units = tuple(uid for uid in identifiers['org_ids'] if uid not in unit_metadata)
+                    if missing_rules or missing_units:
+                        previous_rules, previous_units, correction_detail_warnings = get_validation_detail_metadata(
+                            missing_rules, missing_units, cache_user=current_user_for_cache
+                        )
+                        rule_metadata.update(previous_rules)
+                        unit_metadata.update(previous_units)
+                    previous_leaves, previous_request_errors, _ = analyse_quality_period(
+                        previous_batch, request_targets, unit_metadata
+                    )
+                    previous_assigned, previous_errors, correction_warnings = rollup_period_to_scores(
+                        previous_leaves, previous_request_errors, request_targets, validation_zones_df
+                    )
+                    previous_with_status = mark_previous_corrections(
+                        previous_assigned, current_assigned, current_request_errors, build_violation_signatures
+                    )
+                    previous_details = enrich_detail_geography(
+                        build_validation_details(previous_with_status, rule_metadata, unit_metadata),
+                        previous_with_status, organisation_catalog, unit_metadata,
+                    )
+                    previous_details[CORRECTION_COL] = previous_with_status[CORRECTION_COL].to_numpy()
+
+                comparison_rows = build_validation_comparison_rows(
+                    validation_zones_df, current_assigned, current_errors, previous_assigned, previous_errors,
+                    signature_function=build_violation_signatures,
+                )
+                rows_cat = build_quality_rows(quality_metrics, validation_zones_df, comparison_rows)
+                analysis_progress.progress(1.0, text=f"{len(validation_zones_df)} unité(s) traitée(s)")
+                st.session_state['categorisation_result'] = {
+                    'context': validation_context, 'data': rows_cat,
+                    'violations': violations_details, 'previous_violations': previous_details,
+                    'current_raw': current_raw, 'current_assigned': current_assigned,
+                    'current_errors': current_errors, 'current_requests': current_requests,
+                    'current_request_errors': current_request_errors,
+                    'previous_raw': previous_raw, 'previous_assigned': previous_assigned,
+                    'previous_errors': previous_errors,
+                    'current_analysis_succeeded': any(not issues for issues in current_errors.values()),
+                    'previous_analysis_succeeded': check_previous and any(not issues for issues in previous_errors.values()),
+                    'rule_metadata': rule_metadata, 'unit_metadata': unit_metadata,
+                    'corrections_checked': check_previous,
+                    'correction_warnings': correction_warnings,
+                    'correction_detail_warnings': correction_detail_warnings,
+                    'corrections_checked_at': datetime.now(KINSHASA_TZ).isoformat(timespec='seconds') if check_previous else None,
+                    'validation_warnings': validation_warnings,
+                    'validation_requests': current_requests + previous_requests,
+                    'detail_warnings': detail_warnings, 'reporting_warnings': list(quality_warnings),
+                    'filters': {
+                        'Date de début': validation_start_date.isoformat(),
+                        'Date de fin': validation_end_date.isoformat(),
+                        'Unité d’organisation parent': validation_parent_label,
+                        'ID unité parent': validation_parent_id,
+                        'Groupe de règles': selected_vr_name,
+                        'Compte DHIS2': st.session_state.get('dhis2_user', ''),
+                        'Source des violations': 'DHIS2 /api/dataAnalysis/validationRules',
+                        'Mois des indicateurs de déclaration': validation_period_id,
+                        'Période de référence M-1': ';'.join(validation_reference_months),
+                        'Contrôle des corrections': (
+                            'Partiel' if correction_warnings else 'Effectué'
+                        ) if check_previous else 'Non effectué',
+                    },
+                    'analysed_at': analysed_at,
+                }
+                st.rerun()
 
         saved_validation = st.session_state.get('categorisation_result')
         if validation_dates_valid and not validation_zones_df.empty:
@@ -2512,9 +2406,9 @@ if df_raw is not None:
             if not saved_validation.get('current_analysis_succeeded', False):
                 st.error(
                     "L'analyse DHIS2 de la période M a échoué. Consultez les erreurs détaillées ci-dessous. "
-                    "Le contrôle des corrections sera disponible après une analyse M réussie."
+                    "M-1 peut être consulté séparément ; les corrections exigent des données disponibles pour les deux périodes."
                 )
-            elif not saved_validation.get('corrections_checked', False):
+            if not saved_validation.get('corrections_checked', False):
                 st.info(
                     "La période filtrée M est affichée. Pour renseigner M-1, les corrections et le total /100, "
                     "cliquez sur « Contrôler les corrections du mois précédent »."
@@ -2541,9 +2435,24 @@ if df_raw is not None:
 
             st.divider()
             st.subheader("Détail des règles violées")
-            violations_all = saved_validation.get('violations', build_validation_details(pd.DataFrame()))
-            df_violations_export = detail_export_frame(violations_all)
-            validation_warnings = saved_validation.get('validation_warnings', [])
+            df_violations_export = export_validation_detail_view(saved_validation['violations'])
+            if saved_validation.get('corrections_checked'):
+                df_previous_violations_export = export_validation_detail_view(saved_validation['previous_violations'])
+            detail_period_options = ['Période filtrée (M)']
+            if saved_validation.get('corrections_checked'):
+                detail_period_options.append('Mois précédent (M-1)')
+            if st.session_state.get('validation_detail_period') not in detail_period_options:
+                st.session_state['validation_detail_period'] = detail_period_options[0]
+            detail_period = st.selectbox(
+                "Période des violations affichées", detail_period_options, key='validation_detail_period'
+            )
+            show_previous = detail_period == 'Mois précédent (M-1)'
+            violations_all = saved_validation['previous_violations'] if show_previous else saved_validation['violations']
+            complete_detail_view = export_validation_detail_view(violations_all)
+            validation_warnings = saved_validation.get('correction_warnings' if show_previous else 'validation_warnings', [])
+            active_analysis_succeeded = saved_validation.get(
+                'previous_analysis_succeeded' if show_previous else 'current_analysis_succeeded', False
+            )
             if validation_warnings:
                 st.warning(
                     "Certaines analyses sont indisponibles ou limitées par DHIS2. "
@@ -2552,24 +2461,66 @@ if df_raw is not None:
                 with st.expander("Voir les périodes et zones concernées", expanded=True):
                     for message in validation_warnings:
                         st.text(message)
-            for message in saved_validation.get('detail_warnings', []):
+            for message in saved_validation.get('correction_detail_warnings' if show_previous else 'detail_warnings', []):
                 st.info(message)
             st.caption(
-                "Les lignes, périodes et valeurs sont celles renvoyées par DHIS2 pour l'intervalle M. "
-                "Le contrôle des corrections de M-1 est lancé séparément et conserve cet affichage."
+                f"Période affichée : {detail_period}. Les lignes et valeurs viennent de DHIS2. "
+                "Les filtres ci-dessous portent sur les résultats chargés ; ils ne relancent pas l'analyse. "
+                "Les résultats de M et M-1 restent consultables séparément."
             )
+            detail_geo_columns = st.columns(3)
+            with detail_geo_columns[0]:
+                detail_country_id = _select_scope_id(
+                    "Pays des violations", ['', validation_country_id],
+                    {'': 'Tous les pays analysés', validation_country_id: country_labels[validation_country_id]},
+                    'validation_detail_country', surface=st,
+                    on_change=lambda: st.session_state.update({'validation_detail_province': '', 'validation_detail_zone': ''}),
+                ) or None
+            detail_catalog = organisation_catalog.loc[organisation_catalog['Pays_ID'].eq(validation_country_id)]
+            if validation_province_id:
+                detail_catalog = detail_catalog.loc[detail_catalog['Province_ID'].eq(validation_province_id)]
+            if validation_zone_id:
+                detail_catalog = detail_catalog.loc[detail_catalog['Zone_ID'].eq(validation_zone_id)]
+            detail_province_labels = labels_for_units(detail_catalog, 'Province_ID', 'Province')
+            detail_province_labels[''] = 'Toutes les provinces analysées'
+            with detail_geo_columns[1]:
+                detail_province_id = _select_scope_id(
+                    "Province des violations", [''] + sorted(uid for uid in detail_province_labels if uid),
+                    detail_province_labels, 'validation_detail_province', surface=st,
+                    on_change=lambda: st.session_state.update({'validation_detail_zone': ''}),
+                ) or None
+            detail_zone_catalog = zone_catalog(
+                detail_catalog, country_id=validation_country_id, province_id=detail_province_id
+            )
+            detail_zone_labels = labels_for_units(detail_zone_catalog, 'Zone_ID', 'Zone')
+            detail_zone_labels[''] = 'Toutes les zones analysées'
+            with detail_geo_columns[2]:
+                detail_zone_id = _select_scope_id(
+                    "Zone de santé des violations", [''] + sorted(uid for uid in detail_zone_labels if uid),
+                    detail_zone_labels, 'validation_detail_zone', surface=st,
+                ) or None
+            detail_geography = filter_detail_geography(
+                violations_all, country_id=detail_country_id, province_id=detail_province_id, zone_id=detail_zone_id
+            )
+            if show_previous:
+                correction_status = st.selectbox(
+                    "État des corrections", ['Tous', 'Corrigée', 'Non corrigée', 'Non vérifiable'],
+                    key='validation_correction_status',
+                )
+                if correction_status != 'Tous':
+                    detail_geography = detail_geography.loc[detail_geography[CORRECTION_COL].eq(correction_status)]
             detail_query = st.text_input("Rechercher dans les violations", key="validation_detail_search")
             detail_importance = st.selectbox(
                 "Filtrer les violations par importance", ['Toutes', 'HIGH', 'MEDIUM', 'LOW', 'Non renseignée'],
                 key="validation_detail_importance"
             )
-            violations_visible = filter_validation_details(violations_all, query=detail_query, importance=detail_importance)
-            detail_view = detail_export_frame(violations_visible)
-            if not saved_validation.get('current_analysis_succeeded', False) and violations_all.empty:
+            violations_visible = filter_validation_details(detail_geography, query=detail_query, importance=detail_importance)
+            detail_view = export_validation_detail_view(violations_visible)
+            if not active_analysis_succeeded and violations_all.empty:
                 st.caption("Décompte indisponible : DHIS2 n'a pas fourni de résultat exploitable pour cette analyse.")
             else:
                 st.caption(
-                    f"{len(detail_view)} violation(s) affichée(s) sur {len(df_violations_export)}. "
+                    f"{len(detail_view)} violation(s) affichée(s) sur {len(complete_detail_view)}. "
                     "Le CSV contient les lignes affichées ; le rapport Excel et l'aperçu conservent le détail complet."
                 )
             if violations_all.empty:
@@ -2592,7 +2543,8 @@ if df_raw is not None:
                 st.download_button(
                     "Télécharger les violations affichées en CSV",
                     data=detail_view.to_csv(index=False).encode('utf-8-sig'),
-                    file_name=f"violations_{validation_start_date.isoformat()}_{validation_end_date.isoformat()}.csv", mime='text/csv',
+                    file_name=(f"violations_M-1_{validation_reference_months[0]}.csv" if show_previous else
+                               f"violations_{validation_start_date.isoformat()}_{validation_end_date.isoformat()}.csv"), mime='text/csv',
                     key="download_validation_details_csv"
                 )
                 with st.expander("Consulter le détail d'une violation"):
@@ -2714,6 +2666,7 @@ if df_raw is not None:
             style_context=export_style_context,
             df_violations=df_violations_export,
             df_validation_context=df_validation_context_export,
+            df_previous_violations=df_previous_violations_export,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -2755,6 +2708,7 @@ if df_raw is not None:
             "Règles",
             "Commentaires",
             "Règles détaillées",
+            "Règles détaillées M-1",
         ])
 
         with p_tabs[0]:
@@ -2800,6 +2754,14 @@ if df_raw is not None:
                 st.dataframe(
                     df_violations_export.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
                     .map(style_importance, subset=['Importance']), use_container_width=True, hide_index=True
+                )
+        with p_tabs[10]:
+            if df_previous_violations_export is None:
+                st.info("Contrôlez les corrections du mois précédent pour afficher les règles de M-1.")
+            else:
+                st.dataframe(
+                    df_previous_violations_export.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
+                    .map(style_importance, subset=['Importance']), use_container_width=True, hide_index=True,
                 )
 else:
     st.error("❌ Données indisponibles.")

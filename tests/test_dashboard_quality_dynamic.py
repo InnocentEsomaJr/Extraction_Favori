@@ -219,7 +219,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
                 pd.testing.assert_series_equal(after[column], before[column])
             self.assertTrue(after['Règles violées (M)'].isna().all())
             self.assertTrue(any('504' in message for message in app.session_state['categorisation_result']['validation_warnings']))
-            self.assertEqual(len(app.session_state['_quality_validation_calls']), 1)
+            self.assertEqual(len(app.session_state['_quality_validation_calls']), 3)
 
     def test_province_all_zones_and_country_are_rebuilt_without_running_validation(self):
         app = self.new_app()
