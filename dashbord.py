@@ -29,6 +29,8 @@ from validation_detail_view import (
 )
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
+from reporting_loader import fetch_reporting_chunks, format_reporting_error
+from reporting_availability import mask_failed_reporting_units
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from dhis_auth import check_dhis2_credentials
@@ -1174,13 +1176,14 @@ def test_dhis2_credentials(base_url, username, password):
     )
 
 @st.cache_resource
-def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=600):
+def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=600, analytics_timeout_read=300):
     class SimpleDHIS2Client:
         """Client DHIS2 minimal sans dépendance openhexa."""
-        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0, validation_timeout_read_sec=600):
+        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0, validation_timeout_read_sec=600, analytics_timeout_read_sec=300):
             self.base_url = str(base_url).rstrip("/")
             self.timeout = (timeout_connect_sec, timeout_read_sec)
             self.validation_timeout = (timeout_connect_sec, validation_timeout_read_sec)
+            self.analytics_timeout = (timeout_connect_sec, analytics_timeout_read_sec)
             self.session = requests.Session()
             self.session.auth = (user, pwd)
             self.session.headers.update({"Accept": "application/json"})
@@ -1198,17 +1201,20 @@ def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_rea
             adapter = HTTPAdapter(max_retries=retry_strategy)
             self.session.mount("https://", adapter)
             self.session.mount("http://", adapter)
+            self.session.mount(f"{self.base_url}/api/analytics", HTTPAdapter(max_retries=0))
 
         def _request(self, method, endpoint, params=None, data=None):
             clean_endpoint = str(endpoint).lstrip("/")
             if not clean_endpoint.startswith("api/"):
                 clean_endpoint = f"api/{clean_endpoint}"
             url = f"{self.base_url}/{clean_endpoint}"
-            request_timeout = (
-                self.validation_timeout
-                if clean_endpoint.rstrip('/') == 'api/dataAnalysis/validationRules'
-                else self.timeout
-            )
+            normalized_endpoint = clean_endpoint.split('?', 1)[0].rstrip('/')
+            if normalized_endpoint == 'api/dataAnalysis/validationRules':
+                request_timeout = self.validation_timeout
+            elif normalized_endpoint in ('api/analytics', 'api/analytics.json'):
+                request_timeout = self.analytics_timeout
+            else:
+                request_timeout = self.timeout
             response = self.session.request(method, url, params=params, json=data, timeout=request_timeout)
             response.raise_for_status()
             if not response.text:
@@ -1221,7 +1227,7 @@ def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_rea
         def post(self, endpoint, data=None):
             return self._request("POST", endpoint, data=data)
 
-    return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff, validation_timeout_read)
+    return SimpleDHIS2Client(url, username, password, timeout_connect, timeout_read, retries, backoff, validation_timeout_read, analytics_timeout_read)
 
 def get_dhis2_client():
     dhis2_url = _read_config_value("DHIS2_URL")
@@ -1231,6 +1237,9 @@ def get_dhis2_client():
     dhis2_timeout_read = _read_int_config_value("DHIS2_TIMEOUT_READ", 90)
     dhis2_validation_timeout_read = _read_int_config_value(
         "DHIS2_VALIDATION_TIMEOUT_READ", max(600, dhis2_timeout_read)
+    )
+    dhis2_analytics_timeout_read = _read_int_config_value(
+        'DHIS2_ANALYTICS_TIMEOUT_READ', max(300, dhis2_timeout_read)
     )
     dhis2_retries = _read_int_config_value("DHIS2_HTTP_RETRIES", 2)
 
@@ -1256,15 +1265,58 @@ def get_dhis2_client():
         timeout_connect=dhis2_timeout_connect,
         timeout_read=dhis2_timeout_read,
         validation_timeout_read=dhis2_validation_timeout_read,
+        analytics_timeout_read=dhis2_analytics_timeout_read,
         retries=dhis2_retries,
         backoff=1.0,
     )
 
 @st.cache_data(ttl=3600)
-def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
+def get_reporting_visualization(favori_id, cache_user=None):
+    return get_dhis2_client().get(
+        f"visualizations/{favori_id}",
+        params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
+    )
+
+@st.cache_data(ttl=3600)
+def get_cached_analytics(params, cache_user=None):
+    response = get_dhis2_client().get('analytics.json', params=list(params))
+    analytics_to_reporting_frame(response)
+    return response
+
+def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=None, quality=False):
+    """Répartit Analytics par unité ; seules les réponses réussies sont gardées une heure."""
+    visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
+    builder = build_quality_reporting_query if quality else build_analytics_query
+    params, labels = builder(visualization, period, ou_dimension)
+    class CachedAnalytics:
+        def get(self, endpoint, params=None):
+            return get_cached_analytics(tuple(params or []), cache_user=cache_user)
+    identifiers = tuple(dict.fromkeys(clean_ou_id(uid) for uid in unit_ids if clean_ou_id(uid)))
+    progress = st.progress(0.0, text=f"Chargement des indicateurs de {len(identifiers)} unité(s)")
+    try:
+        result = fetch_reporting_chunks(
+            CachedAnalytics(), params, labels, identifiers,
+            units_per_request=1, items_per_request=max(1, len(labels)),
+            on_progress=lambda position, total, units, items: progress.progress(
+                (position - 1) / total, text=f"Indicateurs DHIS2 : {position}/{total} unité(s)"
+            ),
+        )
+    finally:
+        progress.empty()
+    # Une unité indisponible reste identifiable, avec des valeurs absentes.
+    attributes = dict(result.attrs)
+    result = result.set_index('Organisation unit ID').reindex(identifiers).rename_axis('Organisation unit ID').reset_index()
+    result['Organisation unit'] = result['Organisation unit'].fillna(result['Organisation unit ID'])
+    result.attrs = attributes
+    return result
+
+@st.cache_data(ttl=60)
+def get_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None):
     _ = cache_user
     if not favori_id: return None
     try:
+        if ou_dimension and unit_ids is not None:
+            return load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=cache_user)
         dhis = get_dhis2_client()
         if ou_dimension:
             visualization = dhis.get(
@@ -1284,28 +1336,21 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
     except ValueError as e:
         st.error(f"Impossible de préparer les données du favori pour ce périmètre : {e}")
         return None
-    except requests.exceptions.ReadTimeout:
-        st.error(
-            "Erreur de connexion : délai de lecture dépassé sur DHIS2. "
-            "Essaie une période plus courte (ex. 1-2 mois) ou augmente "
-            "DHIS2_TIMEOUT_READ dans les secrets Streamlit."
-        )
-        return None
-    except requests.exceptions.Timeout:
-        st.error(
-            "Erreur de connexion : timeout réseau DHIS2. "
-            "Vérifie la connectivité et réessaie."
-        )
-        return None
     except Exception as e:
-        st.error(f"Erreur de connexion : {e}")
+        st.error(format_reporting_error(e))
         return None
 
-@st.cache_data(ttl=3600)
-def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
+@st.cache_data(ttl=60)
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None):
     """Charge les cinq mesures de déclaration des datasets du favori, sans analyse de règles."""
     _ = cache_user
     try:
+        if ou_dimension and unit_ids is not None:
+            result = load_reporting_for_units(
+                favori_id, period, ou_dimension, unit_ids, cache_user=cache_user, quality=True
+            )
+            result.attrs['quality_warnings'] = list(result.attrs.get('reporting_warnings', []))
+            return result
         dhis = get_dhis2_client()
         visualization = dhis.get(
             f"visualizations/{favori_id}",
@@ -1676,7 +1721,10 @@ is_zone_focus = selected_zone_id is not None
 ou_dimension = selected_zone_id or f"LEVEL-3;{selected_province_id or selected_country_id}"
 st.sidebar.caption(f"{len(selected_zones_df)} zone(s) de santé dans le périmètre sélectionné.")
 
-df_raw = get_data(id_final, period=period_id, cache_user=current_user_for_cache, ou_dimension=ou_dimension)
+df_raw = get_data(
+    id_final, period=period_id, cache_user=current_user_for_cache, ou_dimension=ou_dimension,
+    unit_ids=tuple(selected_zones_df['Zone_ID']),
+)
 if df_raw is not None:
     df_raw = normalize_orgunit_columns(df_raw)
     if 'Organisation unit ID' not in df_raw.columns:
@@ -1740,6 +1788,16 @@ if df_raw is not None:
 
 
     st.title(f"📊 SNIS RDC - Performance {selected_scope_label}")
+    failed_reporting_units = target_df.attrs.get('failed_units', [])
+    if failed_reporting_units:
+        st.warning(
+            f"Indicateurs indisponibles pour {len(failed_reporting_units)} unité(s). "
+            "Les autres données restent affichées et l'analyse des règles reste accessible. "
+            "Les valeurs manquantes ne sont pas comptées comme des zéros ; les totaux portent sur les données disponibles."
+        )
+        with st.expander("Voir les unités dont les indicateurs sont indisponibles"):
+            for message in target_df.attrs.get('reporting_warnings', []):
+                st.text(message)
 
     # Variables partagées pour export hors onglets.
     fig_comp = None
@@ -1783,6 +1841,7 @@ if df_raw is not None:
             df_actual = target_df[['Organisation unit'] + col_actual_strict].copy()
             for col in col_actual_strict: df_actual[col] = pd.to_numeric(df_actual[col], errors='coerce').fillna(0)
             df_actual['Reports_Actual'] = df_actual[col_actual_strict].sum(axis=1).round(2)
+            df_actual = mask_failed_reporting_units(df_actual, target_df)
             with st.expander("Détail Reports Actuals"): st.dataframe(df_actual.head(15))
             df_actual_detail_export = df_actual.copy()
 
@@ -1791,6 +1850,7 @@ if df_raw is not None:
             df_expected = target_df[['Organisation unit'] + col_expected_strict].copy()
             for col in col_expected_strict: df_expected[col] = pd.to_numeric(df_expected[col], errors='coerce').fillna(0)
             df_expected['Reports_Attendu'] = df_expected[col_expected_strict].sum(axis=1).round(2)
+            df_expected = mask_failed_reporting_units(df_expected, target_df)
             with st.expander("Détail Reports Attendus"): st.dataframe(df_expected.head(15))
             df_expected_detail_export = df_expected.copy()
 
@@ -1799,6 +1859,7 @@ if df_raw is not None:
         if col_rate_uniquement:
             df_affichage = target_df[['Organisation unit'] + col_rate_uniquement].copy()
             for col in col_rate_uniquement: df_affichage[col] = pd.to_numeric(df_affichage[col], errors='coerce').fillna(0).round(2)
+            df_affichage = mask_failed_reporting_units(df_affichage, target_df)
             with st.expander(f"Affichage de {len(col_rate_uniquement)} indicateurs"): st.dataframe(df_affichage.head(15), use_container_width=True)
 
         df_synthese = target_df[['Organisation unit']].copy()
@@ -1809,9 +1870,10 @@ if df_raw is not None:
         st.subheader("Tableau de Performance Final (Stylisé)")
         df_final_c = pd.merge(df_affichage, df_synthese[['Organisation unit', 'Reports_Actual', 'Reports_Attendu', 'Complétude_Globale (%)']], on='Organisation unit')
         df_final_c['Nombre des data set complétude >/=95%'] = (df_final_c[col_rate_uniquement] >= 95).sum(axis=1) if col_rate_uniquement else 0
+        df_final_c = mask_failed_reporting_units(df_final_c, target_df)
 
         st.dataframe(
-            df_final_c.style.format({c: "{:.2f}" for c in df_final_c.columns if c not in ['Organisation unit', 'Nombre des data set complétude >/=95%']})
+            df_final_c.style.format({c: "{:.2f}" for c in df_final_c.columns if c not in ['Organisation unit', 'Nombre des data set complétude >/=95%']}, na_rep='—')
             .map(style_taux, subset=col_rate_uniquement + ['Complétude_Globale (%)'])
             .map(style_score, subset=['Nombre des data set complétude >/=95%']),
             use_container_width=True
@@ -1835,9 +1897,10 @@ if df_raw is not None:
 
         nom_col_score_p = 'Nombre des data set promptitude >/=95%'
         df_final_p[nom_col_score_p] = (df_final_p[col_rate_ot] >= 95).sum(axis=1) if col_rate_ot else 0
+        df_final_p = mask_failed_reporting_units(df_final_p, target_df)
 
         st.dataframe(
-            df_final_p.style.format({c: "{:.2f}" for c in df_final_p.columns if c not in ['Organisation unit', nom_col_score_p]})
+            df_final_p.style.format({c: "{:.2f}" for c in df_final_p.columns if c not in ['Organisation unit', nom_col_score_p]}, na_rep='—')
             .map(style_taux, subset=col_rate_ot + ['Promptitude_Globale (%)'])
             .map(style_score, subset=[nom_col_score_p]), use_container_width=True
         )
@@ -1856,13 +1919,19 @@ if df_raw is not None:
         for c in float_cols_synth:
             if c in df_synth.columns:
                 df_synth[c] = pd.to_numeric(df_synth[c], errors='coerce').fillna(0).round(2)
+        df_synth = mask_failed_reporting_units(df_synth, target_df)
 
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Complétude moyenne", f"{df_synth['Complétude_Globale (%)'].mean():.2f}%")
-        m2.metric("Promptitude moyenne", f"{df_synth['Promptitude_Globale (%)'].mean():.2f}%")
-        m3.metric("Total Attendu", f"{df_synth['Reports_Attendu'].sum():.2f}")
-        m4.metric("Complétude >= 95%", (df_final_c[col_rate_uniquement] >= 95).sum(axis=1).sum() if col_rate_uniquement else 0)
-        m5.metric("Promptitude >= 95%", (df_final_p[col_rate_ot] >= 95).sum(axis=1).sum() if col_rate_ot else 0)
+        average_completeness = df_synth['Complétude_Globale (%)'].mean()
+        average_timeliness = df_synth['Promptitude_Globale (%)'].mean()
+        expected_total = df_synth['Reports_Attendu'].sum(min_count=1)
+        datasets_complete = df_final_c[col_score_comp].sum(min_count=1)
+        datasets_timely = df_final_p[col_score_prompt].sum(min_count=1)
+        m1.metric("Complétude moyenne", '—' if pd.isna(average_completeness) else f"{average_completeness:.2f}%")
+        m2.metric("Promptitude moyenne", '—' if pd.isna(average_timeliness) else f"{average_timeliness:.2f}%")
+        m3.metric("Total Attendu", '—' if pd.isna(expected_total) else f"{expected_total:.2f}")
+        m4.metric("Complétude >= 95%", '—' if pd.isna(datasets_complete) else int(datasets_complete))
+        m5.metric("Promptitude >= 95%", '—' if pd.isna(datasets_timely) else int(datasets_timely))
 
         st.subheader("📊 Tableau comparatif Complétude / Promptitude")
         df_comparatif = (
@@ -1895,7 +1964,7 @@ if df_raw is not None:
                 'Promptitude_Globale (%)': '{:.2f}',
                 'Nombre de dataset complétude >/= 95%': '{:.2f}',
                 'Nombre de dataset promptitude >/= 95%': '{:.2f}'
-            }),
+            }, na_rep='—'),
             use_container_width=True,
             key="grid_comp_prompt"
         )
@@ -2138,6 +2207,7 @@ if df_raw is not None:
                     quality_reporting_source = get_quality_reporting_data(
                         id_final, period=validation_period_id, cache_user=current_user_for_cache,
                         ou_dimension=validation_ou_dimension,
+                        unit_ids=tuple(validation_zones_df['Zone_ID']),
                     )
                 if quality_reporting_source is None:
                     quality_reporting_source = pd.DataFrame()
@@ -2152,6 +2222,7 @@ if df_raw is not None:
                 if quality_metrics[quality_metric_columns].isna().any().any():
                     quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
                     quality_warnings.extend(reporting_quality_warnings(quality_reporting_source, quality_metrics, validation_zones_df))
+            quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
         else:
             quality_reporting_source = pd.DataFrame()
             quality_metrics = pd.DataFrame()

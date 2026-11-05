@@ -22,17 +22,18 @@ class ValidationTimeoutTests(unittest.TestCase):
         )['_build_dhis2_client']
         return factory('https://fixture.invalid/', 'fixture-user', 'fixture-password', **kwargs), session, retry
 
-    def test_long_analysis_wait_does_not_extend_metadata_or_analytics_requests(self):
+    def test_validation_analytics_and_metadata_have_separate_budgets(self):
         client, session, _ = self.client()
         client.post('dataAnalysis/validationRules', data={'ou': 'ZoneAAAAAAA'})
         client.get('organisationUnits', params={'paging': 'false'})
         client.get('analytics', params={'dimension': 'ou:ZoneAAAAAAA'})
         client.get('validationRules')
         self.assertEqual([call.kwargs['timeout'] for call in session.request.call_args_list], [
-            (10, 600), (10, 90), (10, 90), (10, 90),
+            (10, 600), (10, 90), (10, 300), (10, 90),
         ])
         self.assertEqual(client.timeout, (10, 90))
         self.assertEqual(client.validation_timeout, (10, 600))
+        self.assertEqual(client.analytics_timeout, (10, 300))
 
     def test_legacy_get_analysis_uses_the_same_extended_budget(self):
         client, session, _ = self.client(timeout_connect=7, timeout_read=23, validation_timeout_read=1200)

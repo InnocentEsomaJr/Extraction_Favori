@@ -314,6 +314,7 @@ DHIS2_URL = "https://votre-instance-dhis2"
 # Optionnel (connexion lente):
 # DHIS2_TIMEOUT_CONNECT = 10
 # DHIS2_TIMEOUT_READ = 120
+# DHIS2_ANALYTICS_TIMEOUT_READ = 300
 # DHIS2_VALIDATION_TIMEOUT_READ = 600
 # DHIS2_HTTP_RETRIES = 2
 # DHIS2_AUTH_TIMEOUT_CONNECT = 10
@@ -328,7 +329,9 @@ L'analyse des règles peut attendre le calcul DHIS2 plus longtemps que les autre
 requêtes. `DHIS2_VALIDATION_TIMEOUT_READ` règle son délai de lecture, à 600 secondes
 par défaut (ou au moins le délai général si celui-ci dépasse 600). Ce réglage
 s'applique uniquement à `dataAnalysis/validationRules`, en POST et en GET de repli.
-Les autres appels gardent `DHIS2_TIMEOUT_READ` (90 secondes par défaut).
+Les indicateurs utilisent `DHIS2_ANALYTICS_TIMEOUT_READ` (300 secondes par défaut,
+ou le délai général s'il est plus grand). Les appels de métadonnées gardent
+`DHIS2_TIMEOUT_READ` (90 secondes par défaut).
 La vérification des identifiants sur `/api/me` utilise séparément
 `DHIS2_AUTH_TIMEOUT_CONNECT` (10 secondes) et `DHIS2_AUTH_TIMEOUT_READ` (60 secondes).
 Elle fait au plus une seconde tentative lors d'un délai de lecture dépassé,
@@ -344,6 +347,22 @@ de lignes vide. Un vrai résultat sans violation indique **Terminé**, avec zér
 La durée de la requête et son délai de lecture sont affichés dans le diagnostic.
 L'application ne relance pas automatiquement un POST qui a dépassé le délai :
 DHIS2 peut encore être en train de calculer l'analyse.
+
+Le chargement des indicateurs Analytics est aussi réparti **par unité explicite**,
+avec tous les datasets du favori pour cette unité. Le filtre de période et les
+filtres supplémentaires restent identiques ; aucun taux n'est moyenné entre lots.
+Une province de 13 zones produit ainsi 13 petites requêtes, avec une progression,
+au lieu d'une requête unique pour toutes ses zones. Ces appels Analytics ne sont
+pas relancés automatiquement après un timeout.
+
+Les réponses Analytics réussies restent en cache une heure, par compte, révision,
+périmètre et paramètres. La synthèse de chargement, y compris une erreur ou une
+réponse partielle, ne reste en cache que 60 secondes ; **Actualiser les données**
+change immédiatement la révision. Une zone échouée conserve des cellules vides,
+ses scores ne sont pas calculés sur des données partielles et les autres zones
+restent affichées. Les trois boutons de validation restent accessibles même si
+les indicateurs Analytics sont indisponibles. Les erreurs réseau sont résumées
+sans afficher l'URL technique ni les identifiants de connexion.
 
 ## 6. Lancement
 

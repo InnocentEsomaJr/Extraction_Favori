@@ -15,6 +15,7 @@ from streamlit.testing.v1 import AppTest
 
 from categorisation import TOTAL_COL, build_baremes_df, style_context_tab5, style_note_20
 from validation_api import fetch_validation_analysis
+from reporting_loader import format_reporting_error
 
 
 DASHBOARD = Path(__file__).resolve().parents[1] / "dashbord.py"
@@ -30,6 +31,7 @@ def dashboard_functions(*names, **overrides):
     namespace = {
         "pd": pd, "np": np, "io": io, "style_note_20": style_note_20,
         "build_baremes_df": build_baremes_df, "fetch_validation_analysis": fetch_validation_analysis,
+        "format_reporting_error": format_reporting_error,
         **overrides,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(DASHBOARD), "exec"), namespace)
@@ -220,7 +222,15 @@ def app_fixture_source(replacements=None):
 
     class Boundaries(ast.NodeTransformer):
         def visit_FunctionDef(self, node):
-            return copy.deepcopy(fixture_nodes[node.name]) if node.name in fixture_nodes else node
+            if node.name not in fixture_nodes:
+                return node
+            fixture = copy.deepcopy(fixture_nodes[node.name])
+            if node.name in {'get_data', 'get_quality_reporting_data'} and not any(
+                argument.arg == 'unit_ids' for argument in fixture.args.args + fixture.args.kwonlyargs
+            ):
+                fixture.args.kwonlyargs.append(ast.arg(arg='unit_ids'))
+                fixture.args.kw_defaults.append(ast.Constant(value=None))
+            return fixture
 
         def visit_Expr(self, node):
             call = node.value
