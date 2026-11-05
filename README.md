@@ -78,8 +78,9 @@ le total vide, avec un motif dans `Statut catégorisation`.
 
 Les résultats restent en session lors d'un changement de barème ou de l'ouverture
 de l'aperçu. Changer de favori, période, groupe de règles ou périmètre impose une
-nouvelle analyse pour éviter un résultat périmé, tout comme un changement des données
-sources. La déconnexion efface ce résultat.
+nouvelle analyse pour éviter un résultat périmé. L'actualisation des données et la
+déconnexion effacent aussi le résultat et la progression sauvegardée. Une mise à jour
+des seuls indicateurs de déclaration ne supprime pas les réponses de validation en cours.
 Dans l'onglet de catégorisation, les calendriers **Date de début** et **Date de fin**
 définissent l'intervalle M. La référence M-1 reste le mois entier précédant celui de
 la date de début. Chaque ligne renvoyée par DHIS2 est conservée et comptée.
@@ -138,6 +139,20 @@ Une réponse vide réussie donne zéro violation ; une erreur
 affecte seulement l'unité concernée. Les autres résultats et les indicateurs de
 déclaration restent affichés. Aucun échec ne déclenche de relance automatique.
 Les erreurs détaillées et les requêtes par unité restent consultables.
+
+Les réponses sont sauvegardées **après chaque zone**, puis le tableau et les
+détails sont affichés avant de poursuivre la zone suivante. Une notification
+indique la fin du traitement ou son interruption ; les compteurs distinguent
+les unités traitées, indisponibles et en attente. Ces résultats restent dans la
+session, jusqu'à déconnexion, actualisation des données ou changement de filtres.
+
+En cas d'interruption, **Reprendre les zones restantes** conserve les réponses
+déjà reçues. Une requête interrompue sans réponse est signalée comme indisponible
+et n'est pas renvoyée automatiquement. Les zones non encore interrogées sont
+reprises ; elles restent sans décompte avant réception, jamais à zéro par défaut.
+Les trois boutons d'origine sont conservés. Pendant une analyse active, ils sont
+désactivés afin de ne pas mélanger deux périmètres ; relancer M lance une nouvelle
+analyse et retire l'ancien contrôle M-1.
 
 Exemple Aba : 100 % de complétude, 100 % de promptitude, 9 datasets ≥95 %, 5
 violations sur 134 rapports et 2 anciennes violations toujours présentes donnent
@@ -315,7 +330,7 @@ DHIS2_URL = "https://votre-instance-dhis2"
 # DHIS2_TIMEOUT_CONNECT = 10
 # DHIS2_TIMEOUT_READ = 120
 # DHIS2_ANALYTICS_TIMEOUT_READ = 300
-# DHIS2_VALIDATION_TIMEOUT_READ = 600
+# DHIS2_VALIDATION_TIMEOUT_READ = 900
 # DHIS2_HTTP_RETRIES = 2
 # DHIS2_AUTH_TIMEOUT_CONNECT = 10
 # DHIS2_AUTH_TIMEOUT_READ = 60
@@ -326,8 +341,9 @@ Le projet lit `DHIS2_URL` via `st.secrets`.
 Le **nom d'utilisateur** et le **mot de passe** sont saisis par chaque utilisateur dans la barre latérale (`🔐 Connexion DHIS2`).
 
 L'analyse des règles peut attendre le calcul DHIS2 plus longtemps que les autres
-requêtes. `DHIS2_VALIDATION_TIMEOUT_READ` règle son délai de lecture, à 600 secondes
-par défaut (ou au moins le délai général si celui-ci dépasse 600). Ce réglage
+requêtes. `DHIS2_VALIDATION_TIMEOUT_READ` règle son délai de lecture, à 900 secondes
+(15 minutes) au minimum. Une ancienne configuration à 600 est ainsi portée à 900.
+Sans configuration spécifique, un délai général supérieur à 900 reste conservé. Ce réglage
 s'applique uniquement à `dataAnalysis/validationRules`, en POST et en GET de repli.
 Les indicateurs utilisent `DHIS2_ANALYTICS_TIMEOUT_READ` (300 secondes par défaut,
 ou le délai général s'il est plus grand). Les appels de métadonnées gardent

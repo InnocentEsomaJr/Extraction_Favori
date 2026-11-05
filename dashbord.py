@@ -20,6 +20,9 @@ from reporting_metrics import (
 from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
 from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
+from validation_job import (
+    create_validation_job, advance_validation_job, recover_validation_job, resume_validation_job,
+)
 from quality_analysis import (
     analyse_quality_period, build_validation_comparison_rows,
     quality_request_targets, rollup_period_to_scores,
@@ -1176,10 +1179,10 @@ def test_dhis2_credentials(base_url, username, password):
     )
 
 @st.cache_resource
-def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=600, analytics_timeout_read=300):
+def _build_dhis2_client(url, username, password, timeout_connect=10, timeout_read=90, retries=2, backoff=1.0, validation_timeout_read=900, analytics_timeout_read=300):
     class SimpleDHIS2Client:
         """Client DHIS2 minimal sans dépendance openhexa."""
-        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0, validation_timeout_read_sec=600, analytics_timeout_read_sec=300):
+        def __init__(self, base_url, user, pwd, timeout_connect_sec=10, timeout_read_sec=90, retries_count=2, backoff_factor=1.0, validation_timeout_read_sec=900, analytics_timeout_read_sec=300):
             self.base_url = str(base_url).rstrip("/")
             self.timeout = (timeout_connect_sec, timeout_read_sec)
             self.validation_timeout = (timeout_connect_sec, validation_timeout_read_sec)
@@ -1235,9 +1238,9 @@ def get_dhis2_client():
     dhis2_pass = str(st.session_state.get("dhis2_pass", "")).strip()
     dhis2_timeout_connect = _read_int_config_value("DHIS2_TIMEOUT_CONNECT", 10)
     dhis2_timeout_read = _read_int_config_value("DHIS2_TIMEOUT_READ", 90)
-    dhis2_validation_timeout_read = _read_int_config_value(
-        "DHIS2_VALIDATION_TIMEOUT_READ", max(600, dhis2_timeout_read)
-    )
+    dhis2_validation_timeout_read = max(900, _read_int_config_value(
+        "DHIS2_VALIDATION_TIMEOUT_READ", max(900, dhis2_timeout_read)
+    ))
     dhis2_analytics_timeout_read = _read_int_config_value(
         'DHIS2_ANALYTICS_TIMEOUT_READ', max(300, dhis2_timeout_read)
     )
@@ -1552,7 +1555,7 @@ with st.sidebar:
     logout_button = col_disc.button("Se déconnecter", use_container_width=True)
 
     if logout_button:
-        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result", "data_revision", "show_report_preview", "validation_defaults_context"]:
+        for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result", "validation_job", "data_revision", "show_report_preview", "validation_defaults_context"]:
             st.session_state.pop(key, None)
         st.cache_resource.clear()
         st.rerun()
@@ -1570,6 +1573,7 @@ with st.sidebar:
                 st.session_state["dhis2_pass"] = password_input
                 st.session_state['data_revision'] = uuid4().hex
                 st.session_state.pop('categorisation_result', None)
+                st.session_state.pop('validation_job', None)
                 st.session_state.pop('show_report_preview', None)
                 st.session_state.pop('validation_defaults_context', None)
                 st.success(f"Connecté en tant que : {user_input}")
@@ -1588,6 +1592,7 @@ with st.sidebar:
         ):
             st.session_state['data_revision'] = uuid4().hex
             st.session_state.pop('categorisation_result', None)
+            st.session_state.pop('validation_job', None)
             st.session_state.pop('show_report_preview', None)
     else:
         st.info("Veuillez vous connecter via la barre latérale pour accéder aux données.")
@@ -1630,6 +1635,7 @@ with st.sidebar:
     else:
         st.error("Le mois de début doit être avant le mois de fin.")
         st.session_state.pop('categorisation_result', None)
+        st.session_state.pop('validation_job', None)
         st.session_state.pop('show_report_preview', None)
         st.stop()
 
@@ -2155,16 +2161,16 @@ if df_raw is not None:
                 "de la complétude et de la promptitude et ne sont pas ajoutés au total."
             )
         validation_context = (
-            'quality-actions-v6', base_url, current_user_for_cache, id_final,
+            'quality-progress-v7', base_url, current_user_for_cache, id_final,
             validation_start_date, validation_end_date, tuple(validation_months),
             tuple(validation_reference_months), validation_parent_id, target_group_id,
             tuple(validation_zones_df['Zone_ID']),
-            tuple(target_df.columns),
-            int(pd.util.hash_pandas_object(target_df.astype(str), index=True).sum()),
         )
         saved_validation = st.session_state.get("categorisation_result")
         if saved_validation and saved_validation.get("context") != validation_context:
             st.session_state.pop("categorisation_result", None)
+        if st.session_state.get('validation_job', {}).get('context') != validation_context:
+            st.session_state.pop('validation_job', None)
         quality_view_context = (
             id_final, current_user_for_cache, validation_parent_id,
             validation_start_date, validation_end_date, tuple(validation_zones_df['Zone_ID']),
@@ -2234,117 +2240,156 @@ if df_raw is not None:
         )
 
         saved_validation = st.session_state.get('categorisation_result')
-        st.caption("L'analyse DHIS2 peut prendre plusieurs minutes. Le délai de lecture est de 10 minutes par défaut.")
+        effective_validation_timeout = max(900, _read_int_config_value(
+            'DHIS2_VALIDATION_TIMEOUT_READ', max(900, _read_int_config_value('DHIS2_TIMEOUT_READ', 90))
+        ))
+        st.caption(
+            f"Délai de lecture DHIS2 : {effective_validation_timeout} secondes par zone. "
+            "Les résultats sont sauvegardés et affichés après chaque zone traitée."
+        )
+        request_targets = quality_request_targets(validation_zones_df, organisation_catalog)
+        job = st.session_state.get('validation_job')
+        if job and job.get('status') == 'running':
+            job = recover_validation_job(job, request_targets, validation_months, validation_reference_months)
+            st.session_state['validation_job'] = job
+        job_busy = bool(job and job.get('status') == 'running')
         current_action, correction_action = st.columns(2)
         with current_action:
             run_current_analysis = st.button(
                 "Lancer l'analyse des violations",
-                disabled=not validation_dates_valid or validation_zones_df.empty,
+                disabled=not validation_dates_valid or validation_zones_df.empty or job_busy,
                 help="Interroger DHIS2 uniquement pour la période filtrée (M).",
             )
         with correction_action:
             run_correction_check = st.button(
                 "Contrôler les corrections du mois précédent",
-                disabled=not saved_validation,
+                disabled=not saved_validation or job_busy,
                 help="Charger M-1 pour les mêmes unités, afficher ses règles et comparer avec M sans relancer M.",
             )
         run_batch_analysis = st.button(
             "Calculer tous les scores (M et M-1)",
-            disabled=not validation_dates_valid or validation_zones_df.empty,
+            disabled=not validation_dates_valid or validation_zones_df.empty or job_busy,
             help="Analyser chaque DPS ou zone affichée, puis le mois précédent. Une unité indisponible n'efface pas les autres.",
         )
+        resume_analysis = False
+        if job and job.get('status') == 'interrupted':
+            st.warning(
+                "Analyse interrompue. Les réponses déjà reçues sont conservées et affichées. "
+                "Une requête interrompue sans réponse reste indisponible ; elle n'est pas renvoyée automatiquement."
+            )
+            resume_analysis = st.button("Reprendre les zones restantes")
         st.caption(
             "Les trois actions suivent le pays, la province, la zone et les dates sélectionnés. "
-            "Chaque unité est traitée séparément : une erreur sur une unité ne masque pas les autres."
+            "Chaque réponse est conservée avant de passer à la zone suivante."
         )
 
-        if run_current_analysis or run_correction_check or run_batch_analysis:
-            check_previous = run_correction_check or run_batch_analysis
+        action_requested = run_current_analysis or run_correction_check or run_batch_analysis
+        if action_requested:
+            action = 'both' if run_batch_analysis else ('M-1' if run_correction_check else 'M')
+            job = create_validation_job(
+                validation_context, action, (*current_user_for_cache, uuid4().hex),
+                current_batch=saved_validation.get('current_batch') if action == 'M-1' else None,
+            )
+            job['id'] = uuid4().hex
+            job['analysed_at'] = saved_validation['analysed_at'] if action == 'M-1' else datetime.now(KINSHASA_TZ).isoformat(timespec='seconds')
+            job['rule_metadata'] = dict(saved_validation['rule_metadata']) if action == 'M-1' else {}
+            job['unit_metadata'] = dict(saved_validation['unit_metadata']) if action == 'M-1' else {}
+            job['detail_warnings'] = list(saved_validation['detail_warnings']) if action == 'M-1' else []
+            job['enriched_phases'] = ['M'] if action == 'M-1' else []
+            st.session_state['validation_job'] = job
             for key, value in {
                 'validation_detail_search': '', 'validation_detail_importance': 'Toutes',
                 'validation_detail_country': '', 'validation_detail_province': '',
                 'validation_detail_zone': '', 'validation_correction_status': 'Tous',
-                'validation_detail_period': 'Mois précédent (M-1)' if check_previous else 'Période filtrée (M)',
+                'validation_detail_period': 'Mois précédent (M-1)' if action == 'M-1' else 'Période filtrée (M)',
             }.items():
                 st.session_state[key] = value
             st.session_state.pop('validation_selected_row', None)
+        elif resume_analysis:
+            job = resume_validation_job(job)
+            st.session_state['validation_job'] = job
 
-            with st.spinner('Contrôle des corrections en cours...' if run_correction_check else 'Analyse des unités sélectionnées en cours...'):
-                validation_cache_user = (*current_user_for_cache, uuid4().hex)
-                analysis_progress = st.progress(0.0, text="Lecture DHIS2 des unités sélectionnées")
-                validation_labels = labels_for_units(validation_zones_df, 'Zone_ID', 'Zone')
-                request_targets = quality_request_targets(validation_zones_df, organisation_catalog)
-                if run_current_analysis or run_batch_analysis:
-                    current_batch = run_quality_batch(
-                        request_targets, validation_months, target_group_id, get_validation_results,
-                        cache_user=validation_cache_user, start_date=validation_start_date, end_date=validation_end_date,
-                        on_progress=lambda position, total, uid, name: analysis_progress.progress(
-                            0.4 * (position - 1) / total, text=f"M : {position}/{total} — {name}"
-                        ),
+        validation_needs_rerun = False
+        if job and job.get('status') == 'running' and (action_requested or resume_analysis or job.get('auto_continue')):
+            active_phase = job['phase']
+            job['auto_continue'] = False
+            st.session_state['validation_job'] = job
+            analysis_progress = st.progress(0.0, text=f"{active_phase} : lecture de la prochaine zone")
+            def save_validation_checkpoint(checkpoint):
+                st.session_state['validation_job'] = checkpoint
+            job = advance_validation_job(
+                job, request_targets, validation_months, validation_reference_months, target_group_id,
+                get_validation_results, start_date=validation_start_date, end_date=validation_end_date,
+                on_checkpoint=save_validation_checkpoint,
+                on_progress=lambda position, total, uid, name: analysis_progress.progress(
+                    (position - 1) / max(1, total), text=f"{active_phase} : {position}/{total} — {name}"
+                ),
+            )
+            st.session_state['validation_job'] = job
+            analysis_progress.empty()
+            validation_needs_rerun = True
+
+        if job:
+            current_batch = job['batches'].get('M') or {
+                'raw': pd.DataFrame(), 'frames_by_id': {}, 'requests': [], 'processed_ids': [], 'pending_ids': list(request_targets['Zone_ID']),
+            }
+            previous_batch = job['batches'].get('M-1')
+            check_previous = previous_batch is not None
+            checkpoint_key = (
+                job['id'], tuple(current_batch.get('processed_ids', [])),
+                tuple((previous_batch or {}).get('processed_ids', [])), job['status'],
+            )
+            if not saved_validation or saved_validation.get('checkpoint_key') != checkpoint_key:
+                rule_metadata = dict(job.get('rule_metadata', {}))
+                unit_metadata = dict(job.get('unit_metadata', {}))
+                detail_warnings = list(job.get('detail_warnings', []))
+                correction_detail_warnings = []
+                for phase, batch in [('M', current_batch), ('M-1', previous_batch)]:
+                    if not batch or not batch.get('finished') or phase in job.get('enriched_phases', []):
+                        continue
+                    identifiers = validation_detail_identifiers(batch['raw'])
+                    missing_rules = tuple(uid for uid in identifiers['rule_ids'] if uid not in rule_metadata)
+                    missing_units = tuple(uid for uid in identifiers['org_ids'] if uid not in unit_metadata)
+                    if phase == 'M' or missing_rules or missing_units:
+                        new_rules, new_units, warnings = get_validation_detail_metadata(
+                            missing_rules, missing_units, cache_user=current_user_for_cache
+                        )
+                        rule_metadata.update(new_rules)
+                        unit_metadata.update(new_units)
+                        (detail_warnings if phase == 'M' else correction_detail_warnings).extend(warnings)
+                    job.setdefault('enriched_phases', []).append(phase)
+                job.update(rule_metadata=rule_metadata, unit_metadata=unit_metadata, detail_warnings=detail_warnings)
+                st.session_state['validation_job'] = job
+
+                def assign_checkpoint(batch):
+                    leaves, errors, _ = analyse_quality_period(batch, request_targets, unit_metadata)
+                    pending_ids = set(batch.get('pending_ids', []))
+                    for identifier in pending_ids:
+                        errors[identifier] = ['En attente de traitement']
+                    assigned, score_errors, warnings = rollup_period_to_scores(
+                        leaves, errors, request_targets, validation_zones_df
                     )
-                    current_raw = current_batch['raw']
-                    current_requests = current_batch['requests']
-                    current_identifiers = validation_detail_identifiers(current_raw)
-                    rule_metadata, unit_metadata, detail_warnings = get_validation_detail_metadata(
-                        tuple(current_identifiers['rule_ids']), tuple(current_identifiers['org_ids']),
-                        cache_user=current_user_for_cache,
-                    )
-                    current_leaves, current_request_errors, _ = analyse_quality_period(
-                        current_batch, request_targets, unit_metadata
-                    )
-                    current_assigned, current_errors, validation_warnings = rollup_period_to_scores(
-                        current_leaves, current_request_errors, request_targets, validation_zones_df
-                    )
+                    # Les unités en attente restent inconnues, sans être annoncées comme une panne.
+                    warnings = [message for message in warnings if 'En attente de traitement' not in message]
+                    return assigned, errors, score_errors, warnings
+
+                current_raw = current_batch['raw']
+                current_requests = current_batch['requests']
+                current_assigned, current_request_errors, current_errors, validation_warnings = assign_checkpoint(current_batch)
+                if job['action'] == 'M-1' and saved_validation:
+                    violations_details = saved_validation['violations']
+                else:
                     violations_details = enrich_detail_geography(
                         build_validation_details(current_assigned, rule_metadata, unit_metadata),
                         current_assigned, organisation_catalog, unit_metadata,
                     )
-                    analysed_at = datetime.now(KINSHASA_TZ).isoformat(timespec='seconds')
-                else:
-                    current_raw = saved_validation['current_raw']
-                    current_assigned = saved_validation['current_assigned']
-                    current_errors = saved_validation['current_errors']
-                    current_request_errors = saved_validation['current_request_errors']
-                    current_requests = saved_validation['current_requests']
-                    validation_warnings = list(saved_validation['validation_warnings'])
-                    violations_details = saved_validation['violations']
-                    rule_metadata = dict(saved_validation['rule_metadata'])
-                    unit_metadata = dict(saved_validation['unit_metadata'])
-                    detail_warnings = list(saved_validation['detail_warnings'])
-                    analysed_at = saved_validation['analysed_at']
-
-                previous_raw = pd.DataFrame()
-                previous_assigned = None
+                previous_raw, previous_assigned = pd.DataFrame(), None
                 previous_details = build_validation_details(pd.DataFrame())
-                previous_errors = {}
-                previous_requests = []
-                correction_warnings = []
-                correction_detail_warnings = []
+                previous_errors, previous_requests, correction_warnings = {}, [], []
                 if check_previous:
-                    previous_batch = run_quality_batch(
-                        request_targets, validation_reference_months, target_group_id, get_validation_results,
-                        cache_user=validation_cache_user, label='M-1',
-                        on_progress=lambda position, total, uid, name: analysis_progress.progress(
-                            0.4 + 0.4 * (position - 1) / total, text=f"M-1 : {position}/{total} — {name}"
-                        ),
-                    )
                     previous_raw = previous_batch['raw']
                     previous_requests = previous_batch['requests']
-                    identifiers = validation_detail_identifiers(previous_raw)
-                    missing_rules = tuple(uid for uid in identifiers['rule_ids'] if uid not in rule_metadata)
-                    missing_units = tuple(uid for uid in identifiers['org_ids'] if uid not in unit_metadata)
-                    if missing_rules or missing_units:
-                        previous_rules, previous_units, correction_detail_warnings = get_validation_detail_metadata(
-                            missing_rules, missing_units, cache_user=current_user_for_cache
-                        )
-                        rule_metadata.update(previous_rules)
-                        unit_metadata.update(previous_units)
-                    previous_leaves, previous_request_errors, _ = analyse_quality_period(
-                        previous_batch, request_targets, unit_metadata
-                    )
-                    previous_assigned, previous_errors, correction_warnings = rollup_period_to_scores(
-                        previous_leaves, previous_request_errors, request_targets, validation_zones_df
-                    )
+                    previous_assigned, previous_request_errors, previous_errors, correction_warnings = assign_checkpoint(previous_batch)
                     previous_with_status = mark_previous_corrections(
                         previous_assigned, current_assigned, current_request_errors, build_violation_signatures
                     )
@@ -2353,15 +2398,16 @@ if df_raw is not None:
                         previous_with_status, organisation_catalog, unit_metadata,
                     )
                     previous_details[CORRECTION_COL] = previous_with_status[CORRECTION_COL].to_numpy()
-
+                    if not saved_validation or not saved_validation.get('corrections_checked'):
+                        st.session_state['validation_detail_period'] = 'Mois précédent (M-1)'
                 comparison_rows = build_validation_comparison_rows(
                     validation_zones_df, current_assigned, current_errors, previous_assigned, previous_errors,
                     signature_function=build_violation_signatures,
                 )
                 rows_cat = build_quality_rows(quality_metrics, validation_zones_df, comparison_rows)
-                analysis_progress.progress(1.0, text=f"{len(validation_zones_df)} unité(s) traitée(s)")
                 st.session_state['categorisation_result'] = {
-                    'context': validation_context, 'data': rows_cat,
+                    'context': validation_context, 'checkpoint_key': checkpoint_key,
+                    'data': rows_cat, 'current_batch': current_batch,
                     'violations': violations_details, 'previous_violations': previous_details,
                     'current_raw': current_raw, 'current_assigned': current_assigned,
                     'current_errors': current_errors, 'current_requests': current_requests,
@@ -2389,12 +2435,34 @@ if df_raw is not None:
                         'Mois des indicateurs de déclaration': validation_period_id,
                         'Période de référence M-1': ';'.join(validation_reference_months),
                         'Contrôle des corrections': (
-                            'Partiel' if correction_warnings else 'Effectué'
+                            'En cours' if not previous_batch.get('finished') else ('Partiel' if correction_warnings else 'Effectué')
                         ) if check_previous else 'Non effectué',
                     },
-                    'analysed_at': analysed_at,
+                    'analysed_at': job['analysed_at'],
                 }
-                st.rerun()
+
+            if job['status'] == 'running':
+                st.info("Analyse en cours : les résultats reçus sont déjà affichés ci-dessous.")
+            elif job['status'] == 'complete':
+                any_failures = any(
+                    not success for batch in job['batches'].values() if batch
+                    for success in batch.get('succeeded_by_id', {}).values()
+                )
+                if any_failures:
+                    st.warning("Analyse terminée avec des unités indisponibles. Les résultats reçus sont conservés ; consultez les diagnostics.")
+                else:
+                    st.success("Analyse terminée. Les résultats des zones traitées sont affichés ci-dessous.")
+            request_labels = labels_for_units(request_targets, 'Zone_ID', 'Zone')
+            for phase, batch in job['batches'].items():
+                if not batch:
+                    continue
+                completed = len(batch.get('processed_ids', []))
+                failed = sum(not value for value in batch.get('succeeded_by_id', {}).values())
+                pending_ids = batch.get('pending_ids', [])
+                st.caption(f"{phase} : {completed}/{len(request_targets)} zone(s) traitée(s), {failed} indisponible(s), {len(pending_ids)} en attente.")
+                if pending_ids:
+                    with st.expander(f"Zones en attente ({phase})"):
+                        st.text('\n'.join(request_labels[uid] for uid in pending_ids if uid in request_labels))
 
         saved_validation = st.session_state.get('categorisation_result')
         if validation_dates_valid and not validation_zones_df.empty:
@@ -2474,17 +2542,17 @@ if df_raw is not None:
             analysed_at = saved_validation.get('analysed_at')
             if analysed_at:
                 st.caption(f"Analyse effectuée le {datetime.fromisoformat(analysed_at).strftime('%d/%m/%Y à %H:%M:%S')} (Kinshasa).")
-            if not saved_validation.get('current_analysis_succeeded', False):
+            if not saved_validation.get('current_analysis_succeeded', False) and not (job and job.get('status') == 'running'):
                 st.error(
                     "L'analyse DHIS2 de la période M a échoué. Consultez les erreurs détaillées ci-dessous. "
                     "M-1 peut être consulté séparément ; les corrections exigent des données disponibles pour les deux périodes."
                 )
-            if not saved_validation.get('corrections_checked', False):
+            if not saved_validation.get('corrections_checked', False) and not (job and job.get('status') == 'running'):
                 st.info(
                     "La période filtrée M est affichée. Pour renseigner M-1, les corrections et le total /100, "
                     "cliquez sur « Contrôler les corrections du mois précédent »."
                 )
-            else:
+            elif saved_validation.get('corrections_checked', False):
                 corrections_checked_at = saved_validation.get('corrections_checked_at')
                 if corrections_checked_at:
                     st.caption(
@@ -2834,5 +2902,11 @@ if df_raw is not None:
                     df_previous_violations_export.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
                     .map(style_importance, subset=['Importance']), use_container_width=True, hide_index=True,
                 )
+    if validation_needs_rerun:
+        active_job = st.session_state.get('validation_job')
+        if active_job and active_job.get('status') == 'running':
+            active_job['auto_continue'] = True
+            st.session_state['validation_job'] = active_job
+        st.rerun()
 else:
     st.error("❌ Données indisponibles.")

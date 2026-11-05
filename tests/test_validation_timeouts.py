@@ -29,10 +29,10 @@ class ValidationTimeoutTests(unittest.TestCase):
         client.get('analytics', params={'dimension': 'ou:ZoneAAAAAAA'})
         client.get('validationRules')
         self.assertEqual([call.kwargs['timeout'] for call in session.request.call_args_list], [
-            (10, 600), (10, 90), (10, 300), (10, 90),
+            (10, 900), (10, 90), (10, 300), (10, 90),
         ])
         self.assertEqual(client.timeout, (10, 90))
-        self.assertEqual(client.validation_timeout, (10, 600))
+        self.assertEqual(client.validation_timeout, (10, 900))
         self.assertEqual(client.analytics_timeout, (10, 300))
 
     def test_legacy_get_analysis_uses_the_same_extended_budget(self):
@@ -70,8 +70,8 @@ class ValidationTimeoutTests(unittest.TestCase):
         self.assertEqual(kwargs['validation_timeout_read'], 1200)
         self.assertEqual(kwargs['timeout_connect'], 10)
 
-    def test_default_wait_is_ten_minutes_and_preserves_a_larger_existing_budget(self):
-        for generic, expected in [(None, 600), ('120', 600), ('900', 900)]:
+    def test_default_wait_is_fifteen_minutes_and_preserves_a_larger_existing_budget(self):
+        for generic, expected in [(None, 900), ('120', 900), ('900', 900), ('1200', 1200)]:
             with self.subTest(generic=generic):
                 kwargs = self.configured_client({
                     'DHIS2_URL': 'https://fixture.invalid', 'DHIS2_TIMEOUT_READ': generic,
@@ -84,7 +84,13 @@ class ValidationTimeoutTests(unittest.TestCase):
                 kwargs = self.configured_client({
                     'DHIS2_URL': 'https://fixture.invalid', 'DHIS2_VALIDATION_TIMEOUT_READ': value,
                 })
-                self.assertEqual(kwargs['validation_timeout_read'], 600)
+                self.assertEqual(kwargs['validation_timeout_read'], 900)
+
+    def test_old_six_hundred_second_setting_is_raised_to_the_new_minimum(self):
+        kwargs = self.configured_client({
+            'DHIS2_URL': 'https://fixture.invalid', 'DHIS2_VALIDATION_TIMEOUT_READ': '600',
+        })
+        self.assertEqual(kwargs['validation_timeout_read'], 900)
 
 
 if __name__ == '__main__':

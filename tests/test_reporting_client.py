@@ -43,7 +43,7 @@ class ReportingClientTests(unittest.TestCase):
             client.get('organisationUnits')
             client.post('dataAnalysis/validationRules', data={'ou': 'ZoneAAAAAAA'})
         self.assertEqual([call.kwargs['timeout'] for call in request.call_args_list], [
-            (10, 300), (10, 90), (10, 600),
+            (10, 300), (10, 90), (10, 900),
         ])
         self.assertEqual(client.session.auth, ('fixture-user', 'fixture-password'))
         self.assertEqual(client.session.headers['Accept'], 'application/json')

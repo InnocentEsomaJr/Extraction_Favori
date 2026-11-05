@@ -6,6 +6,7 @@ import pandas as pd
 
 from geography import build_geography_catalog
 from quality_batch import run_quality_batch
+from quality_analysis import analyse_quality_period, build_validation_comparison_rows
 from quality_scope import assign_quality_units, quality_target_catalog
 
 
@@ -153,6 +154,111 @@ class QualityBatchTests(unittest.TestCase):
         self.assertTrue(result['succeeded_by_id']['ZoneCCCCCCC'])
         self.assertNotIn('private credential value', str(result))
         self.assertEqual(result['requests'][1]['Statut'], 'Partiel')
+
+    def test_one_target_step_saves_its_reply_and_leaves_pending_counts_unknown(self):
+        fetch = mock.Mock(return_value=pd.DataFrame())
+        checkpoint = mock.Mock()
+        result = run_quality_batch(
+            self.targets, ['202609'], None, fetch, max_targets=1, on_result=checkpoint,
+        )
+        fetch.assert_called_once_with('ZoneAAAAAAA', ['202609'], None, cache_user=None)
+        self.assertEqual(result['processed_ids'], ['ZoneAAAAAAA'])
+        self.assertEqual(result['pending_ids'], ['ZoneBBBBBBB', 'ZoneCCCCCCC'])
+        self.assertFalse(result['finished'])
+        self.assertFalse(result['complete'])
+        self.assertEqual(checkpoint.call_count, 1)
+        self.assertEqual(checkpoint.call_args.args[0]['processed_ids'], ['ZoneAAAAAAA'])
+        assigned, errors, _ = analyse_quality_period(result, self.targets)
+        compared = build_validation_comparison_rows(self.targets, assigned, errors).set_index('Zone_ID')
+        self.assertEqual(compared.loc['ZoneAAAAAAA', 'Violations_Actuelles'], 0)
+        self.assertTrue(compared.loc[['ZoneBBBBBBB', 'ZoneCCCCCCC'], 'Violations_Actuelles'].isna().all())
+
+    def test_interruption_on_seventh_zone_keeps_six_replies_and_resumes_at_seventh(self):
+        targets = pd.DataFrame([
+            {'Zone_ID': f'Zone{number:07d}', 'Zone': f'ZS {number}'} for number in range(1, 9)
+        ])
+        checkpoints = []
+        fetch = mock.Mock(side_effect=[pd.DataFrame() for _ in range(6)] + [KeyboardInterrupt()])
+        with self.assertRaises(KeyboardInterrupt):
+            run_quality_batch(targets, ['202609'], None, fetch, on_result=checkpoints.append)
+        self.assertEqual(fetch.call_count, 7)
+        self.assertEqual(len(checkpoints), 6)
+        saved = checkpoints[-1]
+        self.assertEqual(saved['processed_ids'], targets['Zone_ID'].tolist()[:6])
+        self.assertEqual(saved['pending_ids'], targets['Zone_ID'].tolist()[6:])
+        self.assertFalse(saved['finished'])
+        resume = mock.Mock(return_value=pd.DataFrame())
+        result = run_quality_batch(targets, ['202609'], None, resume, initial_state=saved)
+        self.assertEqual([call.args[0] for call in resume.call_args_list], targets['Zone_ID'].tolist()[6:])
+        self.assertEqual(len(result['requests']), 8)
+        self.assertEqual(len(set(result['processed_ids'])), 8)
+        self.assertEqual(result['pending_ids'], [])
+        self.assertTrue(result['finished'])
+        self.assertTrue(result['complete'])
+
+    def test_resuming_does_not_retry_an_already_failed_target(self):
+        failed = pd.DataFrame()
+        failed.attrs = {'failed_periods': ['202609'], 'errors': {'202609': ['HTTP 504']}}
+        initial = run_quality_batch(
+            self.targets, ['202609'], None, mock.Mock(return_value=failed), max_targets=1,
+        )
+        resume = mock.Mock(return_value=pd.DataFrame())
+        result = run_quality_batch(self.targets, ['202609'], None, resume, initial_state=initial)
+        self.assertEqual([call.args[0] for call in resume.call_args_list], ['ZoneBBBBBBB', 'ZoneCCCCCCC'])
+        self.assertFalse(result['succeeded_by_id']['ZoneAAAAAAA'])
+        self.assertIn('HTTP 504', result['warnings'][0])
+        self.assertTrue(result['finished'])
+        self.assertFalse(result['complete'])
+        already_finished_fetch = mock.Mock(side_effect=AssertionError('Aucune relance attendue'))
+        final = run_quality_batch(self.targets, ['202609'], None, already_finished_fetch, initial_state=result)
+        already_finished_fetch.assert_not_called()
+        self.assertEqual(final['processed_ids'], result['processed_ids'])
+
+    def test_resume_filters_foreign_targets_and_never_reuses_another_period(self):
+        rows = pd.DataFrame([{'organisationUnitId': 'CentreAAAAA'}])
+        initial = run_quality_batch(self.targets, ['202609'], None, mock.Mock(return_value=rows))
+        focused = self.targets.iloc[[1]]
+        fetch = mock.Mock(side_effect=AssertionError('La cible existe déjà'))
+        result = run_quality_batch(focused, ['202609'], None, fetch, initial_state=initial)
+        fetch.assert_not_called()
+        self.assertEqual(list(result['frames_by_id']), ['ZoneBBBBBBB'])
+        self.assertEqual(result['raw']['_analysis_target_id'].tolist(), ['ZoneBBBBBBB'])
+        self.assertEqual([row['Unité parent'] for row in result['requests']], ['ZoneBBBBBBB'])
+        next_period = mock.Mock(return_value=pd.DataFrame())
+        replaced = run_quality_batch(focused, ['202610'], None, next_period, initial_state=initial)
+        next_period.assert_called_once_with('ZoneBBBBBBB', ['202610'], None, cache_user=None)
+        self.assertTrue(replaced['raw'].empty)
+        self.assertEqual(replaced['context']['periods'], ['202610'])
+
+    def test_checkpoints_and_restored_frames_are_deep_copies(self):
+        rows = pd.DataFrame([{'organisationUnit': {'id': 'CentreAAAAA'}}])
+        rows.attrs = {'metadata': {'name': 'Source'}}
+        saved = []
+
+        def change_snapshot(snapshot):
+            saved.append(snapshot)
+            snapshot['frames_by_id']['ZoneAAAAAAA'].iloc[0]['organisationUnit']['id'] = 'MutatedFrame'
+            snapshot['frames_by_id']['ZoneAAAAAAA'].attrs['metadata']['name'] = 'MutatedMetadata'
+            snapshot['raw'].iloc[0]['organisationUnit']['id'] = 'MutatedRaw'
+
+        result = run_quality_batch(
+            self.targets.iloc[:1], ['202609'], None, mock.Mock(return_value=rows), on_result=change_snapshot,
+        )
+        self.assertEqual(result['frames_by_id']['ZoneAAAAAAA'].iloc[0]['organisationUnit']['id'], 'CentreAAAAA')
+        self.assertEqual(result['frames_by_id']['ZoneAAAAAAA'].attrs['metadata']['name'], 'Source')
+        self.assertEqual(rows.iloc[0]['organisationUnit']['id'], 'CentreAAAAA')
+        initial_before = result['frames_by_id']['ZoneAAAAAAA'].iloc[0]['organisationUnit']['id']
+        restored = run_quality_batch(self.targets.iloc[:1], ['202609'], None, mock.Mock(), initial_state=result)
+        restored['frames_by_id']['ZoneAAAAAAA'].iloc[0]['organisationUnit']['id'] = 'RestoredMutation'
+        self.assertEqual(result['frames_by_id']['ZoneAAAAAAA'].iloc[0]['organisationUnit']['id'], initial_before)
+
+    def test_invalid_step_limit_is_rejected_before_fetching(self):
+        for value in [0, -1, True, 1.5]:
+            with self.subTest(value=value):
+                fetch = mock.Mock()
+                with self.assertRaises(ValueError):
+                    run_quality_batch(self.targets, ['202609'], None, fetch, max_targets=value)
+                fetch.assert_not_called()
 
 
 if __name__ == '__main__':
