@@ -82,7 +82,7 @@ class DashboardSummaryMetricsTests(unittest.TestCase):
         rows = build_quality_rows(metrics, self.targets())
         calculated = calculer_categorisation(rows, profil='ZS')
         self.assertEqual(calculated.iloc[0]['Score_Qualite'], 84)
-        self.assertEqual(calculated.iloc[0]['Score de qualité /20'], 15)
+        self.assertEqual(calculated.iloc[0]['Note moyenne des taux /20'], 15)
 
     def test_summary_explicit_ids_resolve_homonyms_without_using_other_zone_values(self):
         source = pd.DataFrame([self.raw(), self.raw('ZoneBBBBBBB')])

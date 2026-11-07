@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 
-QUALITY_NOTE_COL = "Score de qualité /20"
+QUALITY_NOTE_COL = "Note moyenne des taux /20"
 COMPONENT_COLS = [
     "Score complétude /20",
     "Score promptitude /20",
@@ -13,7 +13,7 @@ COMPONENT_COLS = [
     "Score corrections /20",
 ]
 NOTE_COLS = [QUALITY_NOTE_COL, *COMPONENT_COLS]
-TOTAL_COL = "Score catégorisation /100"
+TOTAL_COL = "Score qualité /100"
 DATASET_COUNT_COL = "Nombre de datasets complétude ≥95 %"
 REMAINING_COL = "Règles restantes (M-1 -> M)"
 INTEGER_COLS = [
@@ -115,6 +115,10 @@ def calculer_categorisation(df, profil="Automatique"):
     correction_counts_valid = previous.notna() & corrected.notna() & corrected.le(previous)
     correction_valid = correction_counts_valid & correction_checked & ~errors & ~correction_errors
     remaining = (previous - corrected).clip(lower=0).where(correction_valid)
+    # Le critère M-1 est strict : toute violation de la période précédente
+    # vaut zéro, même si elle ne réapparaît pas en M. La comparaison ci-dessus
+    # reste disponible comme diagnostic, sans modifier la note du critère.
+    previous_valid = previous.notna() & correction_checked & ~correction_errors
 
     result["Ratio_Violations_sur_100"] = current / actual.where(actual.gt(0)) * 100
     result[QUALITY_NOTE_COL] = score_taux(_column(result, "Score_Qualite"))
@@ -125,8 +129,8 @@ def calculer_categorisation(df, profil="Automatique"):
     result[COMPONENT_COLS[1]] = score_taux(_column(result, "Promptitude_Globale"))
     result[COMPONENT_COLS[2]] = score_datasets(counts, profiles)
     result[COMPONENT_COLS[3]] = score_violations(result["Ratio_Violations_sur_100"]).where(~errors)
-    correction_score = pd.Series(np.where(remaining.eq(0), 20, 0), index=result.index, dtype=float)
-    result[COMPONENT_COLS[4]] = correction_score.where(remaining.notna())
+    correction_score = pd.Series(np.where(previous.eq(0), 20, 0), index=result.index, dtype=float)
+    result[COMPONENT_COLS[4]] = correction_score.where(previous_valid)
     result[TOTAL_COL] = result[COMPONENT_COLS].sum(axis=1, min_count=len(COMPONENT_COLS))
 
     reasons = [
@@ -140,8 +144,8 @@ def calculer_categorisation(df, profil="Automatique"):
         (~correction_checked, "contrôle des corrections non effectué"),
         (correction_checked & correction_errors, "contrôle des corrections indisponible"),
         (
-            correction_checked & ~errors & ~correction_errors & ~correction_counts_valid,
-            "comparaison des corrections indisponible ou incohérente",
+            correction_checked & ~correction_errors & previous.isna(),
+            "violations de la période précédente indisponibles",
         ),
     ]
     statuses = []
@@ -177,8 +181,8 @@ def build_baremes_df():
         ("Plus de 15 à 20", 5), ("Plus de 20", 0),
     ]:
         add("Violations /100 rapports", "Tous", condition, points)
-    add("Corrections", "Tous", "Aucune règle restante", 20)
-    add("Corrections", "Tous", "Au moins une règle restante", 0)
+    add("Corrections", "Tous", "Aucune règle violée en M-1", 20)
+    add("Corrections", "Tous", "Au moins une règle violée en M-1, même corrigée en M", 0)
     return pd.DataFrame(rows)
 
 
@@ -203,7 +207,7 @@ def style_note_20(value):
 
 def style_context_tab5():
     return {
-        "taux_cols": ["Complétude globale (%)", "Promptitude globale (%)", "Score de qualité", TOTAL_COL],
+        "taux_cols": ["Complétude globale (%)", "Promptitude globale (%)", "Moyenne complétude / promptitude (%)", TOTAL_COL],
         "note_cols": NOTE_COLS.copy(),
         "int_cols": INTEGER_COLS.copy(),
         "highlight_max_cols": ["Règles violées (M)"],

@@ -113,7 +113,7 @@ class DashboardReportingLoadTests(unittest.TestCase):
             self.assertEqual(frame.loc['ZS Commune', 'Promptitude globale (%)'], 68)
             self.assertEqual(frame.loc['ZS Commune', 'Reports_Actual'], 9)
             self.assertEqual(frame.loc['ZS Commune', 'Nombre de datasets complétude ≥95 %'], 9)
-            self.assertEqual(frame.loc['ZS Commune', 'Score de qualité'], 84)
+            self.assertEqual(frame.loc['ZS Commune', 'Moyenne complétude / promptitude (%)'], 84)
             self.assertTrue(frame[TOTAL_COL].isna().all())
             queries = list(app.session_state['_reporting_queries'])
             self.assertEqual(Counter(query['units'] for query in queries), {'ZoneAAAAAAA': 1, 'ZoneBBBBBBB': 1})
@@ -127,7 +127,7 @@ class DashboardReportingLoadTests(unittest.TestCase):
             self.assertEqual(selected['Zone de santé'].tolist(), ['ZS B'])
             self.assertEqual(selected['Reports_Actual'].tolist(), [18])
             self.assertEqual(selected['Promptitude globale (%)'].tolist(), [80])
-            self.assertEqual(selected['Score de qualité'].tolist(), [90])
+            self.assertEqual(selected['Moyenne complétude / promptitude (%)'].tolist(), [90])
             self.assertEqual(list(app.session_state['_reporting_queries']), queries)
 
     def test_failed_unit_is_missing_and_successful_unit_cache_survives_scope_changes(self):
@@ -138,7 +138,7 @@ class DashboardReportingLoadTests(unittest.TestCase):
             self.assertEqual(frame.loc['ZS Commune', 'Reports_Actual'], 9)
             missing_columns = [
                 'Complétude globale (%)', 'Promptitude globale (%)', 'Reports_Actual',
-                'Nombre de datasets complétude ≥95 %', 'Score de qualité', TOTAL_COL,
+                'Nombre de datasets complétude ≥95 %', 'Moyenne complétude / promptitude (%)', TOTAL_COL,
             ]
             self.assertTrue(frame.loc['ZS B', missing_columns].isna().all())
             self.assertTrue(any(button.label == "Lancer l'analyse des violations" for button in app.button))
@@ -168,14 +168,14 @@ class DashboardReportingLoadTests(unittest.TestCase):
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
             self.run_app(app)
             self.assertEqual(len(app.tabs), 5)
-            self.assertTrue(self.scores(app)[['Complétude globale (%)', 'Reports_Actual', 'Score de qualité']].isna().all().all())
+            self.assertTrue(self.scores(app)[['Complétude globale (%)', 'Reports_Actual', 'Moyenne complétude / promptitude (%)']].isna().all().all())
             self.assertFalse(any('Données indisponibles.' in str(item.value) for item in app.error))
             self.assert_no_technical_exception(app)
             self.widget(app, 'button', "Lancer l'analyse des violations").click()
             self.run_app(app)
             self.assertEqual({query['ou'] for query in app.session_state['_reporting_validation_queries']}, {'ZoneAAAAAAA', 'ZoneBBBBBBB'})
             self.assertEqual(self.scores(app)['Règles violées (M)'].tolist(), [0, 0])
-            self.assertTrue(self.scores(app)[['Complétude globale (%)', 'Reports_Actual', 'Score de qualité']].isna().all().all())
+            self.assertTrue(self.scores(app)[['Complétude globale (%)', 'Reports_Actual', 'Moyenne complétude / promptitude (%)']].isna().all().all())
             self.assert_no_technical_exception(app)
 
 

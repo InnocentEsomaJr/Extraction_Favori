@@ -419,8 +419,8 @@ class DashboardValidationDetailTests(unittest.TestCase):
             pd.testing.assert_frame_equal(checked["violations"], current_source)
             for column in [
                 "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
-                "Règles violées (M)", "Ratio / 100 rapports", "Score de qualité",
-                "Score de qualité /20", "Score violations /20",
+                "Règles violées (M)", "Ratio / 100 rapports", "Moyenne complétude / promptitude (%)",
+                "Note moyenne des taux /20", "Score violations /20",
             ]:
                 pd.testing.assert_series_equal(summary[column], current[column])
             self.assertEqual(summary["Règles violées (M-1)"].tolist(), [0, 0, 0])
@@ -472,8 +472,8 @@ class DashboardValidationDetailTests(unittest.TestCase):
             pd.testing.assert_frame_equal(self.detail_view(app), details)
             for column in [
                 "Complétude globale (%)", "Promptitude globale (%)", "Reports_Actual",
-                "Règles violées (M)", "Ratio / 100 rapports", "Score de qualité",
-                "Score de qualité /20", "Score violations /20",
+                "Règles violées (M)", "Ratio / 100 rapports", "Moyenne complétude / promptitude (%)",
+                "Note moyenne des taux /20", "Score violations /20",
             ]:
                 pd.testing.assert_series_equal(summary[column], current[column])
             self.assertTrue(summary["Règles violées (M-1)"].isna().all())

@@ -10,7 +10,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from categorisation import (
-    NOTE_COLS, TOTAL_COL, build_baremes_df, calculer_categorisation,
+    NOTE_COLS, QUALITY_NOTE_COL, TOTAL_COL, build_baremes_df, calculer_categorisation,
     style_context_tab5, style_note_20,
 )
 from reporting_metrics import (
@@ -18,6 +18,7 @@ from reporting_metrics import (
     reporting_quality_warnings,
 )
 from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
+from quality_datasets import quality_dataset_selection, select_quality_datasets
 from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
 from validation_job import (
@@ -239,12 +240,12 @@ def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de 
         'Violations_Corrigees': 'Règles corrigées (M-1 -> M)',
         'Violations_Actuelles': 'Règles violées (M)',
         'Ratio_Violations_sur_100': 'Ratio / 100 rapports',
-        'Score_Qualite': 'Score de qualité',
+        'Score_Qualite': 'Moyenne complétude / promptitude (%)',
     }
     added_columns = [
-        'Score de qualité /20', 'Barème datasets',
+        QUALITY_NOTE_COL, 'Barème datasets',
         'Nombre de datasets complétude ≥95 %', 'Règles restantes (M-1 -> M)',
-        *[c for c in NOTE_COLS if c != 'Score de qualité /20'],
+        *[c for c in NOTE_COLS if c != QUALITY_NOTE_COL],
         TOTAL_COL, 'Statut catégorisation',
     ]
     df_display = df_cat[list(historical_columns) + added_columns].rename(columns=historical_columns)
@@ -259,7 +260,8 @@ def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de 
     df_display = df_display[ordered_columns + [column for column in df_display if column not in ordered_columns]]
     st.caption(
         "Score qualité /100 = complétude + promptitude + datasets + violations /100 rapports + corrections de M-1. "
-        "Chaque critère est noté sur 20. Le score de qualité historique (moyenne des deux taux) est conservé à droite."
+        "Chaque critère est noté sur 20 : le total vaut 0, 5, 10, …, 100. "
+        "M-1 : aucune violation = 20/20 ; au moins une violation = 0/20, même si elle est corrigée en M."
     )
     view_query = st.text_input("Rechercher une zone" if unit_label == 'Zone de santé' else "Rechercher une DPS", key="categorisation_search")
     view_left, view_right = st.columns(2)
@@ -282,10 +284,10 @@ def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de 
             TOTAL_COL: st.column_config.NumberColumn(
                 "Score qualité /100", help="Somme des cinq notes sur 20.", format="%.0f",
             ),
-            'Score de qualité': st.column_config.NumberColumn(
-                "Moyenne des deux taux (%)", help="Moyenne historique de la complétude et de la promptitude, distincte du total /100.",
+            'Moyenne complétude / promptitude (%)': st.column_config.NumberColumn(
+                help="Moyenne de la complétude et de la promptitude, distincte du score qualité /100.",
             ),
-            'Score de qualité /20': st.column_config.NumberColumn(
+            QUALITY_NOTE_COL: st.column_config.NumberColumn(
                 "Note de la moyenne /20", help="Repère historique, exclu de la somme des cinq critères.", format="%.0f",
             ),
         },
@@ -495,9 +497,9 @@ def build_dashboard_comments_df(
             "Element": "Onglet 5 - Tableau Catégorisation",
             "Commentaire": (
                 "Le tableau compare M-1 et M: règles violées, règles corrigées et ratio /100 rapports. "
-                "Le score de catégorisation /100 additionne les notes de complétude, promptitude, "
-                "datasets à complétude >=95%, violations et corrections. "
-                "Le score de qualité historique reste distinct de ce total. "
+                "Le Score qualité /100 additionne les notes de complétude, promptitude, "
+                "datasets à complétude >=95%, violations actuelles et absence de violations en M-1. "
+                "La moyenne des deux taux reste un indicateur distinct. "
                 "Les barèmes DPS/ZS sont détaillés dans la feuille Baremes_Categorisation."
             )
         },
@@ -519,7 +521,7 @@ def build_dashboard_comments_df(
                 "Element": "Onglet 5 - Lecture décisionnelle",
                 "Commentaire": (
                     "Comparer d'abord 'Règles violées (M)' puis 'Règles corrigées (M-1 -> M)'. "
-                    "La note des corrections vaut 20 si aucune violation de M-1 ne reste à corriger. "
+                    "La note M-1 vaut 20 si cette période ne contient aucune violation, sinon 0, même après correction en M. "
                     "Une note ou un total vide indique une donnée indisponible, précisée dans le statut."
                 )
             }
@@ -1281,14 +1283,36 @@ def get_reporting_visualization(favori_id, cache_user=None):
     )
 
 @st.cache_data(ttl=3600)
+def get_quality_dataset_options(favori_id, cache_user=None):
+    """Identifie les datasets évalués depuis les métadonnées DHIS2 accessibles."""
+    visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
+    try:
+        catalog = get_dhis2_client().get(
+            'dataSets', params={'fields': 'id,displayName,name', 'paging': 'false'},
+        )
+        if not isinstance(catalog, dict) or not isinstance(catalog.get('dataSets'), list):
+            raise ValueError('Catalogue des datasets invalide')
+    except Exception:
+        selection = quality_dataset_selection(visualization, surveillance_name='1y-Surveillance épidémiologique')
+        selection['warnings'].append(
+            "Le catalogue DHIS2 des datasets est indisponible : impossible de vérifier "
+            "si la surveillance manque dans le favori."
+        )
+        return selection
+    return quality_dataset_selection(visualization, catalog, surveillance_name='1y-Surveillance épidémiologique')
+
+@st.cache_data(ttl=3600)
 def get_cached_analytics(params, cache_user=None):
     response = get_dhis2_client().get('analytics.json', params=list(params))
     analytics_to_reporting_frame(response)
     return response
 
-def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=None, quality=False):
+def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=None, quality=False, dataset_ids=None):
     """Répartit Analytics par unité ; seules les réponses réussies sont gardées une heure."""
     visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
+    if quality and dataset_ids is not None:
+        options = get_quality_dataset_options(favori_id, cache_user=cache_user)
+        visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
     builder = build_quality_reporting_query if quality else build_analytics_query
     params, labels = builder(visualization, period, ou_dimension)
     class CachedAnalytics:
@@ -1344,13 +1368,14 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_id
         return None
 
 @st.cache_data(ttl=60)
-def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None):
-    """Charge les cinq mesures de déclaration des datasets du favori, sans analyse de règles."""
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None, dataset_ids=None):
+    """Charge les cinq mesures des datasets évalués, sans analyse de règles."""
     _ = cache_user
     try:
         if ou_dimension and unit_ids is not None:
             result = load_reporting_for_units(
-                favori_id, period, ou_dimension, unit_ids, cache_user=cache_user, quality=True
+                favori_id, period, ou_dimension, unit_ids, cache_user=cache_user, quality=True,
+                dataset_ids=dataset_ids,
             )
             result.attrs['quality_warnings'] = list(result.attrs.get('reporting_warnings', []))
             return result
@@ -1359,9 +1384,12 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             f"visualizations/{favori_id}",
             params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
         )
+        if dataset_ids is not None:
+            options = get_quality_dataset_options(favori_id, cache_user=cache_user)
+            visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
         params, labels = build_quality_reporting_query(visualization, period, ou_dimension)
         result = analytics_to_reporting_frame(dhis.get('analytics.json', params=params), labels)
-        result.attrs['quality_source'] = 'Reporting DHIS2 des datasets du favori'
+        result.attrs['quality_source'] = 'Reporting DHIS2 des datasets évalués'
         return result
     except ValueError as error:
         warning = str(error)
@@ -2153,12 +2181,54 @@ if df_raw is not None:
             ["Automatique", "DPS", "ZS"],
             help="Automatique utilise le niveau DHIS2 : province = DPS, zone de santé = ZS."
         )
+        quality_dataset_options = None
+        quality_dataset_ids = None
+        quality_dataset_context = (id_final, current_user_for_cache)
+        if st.session_state.get('quality_dataset_context') != quality_dataset_context:
+            st.session_state['quality_dataset_context'] = quality_dataset_context
+            st.session_state.pop('quality_evaluation_datasets', None)
+        try:
+            quality_dataset_options = get_quality_dataset_options(id_final, cache_user=current_user_for_cache)
+        except Exception:
+            quality_dataset_options = {
+                'options': [], 'defaults': [], 'labels': {}, 'favorite_ids': [],
+                'warnings': ["Impossible d'identifier les datasets évalués depuis DHIS2."],
+            }
+        if quality_dataset_options is not None:
+            dataset_choices = quality_dataset_options['options']
+            if 'quality_evaluation_datasets' in st.session_state:
+                valid_dataset_choices = [
+                    identifier for identifier in st.session_state['quality_evaluation_datasets']
+                    if identifier in dataset_choices
+                ]
+                if valid_dataset_choices != st.session_state['quality_evaluation_datasets']:
+                    st.session_state['quality_evaluation_datasets'] = valid_dataset_choices
+            quality_dataset_ids = tuple(st.multiselect(
+                "Datasets évalués pour le score qualité", dataset_choices,
+                default=quality_dataset_options['defaults'] if 'quality_evaluation_datasets' not in st.session_state else None,
+                format_func=lambda identifier: quality_dataset_options['labels'][identifier],
+                key='quality_evaluation_datasets',
+                help="Le dataset 1y-Surveillance épidémiologique est inclus dans l'évaluation. Le service tertiaire est exclu. "
+                     "La sélection s'applique aux taux globaux, aux rapports et au nombre de datasets ≥95 %.",
+            ))
+            st.caption(
+                f"{len(quality_dataset_ids)} dataset(s) sélectionné(s) pour l'évaluation. "
+                "Le nombre atteignant 95 % est calculé séparément pour chaque unité et période."
+            )
+            for message in quality_dataset_options.get('warnings', []):
+                st.warning(message)
+            if not quality_dataset_ids:
+                st.warning("Sélectionnez au moins un dataset pour calculer les indicateurs du score qualité.")
+        quality_dataset_filter = (
+            '; '.join(f"{quality_dataset_options['labels'][uid]} [{uid}]" for uid in quality_dataset_ids)
+            if quality_dataset_ids is not None else 'Datasets du favori'
+        )
         with st.expander("Consulter les barèmes de catégorisation"):
             st.dataframe(build_baremes_df(), hide_index=True, use_container_width=True)
             st.caption(
-                "Le score de catégorisation /100 additionne cinq notes sur 20. "
-                "Le score de qualité historique et sa note /20 restent basés sur la moyenne "
-                "de la complétude et de la promptitude et ne sont pas ajoutés au total."
+                "Le Score qualité /100 additionne cinq notes sur 20, par pas de 5. "
+                "Pour M-1, seule l'absence totale de violation donne 20 points. "
+                "La moyenne des taux est un indicateur distinct."
             )
         validation_context = (
             'quality-progress-v7', base_url, current_user_for_cache, id_final,
@@ -2174,6 +2244,7 @@ if df_raw is not None:
         quality_view_context = (
             id_final, current_user_for_cache, validation_parent_id,
             validation_start_date, validation_end_date, tuple(validation_zones_df['Zone_ID']),
+            quality_dataset_ids,
         )
         if st.session_state.get('quality_view_context') != quality_view_context:
             st.session_state.update({
@@ -2186,11 +2257,16 @@ if df_raw is not None:
         # Le tableau qualité suit les filtres sans attendre les appels des règles de validation.
         quality_warnings = []
         quality_source_description = 'Synthèse des onglets Complétude, Promptitude et Analyse Comparative'
-        if validation_dates_valid and not validation_zones_df.empty:
+        if validation_dates_valid and not validation_zones_df.empty and quality_dataset_ids != ():
             same_reporting_months = validation_period_id == period_id
+            same_reporting_datasets = (
+                quality_dataset_options is None or
+                set(quality_dataset_ids) == set(quality_dataset_options['favorite_ids'])
+            )
+            reusable_summary = same_reporting_months and same_reporting_datasets
             quality_metrics = (
                 metrics_from_dashboard_summary(df_synth, target_df, validation_zones_df)
-                if same_reporting_months else
+                if reusable_summary else
                 aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
             )
             quality_metric_columns = [
@@ -2198,9 +2274,9 @@ if df_raw is not None:
             ]
             quality_reporting_source = target_df.loc[
                 target_df['Organisation unit ID'].isin(validation_zones_df['Zone_ID'])
-            ].copy() if same_reporting_months else pd.DataFrame()
+            ].copy() if reusable_summary else pd.DataFrame()
             if quality_metrics[quality_metric_columns].isna().any().any():
-                same_reporting_scope = same_reporting_months and validation_ou_dimension == ou_dimension
+                same_reporting_scope = reusable_summary and validation_ou_dimension == ou_dimension
                 certified_reporting_columns = [
                     column for column in target_df.attrs.get('reporting_columns', []) if column in target_df
                 ]
@@ -2214,6 +2290,7 @@ if df_raw is not None:
                         id_final, period=validation_period_id, cache_user=current_user_for_cache,
                         ou_dimension=validation_ou_dimension,
                         unit_ids=tuple(validation_zones_df['Zone_ID']),
+                        dataset_ids=quality_dataset_ids,
                     )
                 if quality_reporting_source is None:
                     quality_reporting_source = pd.DataFrame()
@@ -2222,8 +2299,8 @@ if df_raw is not None:
                     extra_metrics.set_index('Zone_ID')
                 ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
                 quality_source_description = (
-                    'Synthèse affichée complétée par Analytics DHIS2' if same_reporting_months else
-                    'Analytics DHIS2 — métriques de reporting des datasets'
+                    'Synthèse affichée complétée par Analytics DHIS2' if reusable_summary else
+                    'Analytics DHIS2 — métriques des datasets sélectionnés pour le score qualité'
                 )
                 if quality_metrics[quality_metric_columns].isna().any().any():
                     quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
@@ -2231,7 +2308,7 @@ if df_raw is not None:
             quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
         else:
             quality_reporting_source = pd.DataFrame()
-            quality_metrics = pd.DataFrame()
+            quality_metrics = aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
         st.caption(
             f"Mois couverts : {', '.join(validation_months) or '—'}. "
             f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
@@ -2304,7 +2381,7 @@ if df_raw is not None:
                 'validation_detail_period': 'Mois précédent (M-1)' if action == 'M-1' else 'Période filtrée (M)',
             }.items():
                 st.session_state[key] = value
-            st.session_state.pop('validation_selected_row', None)
+            st.session_state['validation_selected_row'] = 0
         elif resume_analysis:
             job = resume_validation_job(job)
             st.session_state['validation_job'] = job
@@ -2485,6 +2562,7 @@ if df_raw is not None:
                     'Favori DHIS2': id_final,
                     'Mois des indicateurs de déclaration': validation_period_id,
                     'Source des indicateurs': quality_source_description,
+                    'Datasets évalués': quality_dataset_filter,
                     'Barème datasets': profil_bareme,
                     'Analyse des violations': 'Non lancée',
                     'Contrôle des corrections': 'Non effectué',
@@ -2513,6 +2591,7 @@ if df_raw is not None:
             applied_filters['Barème datasets'] = profil_bareme
             applied_filters['Favori DHIS2'] = id_final
             applied_filters['Source des indicateurs'] = quality_source_description
+            applied_filters['Datasets évalués'] = quality_dataset_filter
             applied_filters['Analyse M effectuée le'] = saved_validation.get('analysed_at', '')
             applied_filters['Contrôle des corrections effectué le'] = saved_validation.get('corrections_checked_at') or 'Non effectué'
             df_validation_context_export = pd.DataFrame(
@@ -2689,7 +2768,7 @@ if df_raw is not None:
                 with st.expander("Consulter le détail d'une violation"):
                     row_options = list(range(len(violations_visible)))
                     if st.session_state.get('validation_selected_row') not in row_options:
-                        st.session_state.pop('validation_selected_row', None)
+                        st.session_state['validation_selected_row'] = row_options[0]
                     selected_row = st.selectbox(
                         "Violation à consulter", row_options,
                         format_func=lambda position: (

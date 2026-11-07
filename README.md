@@ -41,9 +41,9 @@ Le dashboard est organisé en 5 onglets:
   - `Règles violées (M)`
 - `Ratio / 100 rapports` calculé par:
   - `(Règles violées (M) / Reports_Actual) * 100`
-- `Score de qualité`
-- `Score de qualité /20`, repère historique conservé avec la moyenne des deux taux.
-  Le barème s'applique au score de qualité (moyenne de la complétude et de la promptitude) :
+- `Moyenne complétude / promptitude (%)`
+- `Note moyenne des taux /20`, repère conservé à droite du tableau.
+  Le barème des taux s'applique séparément à la complétude et à la promptitude :
   - moins de 50 % : **0**
   - de 50 à moins de 60 % : **5**
   - de 60 à moins de 80 % : **10**
@@ -52,8 +52,8 @@ Le dashboard est organisé en 5 onglets:
 - **Catégorisation issue du modèle Excel** : toutes les colonnes précédentes sont conservées,
   puis le tableau affiche le barème DPS/ZS, le nombre de datasets à complétude `>=95 %`,
   les anciennes violations restantes, les cinq notes détaillées et leur somme
-  `Score catégorisation /100`. Le score de qualité historique et sa note `/20` sont des
-  repères distincts et ne sont pas ajoutés au total.
+  `Score qualité /100`. Ce total prend les valeurs 0, 5, 10, …, 95, 100.
+  La moyenne des deux taux et sa note `/20` restent des repères distincts.
 
 | Critère | Barème actif sur 20 |
 | --- | --- |
@@ -61,13 +61,14 @@ Le dashboard est organisé en 5 onglets:
 | Datasets à complétude >=95 % (DPS) | `<6 : 0` ; `6–7 : 5` ; `8–9 : 10` ; `10–11 : 15` ; `>=12 : 20` |
 | Datasets à complétude >=95 % (ZS) | `<5 : 0` ; `5 : 5` ; `6–7 : 10` ; `8–9 : 15` ; `>=10 : 20` |
 | Violations pour 100 rapports | `0–5 : 20` ; `>5–10 : 15` ; `>10–15 : 10` ; `>15–20 : 5` ; `>20 : 0` |
-| Corrections de M-1 | Aucune ancienne violation restante : `20` ; au moins une restante : `0` |
+| Violations de M-1 | Aucune violation en M-1 : `20` ; au moins une violation en M-1 : `0`, même corrigée en M |
 
 Le mode **Automatique** déduit DPS/ZS du niveau DHIS2 de chaque unité. Le sélecteur
 permet de choisir explicitement DPS ou ZS si la hiérarchie est indisponible.
 Les règles sont consultables dans l'expandeur « Consulter les barèmes de catégorisation ».
 Les trois ambiguïtés du modèle ont été clarifiées : promptitude `>=95 % = 20`,
-ratio exactement `20 = 5`, et corrections notées sur les violations **restantes**.
+ratio exactement `20 = 5`, et note M-1 selon la loi du tout ou rien sur le nombre
+de violations **présentes en M-1**, indépendamment de leur disparition en M.
 Les notes saisies manuellement dans les exemples du modèle ne remplacent pas les barèmes.
 
 Chaque dataset est compté une seule fois pour l'unité analysée. Une ligne directe de
@@ -126,8 +127,8 @@ résultats des règles sans retirer les nouveaux indicateurs de déclaration.
 
 Le tableau aligne chaque mesure avec sa note, dans l'ordre : complétude globale,
 promptitude globale, nombre de datasets ≥95 %, violations pour 100 rapports et
-corrections de M-1, puis le **Score qualité /100** (colonne `Score catégorisation /100`
-dans les exports). La moyenne des deux taux est conservée à droite comme repère.
+corrections de M-1, puis le **Score qualité /100**, nommé de même dans les exports.
+La moyenne des deux taux est conservée à droite sous son nom explicite.
 
 Les trois boutons utilisent les mêmes filtres pays, province, zone et dates.
 Les analyses sont réparties par zone de santé pour éviter une requête volumineuse
@@ -155,9 +156,20 @@ désactivés afin de ne pas mélanger deux périmètres ; relancer M lance une n
 analyse et retire l'ancien contrôle M-1.
 
 Exemple Aba : 100 % de complétude, 100 % de promptitude, 9 datasets ≥95 %, 5
-violations sur 134 rapports et 2 anciennes violations toujours présentes donnent
+violations sur 134 rapports et 2 violations en M-1 donnent
 20 + 20 + 15 + 20 + 0 = **75/100**. Le ratio exact (3,73/100) sert au barème.
-Si les 2 anciennes violations sont corrigées, la note des corrections passe à 20.
+Même si les 2 anciennes violations sont corrigées en M, la note M-1 reste 0.
+Seule une analyse M-1 réussie sans aucune violation donne 20 points.
+
+La sélection **Datasets évalués pour le score qualité** est alimentée par les
+métadonnées DHIS2. Elle reprend les datasets du favori, retire le service tertiaire
+et ajoute **1y-Surveillance épidémiologique**, identifié par son nom puis son UID DHIS2.
+Si ce nom est absent ou ambigu, un message demande de vérifier la sélection ;
+aucun autre dataset de surveillance n'est substitué automatiquement.
+Aucun identifiant ni résultat d'exemple n'est imposé.
+Les cinq métriques de reporting de chaque dataset choisi alimentent les taux,
+les rapports et le compte des datasets à 95 %. La synthèse des autres onglets est
+réutilisée seulement pour les mêmes mois et exactement la même sélection de datasets.
 
 Les deux actions existantes restent séparées :
 
