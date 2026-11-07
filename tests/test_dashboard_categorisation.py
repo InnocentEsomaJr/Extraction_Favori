@@ -238,6 +238,11 @@ def app_fixture_source(replacements=None):
             ):
                 fixture.args.kwonlyargs.append(ast.arg(arg='dataset_ids'))
                 fixture.args.kw_defaults.append(ast.Constant(value=None))
+            if node.name == 'get_quality_reporting_data' and not any(
+                argument.arg == 'weekly_periods' for argument in fixture.args.args + fixture.args.kwonlyargs
+            ):
+                fixture.args.kwonlyargs.append(ast.arg(arg='weekly_periods'))
+                fixture.args.kw_defaults.append(ast.Constant(value=None))
             return fixture
 
         def visit_Expr(self, node):

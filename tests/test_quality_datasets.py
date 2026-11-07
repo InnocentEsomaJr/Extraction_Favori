@@ -164,6 +164,79 @@ class QualityDatasetSelectionTests(unittest.TestCase):
         self.assertEqual(selection['ambiguous_surveillance_ids'], [])
         self.assertEqual(selection['warnings'], [])
 
+    def test_esurveillance_weekly_exact_name_replaces_old_monthly_surveillance(self):
+        favorite = self.favorite()
+        favorite['dataDimensionItems'].append({'reportingRate': {
+            'dataSet': {'id': 'DatasetDDDD', 'name': '1y-Surveillance épidémiologique',
+                        'periodType': 'Monthly'}, 'metric': 'REPORTING_RATE',
+        }})
+        selection = quality_dataset_selection(favorite, [
+            {'id': 'DatasetCCCC', 'displayName': 'eSurveillance Hebdomadaire-Édition2025',
+             'periodType': 'Weekly'},
+            {'id': 'DatasetEEEE', 'displayName': 'eSurveillance Hebdomadaire-Edition 2024',
+             'periodType': 'Weekly'},
+        ], surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
+        self.assertEqual(selection['defaults'], ['DatasetAAAA', 'DatasetCCCC'])
+        self.assertEqual(selection['warnings'], [])
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        self.assertTrue(records['DatasetCCCC']['is_surveillance'])
+        self.assertTrue(records['DatasetCCCC']['is_weekly'])
+        self.assertEqual(records['DatasetCCCC']['periodType'], 'Weekly')
+        self.assertFalse(records['DatasetDDDD']['is_weekly'])
+        self.assertEqual(records['DatasetDDDD']['periodType'], 'Monthly')
+
+    def test_favorite_weekly_metadata_is_retained_and_catalog_type_is_authoritative(self):
+        favorite = self.favorite()
+        for item in favorite['dataDimensionItems']:
+            item['reportingRate']['dataSet']['periodType'] = 'Weekly'
+        selection = quality_dataset_selection(favorite, [
+            {'id': 'DatasetAAAA', 'name': 'Consultations', 'periodType': 'Monthly'},
+        ])
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        self.assertFalse(records['DatasetAAAA']['is_weekly'])
+        self.assertEqual(records['DatasetAAAA']['periodType'], 'Monthly')
+        self.assertTrue(records['DatasetBBBB']['is_weekly'])
+        self.assertEqual(records['DatasetBBBB']['periodType'], 'Weekly')
+
+    def test_weekly_name_fallback_only_for_esurveillance_hebdomadaire_without_explicit_type(self):
+        selection = quality_dataset_selection(self.favorite(), [
+            {'id': 'DatasetCCCC', 'name': 'eSurveillance Hebdomadaire-Edition 2025'},
+            {'id': 'DatasetDDDD', 'name': '1y-Surveillance épidémiologique', 'periodType': 'Monthly'},
+            {'id': 'DatasetEEEE', 'name': 'Surveillance mensuelle'},
+            {'id': 'DatasetFFFF', 'name': 'eSurveillance Hebdomadaire ancienne', 'periodType': 'Monthly'},
+            {'id': 'DatasetGGGG', 'name': 'Autre collecte', 'periodType': 'weekly'},
+        ], surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        self.assertTrue(records['DatasetCCCC']['is_weekly'])
+        self.assertFalse(records['DatasetDDDD']['is_weekly'])
+        self.assertFalse(records['DatasetEEEE']['is_weekly'])
+        self.assertFalse(records['DatasetFFFF']['is_weekly'])
+        self.assertTrue(records['DatasetGGGG']['is_weekly'])
+        self.assertEqual(records['DatasetGGGG']['periodType'], 'Weekly')
+
+    def test_selected_query_preserves_weekly_dataset_period_type_without_mutating_favorite(self):
+        favorite = self.favorite()
+        before = deepcopy(favorite)
+        selection = quality_dataset_selection(favorite, [
+            {'id': 'DatasetCCCC', 'name': 'eSurveillance Hebdomadaire-Edition 2025', 'periodType': 'Weekly'},
+        ], surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
+        chosen = select_quality_datasets(favorite, ['DatasetCCCC'], selection['datasets'])
+        self.assertEqual(len(chosen['dataDimensionItems']), 5)
+        self.assertTrue(all(item['reportingRate']['dataSet']['periodType'] == 'Weekly'
+                            for item in chosen['dataDimensionItems']))
+        self.assertEqual(favorite, before)
+
+    def test_favorite_period_type_is_retained_when_dataset_is_outside_reporting_identifier(self):
+        favorite = {'dataDimensionItems': [{
+            'reportingRate': 'DatasetCCCC.REPORTING_RATE',
+            'dataSet': {'id': 'DatasetCCCC', 'displayName': 'eSurveillance Hebdomadaire-Edition 2025',
+                        'periodType': 'Weekly'},
+        }]}
+        selection = quality_dataset_selection(favorite)
+        dataset = selection['datasets'][0]
+        self.assertEqual(dataset['periodType'], 'Weekly')
+        self.assertTrue(dataset['is_weekly'])
+
     def test_exact_selected_scope_replaces_all_old_dx_but_preserves_extra_filters(self):
         favorite = self.favorite()
         favorite['columns'][0]['items'] = [{'id': 'DatasetBBBB.REPORTING_RATE'}]

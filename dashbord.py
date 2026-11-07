@@ -19,6 +19,8 @@ from reporting_metrics import (
 )
 from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
 from quality_datasets import quality_dataset_selection, select_quality_datasets
+from quality_reporting import fetch_quality_reporting
+from weekly_periods import weekly_period_schedule, weekly_periods_for_months
 from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
 from validation_job import (
@@ -546,6 +548,8 @@ def to_excel_dashboard_report(
     df_violations=None,
     df_validation_context=None,
     df_previous_violations=None,
+    df_weekly_periods=None,
+    df_surveillance=None,
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -648,6 +652,14 @@ def to_excel_dashboard_report(
             writer.sheets['Contexte_Validation'].set_column(0, 0, 34)
             writer.sheets['Contexte_Validation'].set_column(1, 1, 95)
             writer.sheets['Contexte_Validation'].freeze_panes(1, 0)
+        if df_weekly_periods is not None and not df_weekly_periods.empty:
+            df_weekly_periods.to_excel(writer, index=False, sheet_name='Periodes_Surveillance')
+            writer.sheets['Periodes_Surveillance'].set_column(0, len(df_weekly_periods.columns) - 1, 20)
+            writer.sheets['Periodes_Surveillance'].freeze_panes(1, 0)
+        if df_surveillance is not None and not df_surveillance.empty:
+            df_surveillance.to_excel(writer, index=False, sheet_name='Reporting_Surveillance')
+            writer.sheets['Reporting_Surveillance'].set_column(0, len(df_surveillance.columns) - 1, 24)
+            writer.sheets['Reporting_Surveillance'].freeze_panes(1, 2)
         for name in ['Resultats_Regles', 'Baremes_Categorisation']:
             sheet = writer.sheets[name]
             sheet.freeze_panes(1, 1)
@@ -1279,7 +1291,7 @@ def get_dhis2_client():
 def get_reporting_visualization(favori_id, cache_user=None):
     return get_dhis2_client().get(
         f"visualizations/{favori_id}",
-        params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
+        params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name,periodType]]]"},
     )
 
 @st.cache_data(ttl=3600)
@@ -1288,18 +1300,18 @@ def get_quality_dataset_options(favori_id, cache_user=None):
     visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
     try:
         catalog = get_dhis2_client().get(
-            'dataSets', params={'fields': 'id,displayName,name', 'paging': 'false'},
+            'dataSets', params={'fields': 'id,displayName,name,periodType', 'paging': 'false'},
         )
         if not isinstance(catalog, dict) or not isinstance(catalog.get('dataSets'), list):
             raise ValueError('Catalogue des datasets invalide')
     except Exception:
-        selection = quality_dataset_selection(visualization, surveillance_name='1y-Surveillance épidémiologique')
+        selection = quality_dataset_selection(visualization, surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
         selection['warnings'].append(
             "Le catalogue DHIS2 des datasets est indisponible : impossible de vérifier "
             "si la surveillance manque dans le favori."
         )
         return selection
-    return quality_dataset_selection(visualization, catalog, surveillance_name='1y-Surveillance épidémiologique')
+    return quality_dataset_selection(visualization, catalog, surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
 
 @st.cache_data(ttl=3600)
 def get_cached_analytics(params, cache_user=None):
@@ -1307,12 +1319,14 @@ def get_cached_analytics(params, cache_user=None):
     analytics_to_reporting_frame(response)
     return response
 
-def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=None, quality=False, dataset_ids=None):
+def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_user=None, quality=False, dataset_ids=None, weekly_periods=None):
     """Répartit Analytics par unité ; seules les réponses réussies sont gardées une heure."""
     visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
     if quality and dataset_ids is not None:
         options = get_quality_dataset_options(favori_id, cache_user=cache_user)
         visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
+        if weekly_periods is None:
+            weekly_periods = weekly_periods_for_months(period)
     builder = build_quality_reporting_query if quality else build_analytics_query
     params, labels = builder(visualization, period, ou_dimension)
     class CachedAnalytics:
@@ -1321,13 +1335,23 @@ def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_us
     identifiers = tuple(dict.fromkeys(clean_ou_id(uid) for uid in unit_ids if clean_ou_id(uid)))
     progress = st.progress(0.0, text=f"Chargement des indicateurs de {len(identifiers)} unité(s)")
     try:
-        result = fetch_reporting_chunks(
-            CachedAnalytics(), params, labels, identifiers,
-            units_per_request=1, items_per_request=max(1, len(labels)),
-            on_progress=lambda position, total, units, items: progress.progress(
-                (position - 1) / total, text=f"Indicateurs DHIS2 : {position}/{total} unité(s)"
-            ),
-        )
+        if quality and dataset_ids is not None:
+            result = fetch_quality_reporting(
+                CachedAnalytics(), params, labels, options['datasets'], identifiers,
+                weekly_periods=weekly_periods or (),
+                on_progress=lambda kind, position, total, units, items: progress.progress(
+                    (position - 1) / total,
+                    text=f"{'Surveillance hebdomadaire' if kind == 'weekly' else 'Indicateurs mensuels'} : {position}/{total} unité(s)",
+                ),
+            )
+        else:
+            result = fetch_reporting_chunks(
+                CachedAnalytics(), params, labels, identifiers,
+                units_per_request=1, items_per_request=max(1, len(labels)),
+                on_progress=lambda position, total, units, items: progress.progress(
+                    (position - 1) / total, text=f"Indicateurs DHIS2 : {position}/{total} unité(s)"
+                ),
+            )
     finally:
         progress.empty()
     # Une unité indisponible reste identifiable, avec des valeurs absentes.
@@ -1368,7 +1392,7 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_id
         return None
 
 @st.cache_data(ttl=60)
-def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None, dataset_ids=None):
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None, dataset_ids=None, weekly_periods=None):
     """Charge les cinq mesures des datasets évalués, sans analyse de règles."""
     _ = cache_user
     try:
@@ -1376,19 +1400,28 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             result = load_reporting_for_units(
                 favori_id, period, ou_dimension, unit_ids, cache_user=cache_user, quality=True,
                 dataset_ids=dataset_ids,
+                weekly_periods=weekly_periods,
             )
             result.attrs['quality_warnings'] = list(result.attrs.get('reporting_warnings', []))
             return result
         dhis = get_dhis2_client()
         visualization = dhis.get(
             f"visualizations/{favori_id}",
-            params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name]]]"},
+            params={"fields": "*,dataDimensionItems[*,reportingRate[*,dataSet[id,displayName,name,periodType]]]"},
         )
         if dataset_ids is not None:
             options = get_quality_dataset_options(favori_id, cache_user=cache_user)
             visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
+            if weekly_periods is None:
+                weekly_periods = weekly_periods_for_months(period)
         params, labels = build_quality_reporting_query(visualization, period, ou_dimension)
-        result = analytics_to_reporting_frame(dhis.get('analytics.json', params=params), labels)
+        if dataset_ids is not None:
+            result = fetch_quality_reporting(
+                dhis, params, labels, options['datasets'], unit_ids,
+                weekly_periods=weekly_periods or (),
+            )
+        else:
+            result = analytics_to_reporting_frame(dhis.get('analytics.json', params=params), labels)
         result.attrs['quality_source'] = 'Reporting DHIS2 des datasets évalués'
         return result
     except ValueError as error:
@@ -1842,6 +1875,8 @@ if df_raw is not None:
     df_violations_export = None
     df_previous_violations_export = None
     df_validation_context_export = None
+    df_weekly_periods_export = pd.DataFrame()
+    df_surveillance_export = pd.DataFrame()
     validation_applied_label = None
     df_tab1_export = pd.DataFrame()
     df_actual_detail_export = pd.DataFrame()
@@ -2183,7 +2218,7 @@ if df_raw is not None:
         )
         quality_dataset_options = None
         quality_dataset_ids = None
-        quality_dataset_context = (id_final, current_user_for_cache)
+        quality_dataset_context = ('weekly-surveillance-v1', id_final, current_user_for_cache)
         if st.session_state.get('quality_dataset_context') != quality_dataset_context:
             st.session_state['quality_dataset_context'] = quality_dataset_context
             st.session_state.pop('quality_evaluation_datasets', None)
@@ -2208,7 +2243,7 @@ if df_raw is not None:
                 default=quality_dataset_options['defaults'] if 'quality_evaluation_datasets' not in st.session_state else None,
                 format_func=lambda identifier: quality_dataset_options['labels'][identifier],
                 key='quality_evaluation_datasets',
-                help="Le dataset 1y-Surveillance épidémiologique est inclus dans l'évaluation. Le service tertiaire est exclu. "
+                help="eSurveillance Hebdomadaire-Edition 2025 est chargé séparément sur ses semaines. Le service tertiaire est exclu. "
                      "La sélection s'applique aux taux globaux, aux rapports et au nombre de datasets ≥95 %.",
             ))
             st.caption(
@@ -2223,6 +2258,22 @@ if df_raw is not None:
             '; '.join(f"{quality_dataset_options['labels'][uid]} [{uid}]" for uid in quality_dataset_ids)
             if quality_dataset_ids is not None else 'Datasets du favori'
         )
+        selected_weekly_datasets = [
+            dataset for dataset in (quality_dataset_options or {}).get('datasets', [])
+            if dataset['id'] in (quality_dataset_ids or ()) and dataset.get('is_weekly')
+        ]
+        quality_weekly_periods = (
+            weekly_periods_for_months(validation_months) if selected_weekly_datasets and validation_months else ()
+        )
+        if quality_weekly_periods:
+            df_weekly_periods_export = pd.DataFrame(weekly_period_schedule(validation_months))
+            st.caption(
+                "eSurveillance : les quatre premières semaines se terminant dans le mois sont retenues. "
+                "La cinquième est reportée au mois suivant et s'ajoute à ses semaines ; "
+                "ce mois peut donc compter cinq semaines."
+            )
+            with st.expander(f"Semaines de surveillance retenues ({len(quality_weekly_periods)})"):
+                st.dataframe(df_weekly_periods_export, hide_index=True, use_container_width=True)
         with st.expander("Consulter les barèmes de catégorisation"):
             st.dataframe(build_baremes_df(), hide_index=True, use_container_width=True)
             st.caption(
@@ -2245,6 +2296,7 @@ if df_raw is not None:
             id_final, current_user_for_cache, validation_parent_id,
             validation_start_date, validation_end_date, tuple(validation_zones_df['Zone_ID']),
             quality_dataset_ids,
+            quality_weekly_periods,
         )
         if st.session_state.get('quality_view_context') != quality_view_context:
             st.session_state.update({
@@ -2264,6 +2316,8 @@ if df_raw is not None:
                 set(quality_dataset_ids) == set(quality_dataset_options['favorite_ids'])
             )
             reusable_summary = same_reporting_months and same_reporting_datasets
+            # Une synthèse calculée sur des mois ne certifie pas les périodes hebdomadaires.
+            reusable_summary = reusable_summary and not selected_weekly_datasets
             quality_metrics = (
                 metrics_from_dashboard_summary(df_synth, target_df, validation_zones_df)
                 if reusable_summary else
@@ -2291,6 +2345,7 @@ if df_raw is not None:
                         ou_dimension=validation_ou_dimension,
                         unit_ids=tuple(validation_zones_df['Zone_ID']),
                         dataset_ids=quality_dataset_ids,
+                        weekly_periods=quality_weekly_periods,
                     )
                 if quality_reporting_source is None:
                     quality_reporting_source = pd.DataFrame()
@@ -2298,22 +2353,36 @@ if df_raw is not None:
                 quality_metrics = quality_metrics.set_index('Zone_ID').combine_first(
                     extra_metrics.set_index('Zone_ID')
                 ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
+                quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
                 quality_source_description = (
                     'Synthèse affichée complétée par Analytics DHIS2' if reusable_summary else
                     'Analytics DHIS2 — métriques des datasets sélectionnés pour le score qualité'
                 )
+                if selected_weekly_datasets:
+                    quality_source_description = 'Analytics DHIS2 — rapports mensuels et eSurveillance hebdomadaire'
                 if quality_metrics[quality_metric_columns].isna().any().any():
                     quality_warnings.extend(quality_reporting_source.attrs.get('quality_warnings', []))
                     quality_warnings.extend(reporting_quality_warnings(quality_reporting_source, quality_metrics, validation_zones_df))
             quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
+            weekly_columns = [
+                column for column in quality_reporting_source.attrs.get('weekly_reporting_columns', [])
+                if column in quality_reporting_source
+            ]
+            if weekly_columns:
+                df_surveillance_export = quality_reporting_source[
+                    ['Organisation unit', 'Organisation unit ID'] + weekly_columns
+                ].copy()
+                with st.expander("Indicateurs eSurveillance agrégés sur les semaines retenues"):
+                    st.dataframe(df_surveillance_export, hide_index=True, use_container_width=True)
         else:
             quality_reporting_source = pd.DataFrame()
             quality_metrics = aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
         st.caption(
             f"Mois couverts : {', '.join(validation_months) or '—'}. "
             f"Référence M-1 : {', '.join(validation_reference_months) or '—'}. "
-            "Chaque unité du périmètre est analysée séparément par DHIS2 sur l'intervalle choisi. Les indicateurs de déclaration restent mensuels "
-            "et couvrent les mois de cet intervalle. Le calcul n'enregistre aucun résultat et n'envoie aucune notification."
+            "Chaque unité du périmètre est analysée séparément par DHIS2 sur l'intervalle choisi. "
+            "Les datasets mensuels couvrent les mois de cet intervalle ; eSurveillance utilise les semaines affichées ci-dessus. "
+            "Le calcul n'enregistre aucun résultat et n'envoie aucune notification."
         )
 
         saved_validation = st.session_state.get('categorisation_result')
@@ -2563,6 +2632,8 @@ if df_raw is not None:
                     'Mois des indicateurs de déclaration': validation_period_id,
                     'Source des indicateurs': quality_source_description,
                     'Datasets évalués': quality_dataset_filter,
+                    'Semaines eSurveillance': ';'.join(quality_weekly_periods),
+                    'Règle des semaines': '5e semaine reportée au mois suivant en supplément des semaines de ce mois',
                     'Barème datasets': profil_bareme,
                     'Analyse des violations': 'Non lancée',
                     'Contrôle des corrections': 'Non effectué',
@@ -2592,6 +2663,8 @@ if df_raw is not None:
             applied_filters['Favori DHIS2'] = id_final
             applied_filters['Source des indicateurs'] = quality_source_description
             applied_filters['Datasets évalués'] = quality_dataset_filter
+            applied_filters['Semaines eSurveillance'] = ';'.join(quality_weekly_periods)
+            applied_filters['Règle des semaines'] = '5e semaine reportée au mois suivant en supplément des semaines de ce mois'
             applied_filters['Analyse M effectuée le'] = saved_validation.get('analysed_at', '')
             applied_filters['Contrôle des corrections effectué le'] = saved_validation.get('corrections_checked_at') or 'Non effectué'
             df_validation_context_export = pd.DataFrame(
@@ -2885,6 +2958,8 @@ if df_raw is not None:
             df_violations=df_violations_export,
             df_validation_context=df_validation_context_export,
             df_previous_violations=df_previous_violations_export,
+            df_weekly_periods=df_weekly_periods_export,
+            df_surveillance=df_surveillance_export,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"

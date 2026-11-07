@@ -163,13 +163,32 @@ Seule une analyse M-1 réussie sans aucune violation donne 20 points.
 
 La sélection **Datasets évalués pour le score qualité** est alimentée par les
 métadonnées DHIS2. Elle reprend les datasets du favori, retire le service tertiaire
-et ajoute **1y-Surveillance épidémiologique**, identifié par son nom puis son UID DHIS2.
+et ajoute **eSurveillance Hebdomadaire-Edition 2025**, identifié par son nom puis son UID DHIS2.
 Si ce nom est absent ou ambigu, un message demande de vérifier la sélection ;
 aucun autre dataset de surveillance n'est substitué automatiquement.
 Aucun identifiant ni résultat d'exemple n'est imposé.
 Les cinq métriques de reporting de chaque dataset choisi alimentent les taux,
-les rapports et le compte des datasets à 95 %. La synthèse des autres onglets est
-réutilisée seulement pour les mêmes mois et exactement la même sélection de datasets.
+les rapports et le compte des datasets à 95 %. Les datasets mensuels et hebdomadaires
+font l'objet de requêtes séparées, avec les mêmes filtres d'unités et les mêmes
+filtres supplémentaires du favori. eSurveillance est interrogé sur les semaines ISO,
+puis rattaché par UID aux indicateurs mensuels. Les rapports réels, attendus et à
+temps sont additionnés avant de recalculer les taux globaux ; eSurveillance compte
+une seule fois parmi les datasets à 95 %, quel que soit le nombre de semaines.
+Ces requêtes utilisent les [métriques de reporting Analytics de DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
+
+**Règle des semaines :** les quatre premières semaines dont le dimanche tombe dans
+le mois sont retenues. Toute cinquième semaine est affectée au mois suivant et
+s'ajoute à ses semaines : un mois peut donc en compter cinq. Septembre 2026 utilise
+W35–W39 (W35 reportée d'août), novembre W44–W47, décembre W48–W52 (W48 reportée de
+novembre). Cette règle, confirmée après la capture W36–W39, couvre toutes les semaines
+sans doublon ; les dates réelles et les reports sont affichés dans l'onglet qualité.
+L'export ajoute les feuilles `Periodes_Surveillance` et `Reporting_Surveillance`.
+
+Une surveillance indisponible ne devient pas un dataset inactif : le score de l'unité
+reste incomplet, tandis que les autres unités restent affichées. La synthèse des
+autres onglets n'est réutilisée que pour les mêmes mois, la même sélection de datasets
+et en l'absence de dataset hebdomadaire ; une source mensuelle ne certifie pas les
+semaines de surveillance.
 
 Les deux actions existantes restent séparées :
 

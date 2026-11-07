@@ -23,10 +23,10 @@ def _words(value):
 def _normalized_name(value):
     text = unicodedata.normalize('NFKD', str(value)).casefold()
     text = ''.join(character for character in text if not unicodedata.combining(character))
-    return ' '.join(re.findall(r'[a-z0-9]+', text))
+    return ' '.join(re.findall(r'[a-z]+|[0-9]+', text))
 
 
-def _reporting_items(visualization):
+def _visualization_items(visualization):
     if not isinstance(visualization, dict):
         raise ValueError('La définition du favori DHIS2 est invalide.')
     items = list(visualization.get('dataDimensionItems') or [])
@@ -34,8 +34,38 @@ def _reporting_items(visualization):
         for dimension in visualization.get(location) or []:
             if isinstance(dimension, dict) and (dimension.get('dimension') or dimension.get('id')) == 'dx':
                 items.extend(dimension.get('items') or [])
+    return items
+
+
+def _period_type(value):
+    if isinstance(value, dict):
+        value = value.get('name') or value.get('id')
+    value = str(value or '').strip()
+    return {'weekly': 'Weekly', 'monthly': 'Monthly'}.get(value.casefold(), value)
+
+
+def _favorite_period_types(visualization):
+    """Conserve les types fournis sur les datasets imbriqués du favori."""
     result = {}
-    for item in items:
+    for item in _visualization_items(visualization):
+        if not isinstance(item, dict):
+            continue
+        reporting = item.get('reportingRate') or item.get('dataSetReportingRate') or item
+        if not isinstance(reporting, dict):
+            reporting = {}
+        dataset = reporting.get('dataSet') or item.get('dataSet')
+        if not isinstance(dataset, dict):
+            continue
+        identifier = str(dataset.get('id') or dataset.get('uid') or '').strip()
+        period_type = _period_type(dataset.get('periodType'))
+        if _UID.fullmatch(identifier) and period_type:
+            result[identifier] = period_type
+    return result
+
+
+def _reporting_items(visualization):
+    result = {}
+    for item in _visualization_items(visualization):
         identifier, label = _data_item(item)
         dataset, metric = _metric_parts(identifier)
         if dataset is None:
@@ -73,6 +103,7 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
     sélectionné par défaut : une autre surveillance ne le remplace jamais.
     """
     favorites = _reporting_items(visualization)
+    period_types = _favorite_period_types(visualization)
     names = dict(favorites)
     for entry in _catalog_entries(catalog):
         identifier = str(entry.get('id') or '').strip()
@@ -83,13 +114,22 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
             names[identifier] = name
         else:
             names.setdefault(identifier, identifier)
+        period_type = _period_type(entry.get('periodType'))
+        if period_type:
+            period_types[identifier] = period_type
     datasets = []
     for identifier, name in names.items():
         words = _words(name)
+        period_type = period_types.get(identifier, '')
+        is_weekly = (
+            period_type.casefold().startswith('weekly') if period_type else
+            bool({'esurveillance', 'hebdomadaire'} <= words)
+        )
         datasets.append({
             'id': identifier, 'name': name,
+            'periodType': period_type, 'is_weekly': is_weekly,
             'in_favorite': identifier in favorites,
-            'is_surveillance': 'surveillance' in words,
+            'is_surveillance': bool(words & {'surveillance', 'esurveillance'}),
             'is_tertiary': bool(words & {'tertiaire', 'tertiaires', 'tertiary', 'tertiaries'}),
         })
     by_id = {dataset['id']: dataset for dataset in datasets}
@@ -165,10 +205,14 @@ def select_quality_datasets(visualization, selected_ids, datasets=None):
     if any(not _UID.fullmatch(identifier) for identifier in selected):
         raise ValueError('Un dataset sélectionné ne possède pas un UID DHIS2 valide.')
     names = dict(favorites)
+    period_types = _favorite_period_types(visualization)
     for entry in _catalog_entries(datasets):
         identifier = str(entry.get('id') or '').strip()
         if _UID.fullmatch(identifier):
             names[identifier] = _name(entry) or names.get(identifier, identifier)
+            period_type = _period_type(entry.get('periodType'))
+            if period_type:
+                period_types[identifier] = period_type
     missing = [identifier for identifier in selected if identifier not in names]
     if missing:
         raise ValueError('Un dataset sélectionné est absent des métadonnées disponibles.')
@@ -178,7 +222,8 @@ def select_quality_datasets(visualization, selected_ids, datasets=None):
     result['dataDimensionItems'] = [
         {'dataDimensionItemType': 'REPORTING_RATE', 'reportingRate': {
             'id': f'{identifier}.{metric}', 'metric': metric,
-            'dataSet': {'id': identifier, 'displayName': names[identifier]},
+            'dataSet': {'id': identifier, 'displayName': names[identifier],
+                        **({'periodType': period_types[identifier]} if identifier in period_types else {})},
         }}
         for identifier in selected for metric in METRIC_LABELS
     ]
