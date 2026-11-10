@@ -176,19 +176,28 @@ temps sont additionnés avant de recalculer les taux globaux ; eSurveillance com
 une seule fois parmi les datasets à 95 %, quel que soit le nombre de semaines.
 Ces requêtes utilisent les [métriques de reporting Analytics de DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
 
-**Règle des semaines :** les quatre premières semaines dont le dimanche tombe dans
-le mois sont retenues. Toute cinquième semaine est affectée au mois suivant et
-s'ajoute à ses semaines : un mois peut donc en compter cinq. Septembre 2026 utilise
-W35–W39 (W35 reportée d'août), novembre W44–W47, décembre W48–W52 (W48 reportée de
-novembre). Cette règle, confirmée après la capture W36–W39, couvre toutes les semaines
-sans doublon ; les dates réelles et les reports sont affichés dans l'onglet qualité.
+**Périodes et semaines choisies :** la barre latérale propose une période fixe
+mensuelle, trimestrielle, semestrielle, annuelle ou hebdomadaire, ainsi qu'un intervalle
+de ces périodes sur une ou plusieurs années. Les trimestres, semestres et années sont
+développés en mois entiers pour les datasets mensuels ; une sélection de semaines
+affiche également les mois entiers qu'elle intersecte.
+
+Les semaines de surveillance se choisissent librement ou par semaine de début et de
+fin. La sélection initiale couvre les semaines se terminant dans la période ; elle
+peut être modifiée et ne comporte aucune limite de quatre ou cinq semaines. Aucun
+report automatique de cinquième semaine n'est appliqué. Un semestre peut ainsi utiliser
+toutes ses semaines, ou seulement celles que l'utilisateur a retenues.
 L'export ajoute les feuilles `Periodes_Surveillance` et `Reporting_Surveillance`.
 
 Une surveillance indisponible ne devient pas un dataset inactif : le score de l'unité
-reste incomplet, tandis que les autres unités restent affichées. La synthèse des
-autres onglets n'est réutilisée que pour les mêmes mois, la même sélection de datasets
-et en l'absence de dataset hebdomadaire ; une source mensuelle ne certifie pas les
-semaines de surveillance.
+reste incomplet, tandis que les autres unités restent affichées. La source combinée
+mensuelle et hebdomadaire alimente désormais **tous les tableaux** : complétude,
+promptitude, analyse comparative et qualité. Les anciennes colonnes de reporting du
+favori sont remplacées avant les calculs, afin de ne compter aucun dataset deux fois ;
+ses autres indicateurs restent disponibles. La qualité réutilise cette synthèse
+seulement pour les mêmes mois, datasets et semaines. Une période qualité indépendante
+dispose de son propre choix de semaines. Changer les semaines recalcule les indicateurs
+sans relancer les requêtes M/M-1 déjà reçues.
 
 Les deux actions existantes restent séparées :
 

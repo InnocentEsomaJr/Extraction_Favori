@@ -20,7 +20,11 @@ from reporting_metrics import (
 from quality_score import build_quality_rows, metrics_from_dashboard_summary, metrics_from_reporting_source
 from quality_datasets import quality_dataset_selection, select_quality_datasets
 from quality_reporting import fetch_quality_reporting
-from weekly_periods import weekly_period_schedule, weekly_periods_for_months
+from period_selection import (
+    MONTH_NAMES, period_choices, period_info, period_interval, selection_bounds,
+    selection_months, weekly_choices_for_range,
+)
+from reporting_source import replace_reporting_source
 from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
 from validation_job import (
@@ -231,6 +235,107 @@ def export_validation_detail_view(frame):
         if column in frame:
             result[column] = frame[column]
     return result
+
+
+def render_week_selection(months, surface, key_prefix, default_ids=None):
+    """Choix explicite des semaines, sans nombre imposé ni report automatique."""
+    first, last = monthly_bounds(months)
+    records = [
+        record for year in range(max(1, first.year - 1), min(9999, last.year + 1) + 1)
+        for record in period_choices('Weekly', year)
+    ]
+    labels = {record['id']: record['label'] for record in records}
+    options = list(labels)
+    defaults = list(default_ids) if default_ids is not None else [
+        record['id'] for record in weekly_choices_for_range(first, last)
+    ]
+    context = (tuple(months), tuple(defaults))
+    selected_key = key_prefix + '_selected'
+    saved_key = key_prefix + '_values'
+    begin_key, end_key = key_prefix + '_begin', key_prefix + '_end'
+    if st.session_state.get(key_prefix + '_context') != context:
+        st.session_state.update({
+            key_prefix + '_context': context, selected_key: defaults, saved_key: defaults,
+            begin_key: defaults[0], end_key: defaults[-1],
+        })
+    if selected_key not in st.session_state:
+        st.session_state[selected_key] = st.session_state.get(saved_key, defaults)
+    for key, value in [(begin_key, st.session_state.get(saved_key, defaults)[0] if st.session_state.get(saved_key) else defaults[0]),
+                       (end_key, st.session_state.get(saved_key, defaults)[-1] if st.session_state.get(saved_key) else defaults[-1])]:
+        if key not in st.session_state:
+            st.session_state[key] = value
+    mode = surface.radio(
+        'Choix des semaines', ['Sélection de semaines', 'Intervalle de semaines'],
+        key=key_prefix + '_mode',
+    )
+    if mode == 'Sélection de semaines':
+        selected = surface.multiselect(
+            'Semaines de surveillance', options, format_func=lambda value: labels[value],
+            key=selected_key,
+            help="Ajoutez ou retirez les semaines à intégrer. Aucun report automatique n'est appliqué.",
+        )
+    else:
+        begin = surface.selectbox('Semaine de début', options, format_func=lambda value: labels[value], key=begin_key)
+        end = surface.selectbox('Semaine de fin', options, format_func=lambda value: labels[value], key=end_key)
+        try:
+            selected = [record['id'] for record in period_interval('Weekly', begin, end)]
+        except ValueError as error:
+            surface.error(str(error))
+            return ()
+    selected = tuple(sorted(set(selected), key=lambda value: period_info(value)['start']))
+    st.session_state[saved_key] = selected
+    surface.caption(f"{len(selected)} semaine(s) sélectionnée(s). Leurs rapports seront ajoutés aux rapports mensuels.")
+    if not selected:
+        surface.warning('Choisissez au moins une semaine, ou retirez le dataset hebdomadaire de la sélection.')
+    return selected
+
+
+def surveillance_period_frame(periods):
+    return pd.DataFrame([
+        {'Semaine': value, 'Début': period_info(value)['start'].isoformat(),
+         'Fin': period_info(value)['end'].isoformat()}
+        for value in periods
+    ], columns=['Semaine', 'Début', 'Fin'])
+
+
+def default_surveillance_weeks(months):
+    periods = months.split(';') if isinstance(months, str) else months
+    return tuple(dict.fromkeys(
+        record['id'] for month in periods
+        for record in weekly_choices_for_range(*monthly_bounds([month]))
+    ))
+
+
+def render_dataset_selection(favori_id, cache_user, surface):
+    context = ('shared-explicit-reporting-v2', favori_id, cache_user)
+    if st.session_state.get('quality_dataset_context') != context:
+        st.session_state['quality_dataset_context'] = context
+        st.session_state.pop('quality_evaluation_datasets', None)
+    try:
+        configuration = get_quality_dataset_options(favori_id, cache_user=cache_user)
+    except Exception:
+        configuration = {
+            'options': [], 'defaults': [], 'labels': {}, 'favorite_ids': [], 'datasets': [],
+            'warnings': ["Impossible d'identifier les datasets évalués depuis DHIS2."],
+        }
+    if configuration is None:
+        return None, None, 'Datasets du favori'
+    options = configuration['options']
+    if 'quality_evaluation_datasets' in st.session_state:
+        selected = [value for value in st.session_state['quality_evaluation_datasets'] if value in options]
+        if selected != st.session_state['quality_evaluation_datasets']:
+            st.session_state['quality_evaluation_datasets'] = selected
+    identifiers = tuple(surface.multiselect(
+        'Datasets évalués pour le score qualité', options,
+        default=configuration['defaults'] if 'quality_evaluation_datasets' not in st.session_state else None,
+        format_func=lambda value: configuration['labels'][value], key='quality_evaluation_datasets',
+        help="Cette sélection alimente la complétude, la promptitude, l'analyse comparative et le score qualité. Le tertiaire est exclu.",
+    ))
+    for message in configuration.get('warnings', []):
+        surface.warning(message)
+    if not identifiers:
+        surface.warning('Sélectionnez au moins un dataset pour afficher les indicateurs.')
+    return configuration, identifiers, '; '.join(f"{configuration['labels'][value]} [{value}]" for value in identifiers)
 
 def render_quality_table(df_cat, corrections_checked=False, unit_label='Zone de santé'):
     historical_columns = {
@@ -1326,7 +1431,7 @@ def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_us
         options = get_quality_dataset_options(favori_id, cache_user=cache_user)
         visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
         if weekly_periods is None:
-            weekly_periods = weekly_periods_for_months(period)
+            weekly_periods = default_surveillance_weeks(period)
     builder = build_quality_reporting_query if quality else build_analytics_query
     params, labels = builder(visualization, period, ou_dimension)
     class CachedAnalytics:
@@ -1413,7 +1518,7 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             options = get_quality_dataset_options(favori_id, cache_user=cache_user)
             visualization = select_quality_datasets(visualization, dataset_ids, options['datasets'])
             if weekly_periods is None:
-                weekly_periods = weekly_periods_for_months(period)
+                weekly_periods = default_surveillance_weeks(period)
         params, labels = build_quality_reporting_query(visualization, period, ou_dimension)
         if dataset_ids is not None:
             result = fetch_quality_reporting(
@@ -1672,29 +1777,56 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📅 Sélection de la Période")
-    annee_choisie = st.selectbox("Choisir l'année :", ["2026", "2025", "2024", "2023"], index=1)
-
-    mois_liste = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
-    mois_dict = {m: str(i+1).zfill(2) for i, m in enumerate(mois_liste)}
-
-    col_m1, col_m2 = st.columns(2)
-    with col_m1: mois_debut = st.selectbox("Mois début :", mois_liste, index=0)
-    with col_m2: mois_fin = st.selectbox("Mois fin :", mois_liste, index=0)
-
-    idx_start, idx_end = mois_liste.index(mois_debut), mois_liste.index(mois_fin)
-
-    # Valeurs par défaut pour éviter des variables non définies.
-    selection_mois = [f"{annee_choisie}{mois_dict[mois_debut]}"]
-    period_id = selection_mois[0]
-    prev_idx = idx_start - 1 if idx_start > 0 else 11
-    prev_year = annee_choisie if idx_start > 0 else str(int(annee_choisie)-1)
-    selection_mois_prev = [f"{prev_year}{mois_dict[mois_liste[prev_idx]]}"]
-
-    if idx_start <= idx_end:
-        selection_mois = [f"{annee_choisie}{mois_dict[mois_liste[i]]}" for i in range(idx_start, idx_end + 1)]
-        period_id = ";".join(selection_mois)
+    period_mode = st.selectbox('Mode de sélection de la période', ['Intervalle', 'Période fixe'], key='reporting_period_mode')
+    period_kind = st.selectbox('Périodicité', ['Mensuel', 'Trimestriel', 'Semestriel', 'Annuel', 'Hebdomadaire'], key='reporting_period_kind')
+    available_years = [str(year) for year in range(max(2026, datetime.now(KINSHASA_TZ).year) + 1, 2019, -1)]
+    annee_choisie = st.selectbox("Choisir l'année :", available_years, index=available_years.index(str(datetime.now(KINSHASA_TZ).year)), key='reporting_start_year')
+    if period_mode == 'Intervalle':
+        if st.session_state.get('reporting_last_start_year') != annee_choisie or 'reporting_end_year' not in st.session_state:
+            st.session_state['reporting_end_year'] = annee_choisie
+            st.session_state['reporting_last_start_year'] = annee_choisie
+        end_year = st.selectbox('Année de fin', available_years, key='reporting_end_year')
     else:
-        st.error("Le mois de début doit être avant le mois de fin.")
+        end_year = annee_choisie
+    first_choices = period_choices(period_kind, annee_choisie)
+    last_choices = period_choices(period_kind, end_year)
+    main_explicit_weeks = None
+    try:
+        if period_mode == 'Période fixe':
+            label = {'Mensuel': 'Mois', 'Trimestriel': 'Trimestre', 'Semestriel': 'Semestre', 'Annuel': 'Année', 'Hebdomadaire': 'Semaine'}[period_kind]
+            if period_kind == 'Annuel':
+                selected_periods = [annee_choisie]
+            else:
+                names = {record['id']: record['label'] for record in first_choices}
+                chosen = st.selectbox(label, list(names), format_func=lambda value: names[value], key='reporting_fixed_' + period_kind)
+                selected_periods = [chosen]
+        else:
+            if period_kind == 'Mensuel':
+                col_m1, col_m2 = st.columns(2)
+                with col_m1: mois_debut = st.selectbox('Mois début :', list(MONTH_NAMES), index=0)
+                with col_m2: mois_fin = st.selectbox('Mois fin :', list(MONTH_NAMES), index=0)
+                begin = f'{annee_choisie}{list(MONTH_NAMES).index(mois_debut) + 1:02d}'
+                end = f'{end_year}{list(MONTH_NAMES).index(mois_fin) + 1:02d}'
+            elif period_kind == 'Annuel':
+                begin, end = annee_choisie, end_year
+            else:
+                prefix = {'Trimestriel': 'Trimestre', 'Semestriel': 'Semestre', 'Hebdomadaire': 'Semaine'}[period_kind]
+                first_labels = {record['id']: record['label'] for record in first_choices}
+                last_labels = {record['id']: record['label'] for record in last_choices}
+                suffix = ' de période' if period_kind == 'Hebdomadaire' else ''
+                begin = st.selectbox(prefix + ' de début' + suffix, list(first_labels), format_func=lambda value: first_labels[value], key='reporting_interval_begin_' + period_kind)
+                end = st.selectbox(prefix + ' de fin' + suffix, list(last_labels), format_func=lambda value: last_labels[value], key='reporting_interval_end_' + period_kind)
+            selected_periods = [record['id'] for record in period_interval(period_kind, begin, end)]
+        selection_mois = list(selection_months(selected_periods))
+        period_id = ';'.join(selection_mois)
+        main_period_start, main_period_end = selection_bounds(selected_periods)
+        period_display_label = f"{period_kind} — {main_period_start:%d/%m/%Y} au {main_period_end:%d/%m/%Y}"
+        if period_kind == 'Hebdomadaire':
+            main_explicit_weeks = tuple(selected_periods)
+        st.caption(period_display_label)
+        st.caption('Mois entiers utilisés pour les datasets mensuels : ' + ', '.join(selection_mois))
+    except ValueError as error:
+        st.error(str(error))
         st.session_state.pop('categorisation_result', None)
         st.session_state.pop('validation_job', None)
         st.session_state.pop('show_report_preview', None)
@@ -1788,10 +1920,43 @@ is_zone_focus = selected_zone_id is not None
 ou_dimension = selected_zone_id or f"LEVEL-3;{selected_province_id or selected_country_id}"
 st.sidebar.caption(f"{len(selected_zones_df)} zone(s) de santé dans le périmètre sélectionné.")
 
-df_raw = get_data(
+st.sidebar.subheader('Datasets et surveillance')
+quality_dataset_options, quality_dataset_ids, quality_dataset_filter = render_dataset_selection(
+    id_final, current_user_for_cache, st.sidebar,
+)
+selected_weekly_datasets = [
+    dataset for dataset in (quality_dataset_options or {}).get('datasets', [])
+    if dataset['id'] in (quality_dataset_ids or ()) and dataset.get('is_weekly')
+]
+reporting_week_ids = (
+    render_week_selection(selection_mois, st.sidebar, 'reporting_weeks', default_ids=main_explicit_weeks)
+    if selected_weekly_datasets else ()
+)
+df_favorite = get_data(
     id_final, period=period_id, cache_user=current_user_for_cache, ou_dimension=ou_dimension,
     unit_ids=tuple(selected_zones_df['Zone_ID']),
 )
+df_raw = df_favorite
+if quality_dataset_ids is not None:
+    combined_reporting = get_quality_reporting_data(
+        id_final, period=period_id, cache_user=current_user_for_cache, ou_dimension=ou_dimension,
+        unit_ids=tuple(selected_zones_df['Zone_ID']), dataset_ids=quality_dataset_ids,
+        weekly_periods=reporting_week_ids,
+    )
+    if combined_reporting is None:
+        combined_reporting = pd.DataFrame()
+    if combined_reporting.empty:
+        attributes = dict(combined_reporting.attrs)
+        combined_reporting = pd.DataFrame({
+            'Organisation unit ID': selected_zones_df['Zone_ID'],
+            'Organisation unit': selected_zones_df['Zone'],
+        })
+        combined_reporting.attrs = {
+            **attributes, 'failed_units': list(selected_zones_df['Zone_ID']),
+            'reporting_columns': [], 'reporting_warnings': attributes.get('quality_warnings', []),
+        }
+    combined_reporting.attrs['quality_dataset_ids'] = quality_dataset_ids
+    df_raw = replace_reporting_source(df_favorite, combined_reporting)
 if df_raw is not None:
     df_raw = normalize_orgunit_columns(df_raw)
     if 'Organisation unit ID' not in df_raw.columns:
@@ -1808,6 +1973,10 @@ if df_raw is not None:
                     'Reporting month', 'Organisation unit parameter', 'Organisation unit is parent']
     target_df_all = target_df_all.drop(columns=default_cols, errors='ignore')
     target_df = target_df_all.copy()
+    reporting_columns = [
+        column for column in target_df.attrs.get('reporting_columns', target_df.columns)
+        if column in target_df and column not in ['Organisation unit', 'Organisation unit ID']
+    ]
     mapping_ou_id = dict(zip(df_raw['Organisation unit'], df_raw['Organisation unit ID']))
     is_parent_by_ou = {}
 
@@ -1855,6 +2024,13 @@ if df_raw is not None:
 
 
     st.title(f"📊 SNIS RDC - Performance {selected_scope_label}")
+    st.caption('Période : ' + period_display_label)
+    if selected_weekly_datasets:
+        st.caption(
+            f"Source commune à tous les tableaux : {len(quality_dataset_ids)} datasets, "
+            f"dont eSurveillance sur {len(reporting_week_ids)} semaine(s) choisie(s). "
+            "Les rapports mensuels et hebdomadaires sont additionnés avant de calculer les taux."
+        )
     failed_reporting_units = target_df.attrs.get('failed_units', [])
     if failed_reporting_units:
         st.warning(
@@ -1889,7 +2065,7 @@ if df_raw is not None:
     # --- ONGLET 1 : BASE DE DONNÉES ---
     with tab1:
         st.header("Présentation des données brutes")
-        st.write(f"Période affichée : **{mois_debut} à {mois_fin} {annee_choisie}**")
+        st.write(f"Période affichée : **{period_display_label}**")
         df_tab1 = target_df.copy()
         if 'Organisation unit ID' in df_tab1.columns:
             df_tab1 = df_tab1.drop(columns=['Organisation unit ID'])
@@ -1905,7 +2081,7 @@ if df_raw is not None:
     # --- ONGLET 2 : COMPLÉTUDE ---
     with tab2:
         st.header("Analyse de la Complétude")
-        col_actual_strict = [c for c in target_df.columns if 'actual reports' in c.lower() and 'time' not in c.lower()]
+        col_actual_strict = [c for c in reporting_columns if 'actual reports' in c.lower() and 'time' not in c.lower()]
         if col_actual_strict:
             df_actual = target_df[['Organisation unit'] + col_actual_strict].copy()
             for col in col_actual_strict: df_actual[col] = pd.to_numeric(df_actual[col], errors='coerce').fillna(0)
@@ -1914,7 +2090,7 @@ if df_raw is not None:
             with st.expander("Détail Reports Actuals"): st.dataframe(df_actual.head(15))
             df_actual_detail_export = df_actual.copy()
 
-        col_expected_strict = [c for c in target_df.columns if 'expected reports' in c.lower() and 'time' not in c.lower()]
+        col_expected_strict = [c for c in reporting_columns if 'expected reports' in c.lower() and 'time' not in c.lower()]
         if col_expected_strict:
             df_expected = target_df[['Organisation unit'] + col_expected_strict].copy()
             for col in col_expected_strict: df_expected[col] = pd.to_numeric(df_expected[col], errors='coerce').fillna(0)
@@ -1923,7 +2099,7 @@ if df_raw is not None:
             with st.expander("Détail Reports Attendus"): st.dataframe(df_expected.head(15))
             df_expected_detail_export = df_expected.copy()
 
-        col_rate_uniquement = [c for c in target_df.columns if 'reporting rate' in c.lower() and 'on time' not in c.lower()]
+        col_rate_uniquement = [c for c in reporting_columns if 'reporting rate' in c.lower() and 'on time' not in c.lower()]
         df_affichage = target_df[['Organisation unit']].copy()
         if col_rate_uniquement:
             df_affichage = target_df[['Organisation unit'] + col_rate_uniquement].copy()
@@ -1955,8 +2131,8 @@ if df_raw is not None:
     # --- ONGLET 3 : PROMPTITUDE ---
     with tab3:
         st.header("Analyse de la Promptitude")
-        col_rate_ot = [c for c in target_df.columns if 'reporting rate' in c.lower() and 'on time' in c.lower()]
-        actual_ot_cols = [c for c in target_df.columns if 'actual reports' in c.lower() and 'on time' in c.lower()]
+        col_rate_ot = [c for c in reporting_columns if 'reporting rate' in c.lower() and 'on time' in c.lower()]
+        actual_ot_cols = [c for c in reporting_columns if 'actual reports' in c.lower() and 'on time' in c.lower()]
 
         df_final_p = target_df[['Organisation unit']].copy()
         for col in col_rate_ot: df_final_p[col] = pd.to_numeric(target_df[col], errors='coerce').fillna(0).round(2)
@@ -2216,62 +2392,16 @@ if df_raw is not None:
             ["Automatique", "DPS", "ZS"],
             help="Automatique utilise le niveau DHIS2 : province = DPS, zone de santé = ZS."
         )
-        quality_dataset_options = None
-        quality_dataset_ids = None
-        quality_dataset_context = ('weekly-surveillance-v1', id_final, current_user_for_cache)
-        if st.session_state.get('quality_dataset_context') != quality_dataset_context:
-            st.session_state['quality_dataset_context'] = quality_dataset_context
-            st.session_state.pop('quality_evaluation_datasets', None)
-        try:
-            quality_dataset_options = get_quality_dataset_options(id_final, cache_user=current_user_for_cache)
-        except Exception:
-            quality_dataset_options = {
-                'options': [], 'defaults': [], 'labels': {}, 'favorite_ids': [],
-                'warnings': ["Impossible d'identifier les datasets évalués depuis DHIS2."],
-            }
-        if quality_dataset_options is not None:
-            dataset_choices = quality_dataset_options['options']
-            if 'quality_evaluation_datasets' in st.session_state:
-                valid_dataset_choices = [
-                    identifier for identifier in st.session_state['quality_evaluation_datasets']
-                    if identifier in dataset_choices
-                ]
-                if valid_dataset_choices != st.session_state['quality_evaluation_datasets']:
-                    st.session_state['quality_evaluation_datasets'] = valid_dataset_choices
-            quality_dataset_ids = tuple(st.multiselect(
-                "Datasets évalués pour le score qualité", dataset_choices,
-                default=quality_dataset_options['defaults'] if 'quality_evaluation_datasets' not in st.session_state else None,
-                format_func=lambda identifier: quality_dataset_options['labels'][identifier],
-                key='quality_evaluation_datasets',
-                help="eSurveillance Hebdomadaire-Edition 2025 est chargé séparément sur ses semaines. Le service tertiaire est exclu. "
-                     "La sélection s'applique aux taux globaux, aux rapports et au nombre de datasets ≥95 %.",
-            ))
-            st.caption(
-                f"{len(quality_dataset_ids)} dataset(s) sélectionné(s) pour l'évaluation. "
-                "Le nombre atteignant 95 % est calculé séparément pour chaque unité et période."
-            )
-            for message in quality_dataset_options.get('warnings', []):
-                st.warning(message)
-            if not quality_dataset_ids:
-                st.warning("Sélectionnez au moins un dataset pour calculer les indicateurs du score qualité.")
-        quality_dataset_filter = (
-            '; '.join(f"{quality_dataset_options['labels'][uid]} [{uid}]" for uid in quality_dataset_ids)
-            if quality_dataset_ids is not None else 'Datasets du favori'
-        )
-        selected_weekly_datasets = [
-            dataset for dataset in (quality_dataset_options or {}).get('datasets', [])
-            if dataset['id'] in (quality_dataset_ids or ()) and dataset.get('is_weekly')
-        ]
-        quality_weekly_periods = (
-            weekly_periods_for_months(validation_months) if selected_weekly_datasets and validation_months else ()
-        )
+        quality_weekly_periods = ()
+        if selected_weekly_datasets and validation_months:
+            if validation_period_id == period_id:
+                quality_weekly_periods = reporting_week_ids
+                st.caption("La qualité utilise les semaines de surveillance sélectionnées dans la barre latérale.")
+            else:
+                st.caption("La période de l'analyse diffère de la période principale : choisissez ses semaines de surveillance.")
+                quality_weekly_periods = render_week_selection(validation_months, st, 'validation_weeks')
         if quality_weekly_periods:
-            df_weekly_periods_export = pd.DataFrame(weekly_period_schedule(validation_months))
-            st.caption(
-                "eSurveillance : les quatre premières semaines se terminant dans le mois sont retenues. "
-                "La cinquième est reportée au mois suivant et s'ajoute à ses semaines ; "
-                "ce mois peut donc compter cinq semaines."
-            )
+            df_weekly_periods_export = surveillance_period_frame(quality_weekly_periods)
             with st.expander(f"Semaines de surveillance retenues ({len(quality_weekly_periods)})"):
                 st.dataframe(df_weekly_periods_export, hide_index=True, use_container_width=True)
         with st.expander("Consulter les barèmes de catégorisation"):
@@ -2313,13 +2443,17 @@ if df_raw is not None:
             same_reporting_months = validation_period_id == period_id
             same_reporting_datasets = (
                 quality_dataset_options is None or
-                set(quality_dataset_ids) == set(quality_dataset_options['favorite_ids'])
+                set(quality_dataset_ids) == set(target_df.attrs.get('quality_dataset_ids', []))
             )
-            reusable_summary = same_reporting_months and same_reporting_datasets
-            # Une synthèse calculée sur des mois ne certifie pas les périodes hebdomadaires.
-            reusable_summary = reusable_summary and not selected_weekly_datasets
+            same_reporting_weeks = (
+                not selected_weekly_datasets or
+                tuple(target_df.attrs.get('reporting_periods', {}).get('weekly', ())) == tuple(quality_weekly_periods)
+            )
+            reusable_summary = same_reporting_months and same_reporting_datasets and same_reporting_weeks
             quality_metrics = (
-                metrics_from_dashboard_summary(df_synth, target_df, validation_zones_df)
+                metrics_from_dashboard_summary(
+                    df_synth, target_df[['Organisation unit', 'Organisation unit ID'] + reporting_columns], validation_zones_df
+                )
                 if reusable_summary else
                 aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
             )
@@ -2633,7 +2767,10 @@ if df_raw is not None:
                     'Source des indicateurs': quality_source_description,
                     'Datasets évalués': quality_dataset_filter,
                     'Semaines eSurveillance': ';'.join(quality_weekly_periods),
-                    'Règle des semaines': '5e semaine reportée au mois suivant en supplément des semaines de ce mois',
+                    'Règle des semaines': 'Semaines choisies explicitement, sans report automatique',
+                    'Mode de période principale': period_mode,
+                    'Périodicité principale': period_kind,
+                    'Périodes principales sélectionnées': ';'.join(selected_periods),
                     'Barème datasets': profil_bareme,
                     'Analyse des violations': 'Non lancée',
                     'Contrôle des corrections': 'Non effectué',
@@ -2664,7 +2801,10 @@ if df_raw is not None:
             applied_filters['Source des indicateurs'] = quality_source_description
             applied_filters['Datasets évalués'] = quality_dataset_filter
             applied_filters['Semaines eSurveillance'] = ';'.join(quality_weekly_periods)
-            applied_filters['Règle des semaines'] = '5e semaine reportée au mois suivant en supplément des semaines de ce mois'
+            applied_filters['Règle des semaines'] = 'Semaines choisies explicitement, sans report automatique'
+            applied_filters['Mode de période principale'] = period_mode
+            applied_filters['Périodicité principale'] = period_kind
+            applied_filters['Périodes principales sélectionnées'] = ';'.join(selected_periods)
             applied_filters['Analyse M effectuée le'] = saved_validation.get('analysed_at', '')
             applied_filters['Contrôle des corrections effectué le'] = saved_validation.get('corrections_checked_at') or 'Non effectué'
             df_validation_context_export = pd.DataFrame(
