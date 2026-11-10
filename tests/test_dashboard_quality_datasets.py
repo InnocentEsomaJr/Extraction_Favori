@@ -1,6 +1,7 @@
-"""Périodes et semaines explicites partagées par tous les tableaux du dashboard."""
+"""La sélection qualité pilote réellement les requêtes et le score exporté."""
 
 import ast
+from datetime import date
 import unittest
 from unittest import mock
 
@@ -46,8 +47,6 @@ def get_dhis2_client():
                     (17 * len(periods), 17 * len(periods)) if dataset == "SurveillAAA" else (
                         (12, 10) if dataset == "Data0000000" else (
                             (8, 10) if dataset == "Data0000001" else (14, 14))))
-                if dataset != "SurveillAAA":
-                    actual, expected = actual * len(periods), expected * len(periods)
                 number = {"ACTUAL_REPORTS": actual, "EXPECTED_REPORTS": expected,
                           "ACTUAL_REPORTS_ON_TIME": actual, "REPORTING_RATE": actual / expected * 100,
                           "REPORTING_RATE_ON_TIME": actual / expected * 100}[metric]
@@ -71,14 +70,11 @@ class DashboardQualityDatasetsTests(unittest.TestCase):
     def widget(self, app, kind, label):
         return next(item for item in getattr(app, kind) if item.label == label)
 
-    def choice(self, app, label):
-        return next(item for kind in ('selectbox', 'radio') for item in getattr(app, kind) if item.label == label)
-
     def run_app(self, app):
         app.run(timeout=60)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
 
-    def new_app(self):
+    def test_surveillance_replaces_tertiary_in_quality_only_and_recalculates_on_selection(self):
         tree = ast.parse(dashboard_test.DASHBOARD.read_text(encoding='utf-8-sig'))
         names = {'get_data', 'get_quality_reporting_data', 'get_quality_dataset_options'}
         boundaries = {
@@ -96,33 +92,6 @@ def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
         app.session_state['connected'] = True
         app.session_state['dhis2_user'] = 'fixture-datasets-' + self._testMethodName
         app.session_state['dhis2_pass'] = 'fixture-password'
-        return app
-
-    def select_month_range(self, app, first, last, first_year='2026', last_year='2026'):
-        self.widget(app, 'selectbox', "Choisir l'année :").select(first_year)
-        self.widget(app, 'selectbox', 'Année de fin').select(last_year)
-        self.widget(app, 'selectbox', 'Mois début :').select(first)
-        self.widget(app, 'selectbox', 'Mois fin :').select(last)
-        self.run_app(app)
-
-    def assert_shared_reporting(self, app, actual, datasets):
-        for key in ['_test_main_summary', '_test_main_comp']:
-            frame = app.session_state[key]
-            self.assertEqual(frame['Reports_Actual'].tolist(), [actual])
-            self.assertEqual(frame['Reports_Attendu'].tolist(), [actual])
-            self.assertEqual(frame['Complétude_Globale (%)'].tolist(), [100])
-        prompt = app.session_state['_test_main_prompt']
-        self.assertEqual(prompt['Reports_Actual_On_Time'].tolist(), [actual])
-        self.assertEqual(prompt['Promptitude_Globale (%)'].tolist(), [100])
-        self.assertEqual(app.session_state['_test_main_comp']['Nombre des data set complétude >/=95%'].tolist(), [datasets])
-        quality = app.session_state['_test_export_frame']
-        self.assertEqual(quality['Reports_Actual'].tolist(), [actual])
-        self.assertEqual(quality['Nombre de datasets complétude ≥95 %'].tolist(), [datasets])
-        self.assertEqual(quality['Complétude globale (%)'].tolist(), [100])
-        self.assertEqual(quality['Promptitude globale (%)'].tolist(), [100])
-
-    def test_selected_weeks_are_aggregated_in_every_table_and_export(self):
-        app = self.new_app()
         downloads = {}
         real_download = st.download_button
 
@@ -133,148 +102,101 @@ def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')), \
                 mock.patch('streamlit.download_button', side_effect=capture):
             self.run_app(app)
+            self.widget(app, 'selectbox', "Choisir l'année :").select('2026')
+            self.widget(app, 'selectbox', 'Mois début :').select('Septembre')
+            self.widget(app, 'selectbox', 'Mois fin :').select('Septembre')
             app.session_state['_dataset_queries'] = []
-            self.select_month_range(app, 'Septembre', 'Septembre')
+            self.run_app(app)
+            selector = self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité')
             selected = app.session_state['quality_evaluation_datasets']
             self.assertEqual(len(selected), 10)
             self.assertIn('SurveillAAA', selected)
             self.assertNotIn('TertiaryAAA', selected)
-            self.assertEqual(app.session_state['reporting_weeks_selected'], [f'2026W{week}' for week in range(36, 40)])
-            self.assert_shared_reporting(app, 186, 9)
+            self.assertNotIn('Service tertiaire', selector.options)
+            quality = app.session_state['_test_export_frame']
+            self.assertEqual(quality['Reports_Actual'].tolist(), [203])
+            self.assertEqual(quality['Nombre de datasets complétude ≥95 %'].tolist(), [9])
+            self.assertEqual(quality['Complétude globale (%)'].tolist(), [100])
+            self.assertEqual(quality['Promptitude globale (%)'].tolist(), [100])
             queries = app.session_state['_dataset_queries']
-            self.assertTrue(any(query['filters'] == ['pe:202609'] and len(query['items']) == 45 for query in queries))
-            self.assertTrue(any(query['filters'] == ['pe:2026W36;2026W37;2026W38;2026W39']
-                                and len(query['items']) == 5 for query in queries))
-            self.assertFalse(any('tertiaire' in str(column).casefold() for column in app.session_state['_test_main_raw'].columns))
+            self.assertEqual(len(queries), 3)
+            self.assertTrue(any('TertiaryAAA.' in item for item in queries[0]['items']))
+            self.assertEqual(len(queries[1]['items']), 45)
+            self.assertEqual(queries[1]['filters'], ['pe:202609'])
+            self.assertFalse(any('SurveillAAA.' in item for item in queries[1]['items']))
+            self.assertFalse(any('TertiaryAAA.' in item for item in queries[1]['items']))
+            self.assertEqual(len(queries[2]['items']), 5)
+            self.assertTrue(all('SurveillAAA.' in item for item in queries[2]['items']))
+            self.assertEqual(queries[2]['filters'], ['pe:2026W35;2026W36;2026W37;2026W38;2026W39'])
             self.assertTrue(all(query['unit'] == 'ZoneAAAAAAA' for query in queries))
-            for sheet in ['Perf_Final_Completude', 'Synthese_Comparative', 'Resultats_Regles']:
-                _, rows = excel_sheet(downloads['Télécharger Excel'], sheet)
-                self.assertEqual(rows[0]['Reports_Actual'], 186)
-            _, prompt = excel_sheet(downloads['Télécharger Excel'], 'Analyse_Promptitude')
-            self.assertEqual(prompt[0]['Reports_Actual_On_Time'], 186)
             _, periods = excel_sheet(downloads['Télécharger Excel'], 'Periodes_Surveillance')
-            self.assertEqual([row['Semaine'] for row in periods], [f'2026W{week}' for week in range(36, 40)])
+            self.assertEqual([row['Semaine'] for row in periods], [f'2026W{week}' for week in range(35, 40)])
+            self.assertEqual(periods[0], {
+                'Mois': '202609', 'Semaine': '2026W35', 'Début': '2026-08-24', 'Fin': '2026-08-30', 'Reportée': 1,
+            })
+            self.assertEqual([row['Reportée'] for row in periods], [1, 0, 0, 0, 0])
             headers, weekly = excel_sheet(downloads['Télécharger Excel'], 'Reporting_Surveillance')
-            actual = next(column for column in headers if column.endswith('Actual reports'))
-            self.assertEqual(weekly[0][actual], 68)
-
+            weekly_actual = next(column for column in headers if column.endswith('Actual reports'))
+            weekly_expected = next(column for column in headers if column.endswith('Expected reports'))
+            self.assertEqual(weekly[0][weekly_actual], 85)
+            self.assertEqual(weekly[0][weekly_expected], 85)
+            self.assertEqual(weekly[0]['Organisation unit ID'], 'ZoneAAAAAAA')
             self.widget(app, 'button', 'Calculer tous les scores (M et M-1)').click()
             self.run_app(app)
-            self.assertEqual(app.session_state['_test_export_frame'][TOTAL_COL].tolist(), [75])
+            quality = app.session_state['_test_export_frame']
+            self.assertEqual(quality[TOTAL_COL].tolist(), [75])
+            self.assertEqual(quality['Score corrections /20'].tolist(), [0])
             self.assertEqual(app.session_state['_dataset_posts'], 2)
-            self.widget(app, 'multiselect', 'Semaines de surveillance').unselect('2026W39')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 169, 9)
-            self.assertEqual(app.session_state['_dataset_posts'], 2)
-            self.assertEqual(app.session_state['_test_export_frame']['Règles violées (M)'].tolist(), [5])
-            self.assertEqual(app.session_state['_test_export_frame'][TOTAL_COL].tolist(), [75])
-
             self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').unselect('SurveillAAA')
             self.run_app(app)
-            self.assert_shared_reporting(app, 118, 8)
+            quality = app.session_state['_test_export_frame']
+            self.assertEqual(quality['Reports_Actual'].tolist(), [118])
+            self.assertEqual(quality['Nombre de datasets complétude ≥95 %'].tolist(), [8])
+            self.assertEqual(quality['Règles violées (M)'].tolist(), [5])
             self.assertEqual(app.session_state['_dataset_posts'], 2)
+            self.assertTrue(any(
+                len(query['items']) == 45 and not any('SurveillAAA.' in item or 'TertiaryAAA.' in item
+                                                     for item in query['items'])
+                for query in app.session_state['_dataset_queries']
+            ))
             self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').select('SurveillAAA')
+            self.widget(app, 'selectbox', 'Mois début :').select('Novembre')
+            self.widget(app, 'selectbox', 'Mois fin :').select('Novembre')
             self.run_app(app)
-            self.choice(app, 'Choix des semaines').set_value('Intervalle de semaines')
+            self.assertEqual(app.session_state['_test_export_frame']['Reports_Actual'].tolist(), [186])
+            _, november = excel_sheet(downloads['Télécharger Excel'], 'Periodes_Surveillance')
+            self.assertEqual([row['Semaine'] for row in november], [f'2026W{week}' for week in range(44, 48)])
+            self.assertEqual([row['Reportée'] for row in november], [0, 0, 0, 0])
+            self.widget(app, 'selectbox', 'Mois début :').select('Décembre')
+            self.widget(app, 'selectbox', 'Mois fin :').select('Décembre')
             self.run_app(app)
-            self.widget(app, 'selectbox', 'Semaine de début').select('2026W36')
-            self.widget(app, 'selectbox', 'Semaine de fin').select('2026W39')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 186, 9)
+            self.assertEqual(app.session_state['_test_export_frame']['Reports_Actual'].tolist(), [203])
+            _, december = excel_sheet(downloads['Télécharger Excel'], 'Periodes_Surveillance')
+            self.assertEqual([row['Semaine'] for row in december], [f'2026W{week}' for week in range(48, 53)])
+            self.assertEqual(december[0], {
+                'Mois': '202612', 'Semaine': '2026W48', 'Début': '2026-11-23', 'Fin': '2026-11-29', 'Reportée': 1,
+            })
+            self.assertEqual([row['Reportée'] for row in december], [1, 0, 0, 0, 0])
             self.assertEqual(app.session_state['_dataset_posts'], 2)
-
+            self.widget(app, 'button', "Lancer l'analyse des violations").click()
+            self.run_app(app)
+            self.assertIn('categorisation_result', app.session_state)
+            self.assertEqual(app.session_state['_dataset_posts'], 3)
             app.session_state['_dataset_fail_weekly'] = True
-            self.select_month_range(app, 'Octobre', 'Octobre')
-            for key, columns in [
-                ('_test_main_summary', ['Reports_Actual', 'Complétude_Globale (%)', 'Promptitude_Globale (%)']),
-                ('_test_main_comp', ['Reports_Actual', 'Complétude_Globale (%)']),
-                ('_test_main_prompt', ['Reports_Actual_On_Time', 'Promptitude_Globale (%)']),
-                ('_test_export_frame', ['Reports_Actual', 'Complétude globale (%)', 'Promptitude globale (%)', TOTAL_COL]),
-            ]:
-                self.assertTrue(app.session_state[key][columns].isna().all().all())
+            self.widget(app, 'date_input', 'Date de début').set_value(date(2026, 10, 1))
+            self.widget(app, 'date_input', 'Date de fin').set_value(date(2026, 10, 31))
+            self.run_app(app)
+            failed = app.session_state['_test_export_frame']
+            self.assertTrue(failed[[
+                'Complétude globale (%)', 'Promptitude globale (%)', 'Reports_Actual',
+                'Nombre de datasets complétude ≥95 %', TOTAL_COL,
+            ]].isna().all().all())
+            self.assertTrue(failed['Règles violées (M)'].isna().all())
             self.assertNotIn('categorisation_result', app.session_state)
-            self.assertEqual(app.session_state['_dataset_posts'], 2)
-
-    def test_fixed_semester_quarter_year_and_cross_year_interval_use_all_selected_periods(self):
-        app = self.new_app()
-        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
-            self.run_app(app)
-            self.widget(app, 'selectbox', "Choisir l'année :").select('2026')
-            self.choice(app, 'Mode de sélection de la période').set_value('Période fixe')
-            self.choice(app, 'Périodicité').set_value('Semestriel')
-            self.run_app(app)
-            self.widget(app, 'selectbox', 'Semestre').select('2026S1')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 118 * 6 + 17 * 26, 9)
-            self.assertEqual(app.session_state['reporting_weeks_selected'], [f'2026W{week}' for week in range(1, 27)])
-            self.assertTrue(any(query['filters'] == ['pe:202601;202602;202603;202604;202605;202606']
-                                for query in app.session_state['_dataset_queries']))
-            self.choice(app, 'Périodicité').set_value('Trimestriel')
-            self.run_app(app)
-            self.widget(app, 'selectbox', 'Trimestre').select('2026Q1')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 118 * 3 + 17 * 13, 9)
-            self.choice(app, 'Périodicité').set_value('Annuel')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 118 * 12 + 17 * 52, 9)
-
-            self.choice(app, 'Mode de sélection de la période').set_value('Intervalle')
-            self.choice(app, 'Périodicité').set_value('Mensuel')
-            self.run_app(app)
-            self.select_month_range(app, 'Novembre', 'Février', last_year='2027')
-            self.assert_shared_reporting(app, 118 * 4 + 17 * 18, 9)
-            self.assertTrue(any(query['filters'] == ['pe:202611;202612;202701;202702']
-                                for query in app.session_state['_dataset_queries']))
-            self.assertIn('2026W53', app.session_state['reporting_weeks_selected'])
-            self.assertIn('2027W8', app.session_state['reporting_weeks_selected'])
-            self.assertEqual(len(app.session_state['reporting_weeks_selected']), 18)
-            self.assertNotIn('_dataset_posts', app.session_state)
-
-    def test_weekly_and_quarterly_intervals_keep_explicit_weeks_and_year_bounds(self):
-        app = self.new_app()
-        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
-            self.run_app(app)
-            self.widget(app, 'selectbox', "Choisir l'année :").select('2026')
-            self.widget(app, 'selectbox', 'Année de fin').select('2026')
-            self.choice(app, 'Périodicité').set_value('Hebdomadaire')
-            self.run_app(app)
-            self.widget(app, 'selectbox', 'Semaine de début de période').select('2026W36')
-            self.widget(app, 'selectbox', 'Semaine de fin de période').select('2026W39')
-            self.run_app(app)
-            weeks = [f'2026W{week}' for week in range(36, 40)]
-            self.assertEqual(app.session_state['reporting_weeks_selected'], weeks)
-            self.assert_shared_reporting(app, 118 * 2 + 17 * 4, 9)
-            queries = app.session_state['_dataset_queries']
-            self.assertTrue(any(query['filters'] == ['pe:202608;202609'] for query in queries))
-            self.assertTrue(any(query['filters'] == ['pe:' + ';'.join(weeks)] for query in queries))
-            captions = '\n'.join(str(item.value) for item in app.caption)
-            self.assertIn('Mois entiers utilisés pour les datasets mensuels : 202608, 202609', captions)
-
-            self.choice(app, 'Périodicité').set_value('Annuel')
-            self.run_app(app)
-            self.assertEqual(self.widget(app, 'selectbox', 'Année de fin').value, '2026')
-            self.assert_shared_reporting(app, 118 * 12 + 17 * 52, 9)
-            self.choice(app, 'Mode de sélection de la période').set_value('Période fixe')
-            self.run_app(app)
-            self.choice(app, 'Mode de sélection de la période').set_value('Intervalle')
-            self.choice(app, 'Périodicité').set_value('Mensuel')
-            self.run_app(app)
-            self.assertEqual(self.widget(app, 'selectbox', 'Année de fin').value, '2026')
-
-            self.choice(app, 'Périodicité').set_value('Trimestriel')
-            self.widget(app, 'selectbox', 'Année de fin').select('2027')
-            self.run_app(app)
-            self.widget(app, 'selectbox', 'Trimestre de début').select('2026Q3')
-            self.widget(app, 'selectbox', 'Trimestre de fin').select('2027Q1')
-            self.run_app(app)
-            self.assert_shared_reporting(app, 118 * 9 + 17 * 39, 9)
-            self.assertEqual(len(app.session_state['reporting_weeks_selected']), 39)
-            self.assertEqual(app.session_state['reporting_weeks_selected'][0], '2026W27')
-            self.assertEqual(app.session_state['reporting_weeks_selected'][-1], '2027W12')
-            months = ['202607', '202608', '202609', '202610', '202611', '202612', '202701', '202702', '202703']
-            self.assertTrue(any(query['filters'] == ['pe:' + ';'.join(months)]
-                                for query in app.session_state['_dataset_queries']))
-            self.assertNotIn('_dataset_posts', app.session_state)
+            self.assertEqual(app.session_state['_dataset_posts'], 3)
+            warnings = '\n'.join(str(item.value) for kind in ['warning', 'text'] for item in getattr(app, kind))
+            self.assertIn('weekly', warnings)
+            self.assertIn('Analytics', warnings)
 
 
 if __name__ == '__main__':
