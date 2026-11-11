@@ -176,19 +176,41 @@ temps sont additionnés avant de recalculer les taux globaux ; eSurveillance com
 une seule fois parmi les datasets à 95 %, quel que soit le nombre de semaines.
 Ces requêtes utilisent les [métriques de reporting Analytics de DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
 
-**Règle des semaines :** les quatre premières semaines dont le dimanche tombe dans
-le mois sont retenues. Toute cinquième semaine est affectée au mois suivant et
-s'ajoute à ses semaines : un mois peut donc en compter cinq. Septembre 2026 utilise
-W35–W39 (W35 reportée d'août), novembre W44–W47, décembre W48–W52 (W48 reportée de
-novembre). Cette règle, confirmée après la capture W36–W39, couvre toutes les semaines
-sans doublon ; les dates réelles et les reports sont affichés dans l'onglet qualité.
+**Périodes et semaines choisies :** la barre latérale propose une période fixe
+mensuelle, trimestrielle, semestrielle, annuelle, hebdomadaire ou journalière, ainsi qu'un intervalle
+de ces périodes sur une ou plusieurs années. Les trimestres, semestres et années sont
+développés en mois entiers pour les datasets mensuels. Les deux bornes affichées sont
+**incluses** : un trimestre se termine le dernier jour de son troisième mois, et le
+trimestre suivant commence le lendemain. Les dates de validation sont initialisées
+sur les bornes exactes demandées et restent modifiables.
+
+Une semaine ISO reste entière, du lundi au dimanche, et est rattachée au **mois de
+son dimanche de fin**. W36–W39 de 2026 couvre réellement le 31 août–27 septembre,
+mais n'ajoute pas août aux datasets mensuels : seul septembre est agrégé. W40 se
+termine le 4 octobre et appartient à octobre. La référence M-1 suit le mois précédant
+le premier mois de reporting retenu. Les mois agrégés, les dates demandées et la
+couverture réelle des semaines sont affichés et exportés séparément.
+
+Les semaines de surveillance se choisissent librement ou par semaine de début et de
+fin. Par défaut, la sélection couvre les semaines dont le dimanche est compris dans
+l'intervalle inclusif. L'option « Semaines entièrement comprises » exige que le lundi
+et le dimanche soient tous deux dans cet intervalle. La sélection
+peut être modifiée et ne comporte aucune limite de quatre ou cinq semaines. Aucun
+report automatique de cinquième semaine n'est appliqué. Un semestre peut ainsi utiliser
+toutes ses semaines, ou seulement celles que l'utilisateur a retenues.
+Une semaine ajoutée manuellement hors des bornes reste visible et signalée ; aucun
+rapport hebdomadaire ni mensuel n'est découpé ou calculé au prorata des jours.
 L'export ajoute les feuilles `Periodes_Surveillance` et `Reporting_Surveillance`.
 
 Une surveillance indisponible ne devient pas un dataset inactif : le score de l'unité
-reste incomplet, tandis que les autres unités restent affichées. La synthèse des
-autres onglets n'est réutilisée que pour les mêmes mois, la même sélection de datasets
-et en l'absence de dataset hebdomadaire ; une source mensuelle ne certifie pas les
-semaines de surveillance.
+reste incomplet, tandis que les autres unités restent affichées. La source combinée
+mensuelle et hebdomadaire alimente désormais **tous les tableaux** : complétude,
+promptitude, analyse comparative et qualité. Les anciennes colonnes de reporting du
+favori sont remplacées avant les calculs, afin de ne compter aucun dataset deux fois ;
+ses autres indicateurs restent disponibles. La qualité réutilise cette synthèse
+seulement pour les mêmes mois, datasets et semaines. Une période qualité indépendante
+dispose de son propre choix de semaines. Changer les semaines recalcule les indicateurs
+sans relancer les requêtes M/M-1 déjà reçues.
 
 Les deux actions existantes restent séparées :
 
