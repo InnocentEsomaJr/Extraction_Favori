@@ -7,6 +7,7 @@ from quality_datasets import (
     quality_dataset_selection, reporting_dataset_ids, select_quality_datasets,
 )
 from scoped_analytics import METRIC_LABELS, build_quality_reporting_query
+from quality_reporting import split_quality_reporting_query
 
 
 class QualityDatasetSelectionTests(unittest.TestCase):
@@ -236,6 +237,115 @@ class QualityDatasetSelectionTests(unittest.TestCase):
         dataset = selection['datasets'][0]
         self.assertEqual(dataset['periodType'], 'Weekly')
         self.assertTrue(dataset['is_weekly'])
+
+    def test_mixed_favorite_keeps_supported_sources_without_reclassifying_quarterly(self):
+        favorite = {'dataDimensionItems': [
+            {'reportingRate': {'dataSet': {'id': identifier, 'displayName': name, 'periodType': period_type},
+                               'metric': 'REPORTING_RATE'}}
+            for identifier, name, period_type in [
+                ('MonthlyAAAA', 'Service mensuel', 'monthly'),
+                ('QuarterAAAA', 'Collecte trimestrielle', 'Quarterly'),
+                ('WeeklyAAAAA', 'eSurveillance Hebdomadaire-Edition 2025', 'weekly'),
+            ]
+        ]}
+        before = deepcopy(favorite)
+        selection = quality_dataset_selection(favorite, surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
+        self.assertEqual(selection['defaults'], ['MonthlyAAAA', 'WeeklyAAAAA'])
+        self.assertEqual(set(selection['options']), {'MonthlyAAAA', 'WeeklyAAAAA'})
+        self.assertEqual(selection['favorite_ids'], ['MonthlyAAAA', 'QuarterAAAA', 'WeeklyAAAAA'])
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        self.assertEqual(records['QuarterAAAA']['periodType'], 'Quarterly')
+        self.assertFalse(records['QuarterAAAA']['supported_for_quality'])
+        self.assertFalse(records['QuarterAAAA']['is_weekly'])
+        self.assertTrue(records['MonthlyAAAA']['supported_for_quality'])
+        self.assertTrue(records['WeeklyAAAAA']['is_weekly'])
+        self.assertTrue(any('non inclus' in warning and 'Collecte trimestrielle (Quarterly)' in warning
+                            for warning in selection['warnings']))
+        chosen = select_quality_datasets(favorite, selection['defaults'], selection['datasets'])
+        params, labels = build_quality_reporting_query(chosen, '202609', 'ZoneAAAAAAA')
+        groups = split_quality_reporting_query(params, labels, selection['datasets'], ['2026W36'])
+        self.assertEqual([group['kind'] for group in groups], ['monthly', 'weekly'])
+        self.assertEqual([group['dataset_ids'] for group in groups], [('MonthlyAAAA',), ('WeeklyAAAAA',)])
+        self.assertNotIn('QuarterAAAA', str(params))
+        self.assertEqual(favorite, before)
+
+    def test_explicit_unsupported_catalog_types_are_not_offered_or_selected(self):
+        catalog = [
+            {'id': identifier, 'name': name, 'periodType': period_type}
+            for identifier, name, period_type in [
+                ('QuarterAAAA', 'Collecte trimestrielle', 'Quarterly'),
+                ('YearlyAAAAA', 'Collecte annuelle', 'Yearly'),
+                ('WedWeekAAAA', 'Collecte du mercredi', 'WeeklyWednesday'),
+                ('DailyAAAAAA', 'Collecte quotidienne', 'Daily'),
+            ]
+        ]
+        favorite = self.favorite()
+        selection = quality_dataset_selection(favorite, catalog)
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        for entry in catalog:
+            with self.subTest(period_type=entry['periodType']):
+                record = records[entry['id']]
+                self.assertEqual(record['periodType'], entry['periodType'])
+                self.assertFalse(record['supported_for_quality'])
+                self.assertFalse(record['is_weekly'])
+                self.assertNotIn(entry['id'], selection['options'])
+                self.assertNotIn(entry['id'], selection['defaults'])
+                with self.assertRaisesRegex(ValueError, 'Périodicité non prise en charge') as caught:
+                    select_quality_datasets(favorite, ['DatasetAAAA', entry['id']], selection['datasets'])
+                self.assertIn(entry['name'], str(caught.exception))
+                self.assertIn(entry['periodType'], str(caught.exception))
+
+    def test_all_unsupported_favorite_is_explicit_and_never_falls_back_to_monthly(self):
+        favorite = {'dataDimensionItems': [
+            {'reportingRate': {'dataSet': dataset, 'metric': 'REPORTING_RATE'}}
+            for dataset in [
+                {'id': 'QuarterAAAA', 'name': 'Collecte trimestrielle', 'periodType': 'Quarterly'},
+                {'id': 'YearlyAAAAA', 'name': 'Collecte annuelle', 'periodType': 'Yearly'},
+            ]
+        ]}
+        selection = quality_dataset_selection(favorite)
+        self.assertEqual(selection['options'], [])
+        self.assertEqual(selection['defaults'], [])
+        self.assertEqual(selection['favorite_ids'], ['QuarterAAAA', 'YearlyAAAAA'])
+        self.assertTrue(all(not dataset['supported_for_quality'] for dataset in selection['datasets']))
+        excluded_warning = next(warning for warning in selection['warnings'] if 'non inclus' in warning)
+        self.assertIn('Collecte trimestrielle (Quarterly)', excluded_warning)
+        self.assertIn('Collecte annuelle (Yearly)', excluded_warning)
+        with self.assertRaisesRegex(ValueError, 'Périodicité non prise en charge'):
+            select_quality_datasets(favorite, ['QuarterAAAA'])
+
+    def test_unsupported_requested_surveillance_is_present_but_not_eligible(self):
+        name = 'eSurveillance Hebdomadaire-Edition 2025'
+        selection = quality_dataset_selection(self.favorite(), [
+            {'id': 'WedWeekAAAA', 'name': name, 'periodType': 'WeeklyWednesday'},
+        ], surveillance_name=name)
+        self.assertEqual(selection['defaults'], ['DatasetAAAA'])
+        self.assertNotIn('WedWeekAAAA', selection['options'])
+        self.assertNotIn('WedWeekAAAA', selection['surveillance_ids'])
+        self.assertFalse(any('absent des métadonnées' in warning for warning in selection['warnings']))
+        self.assertTrue(any(name in warning and 'WeeklyWednesday' in warning and 'non inclus' in warning
+                            for warning in selection['warnings']))
+
+    def test_missing_legacy_type_stays_allowed_and_explicit_type_is_authoritative(self):
+        favorite = self.favorite()
+        for item in favorite['dataDimensionItems']:
+            item['reportingRate']['dataSet']['periodType'] = 'Quarterly'
+        selection = quality_dataset_selection(favorite, [
+            {'id': 'DatasetAAAA', 'name': 'Consultations', 'periodType': {'name': 'MONTHLY'}},
+            {'id': 'WeeklyAAAAA', 'name': 'eSurveillance Hebdomadaire-Edition 2025'},
+            {'id': 'LegacyAAAAA', 'name': 'Collecte historique'},
+        ], surveillance_name='eSurveillance Hebdomadaire-Edition 2025')
+        records = {dataset['id']: dataset for dataset in selection['datasets']}
+        self.assertEqual(records['DatasetAAAA']['periodType'], 'Monthly')
+        self.assertTrue(records['DatasetAAAA']['supported_for_quality'])
+        self.assertEqual(records['LegacyAAAAA']['periodType'], '')
+        self.assertTrue(records['LegacyAAAAA']['supported_for_quality'])
+        self.assertFalse(records['LegacyAAAAA']['is_weekly'])
+        self.assertTrue(records['WeeklyAAAAA']['supported_for_quality'])
+        self.assertTrue(records['WeeklyAAAAA']['is_weekly'])
+        self.assertIn('LegacyAAAAA', selection['options'])
+        chosen = select_quality_datasets(favorite, ['DatasetAAAA', 'LegacyAAAAA'], selection['datasets'])
+        self.assertEqual(reporting_dataset_ids(chosen), ('DatasetAAAA', 'LegacyAAAAA'))
 
     def test_exact_selected_scope_replaces_all_old_dx_but_preserves_extra_filters(self):
         favorite = self.favorite()

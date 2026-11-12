@@ -5,10 +5,58 @@ import unittest
 
 import pandas as pd
 
-from reporting_source import replace_reporting_source
+from reporting_source import replace_reporting_source, recover_monthly_reporting, available_reporting_summary
 
 
 class ReportingSourceTests(unittest.TestCase):
+    def test_recovery_preserves_only_selected_monthly_cells_and_marks_total_incomplete(self):
+        source = self.favorite()
+        source['Tertiaire Actual reports'] = 999
+        source['Surveillance Actual reports'] = 68
+        source.attrs['reporting_item_labels'] = {
+            'DatasetAAAA.ACTUAL_REPORTS': 'Dataset Actual reports',
+            'DatasetAAAA.EXPECTED_REPORTS': 'Dataset Expected reports',
+            'TertiaryAAA.ACTUAL_REPORTS': 'Tertiaire Actual reports',
+            'WeeklyAAAAA.ACTUAL_REPORTS': 'Surveillance Actual reports',
+        }
+        recovered = recover_monthly_reporting(source, ['ZoneAAAAAAA'], ['DatasetAAAA'], ['Erreur reçue'])
+        self.assertEqual(recovered['Dataset Actual reports'].tolist(), [999])
+        self.assertNotIn('Tertiaire Actual reports', recovered)
+        self.assertNotIn('Surveillance Actual reports', recovered)
+        self.assertEqual(recovered.attrs['failed_units'], ['ZoneAAAAAAA'])
+        self.assertEqual(recovered.attrs['failed_cells_by_unit'], {})
+        self.assertEqual(recovered.attrs['reporting_warnings'], ['Erreur reçue'])
+        self.assertEqual(recovered.attrs['reporting_status'], 'partial')
+
+    def test_recovery_never_uses_name_guesses_or_other_units(self):
+        recovered = recover_monthly_reporting(self.favorite(), ['ZoneZZZZZZZ'], ['DatasetAAAA'])
+        self.assertEqual(recovered['Organisation unit ID'].tolist(), ['ZoneZZZZZZZ'])
+        self.assertEqual(recovered.attrs['reporting_columns'], [])
+        self.assertEqual(recovered.attrs['reporting_status'], 'unavailable')
+
+    def test_unselected_dataset_failure_does_not_hide_recovered_monthly_cells(self):
+        from reporting_availability import mask_failed_reporting_cells
+        source = self.favorite()
+        source.attrs.update({
+            'reporting_item_labels': {'DatasetAAAA.ACTUAL_REPORTS': 'Dataset Actual reports'},
+            'failed_units': ['ZoneAAAAAAA'],
+            'failed_metrics_by_unit': {'ZoneAAAAAAA': ['TertiaryAAA.ACTUAL_REPORTS']},
+        })
+        recovered = recover_monthly_reporting(source, ['ZoneAAAAAAA'], ['DatasetAAAA'])
+        self.assertEqual(recovered.attrs['failed_cells_by_unit'], {})
+        visible = mask_failed_reporting_cells(recovered, recovered)
+        self.assertEqual(visible['Dataset Actual reports'].tolist(), [999])
+
+    def test_available_summary_keeps_received_zero_and_missing_weekly_distinct(self):
+        source = self.combined()
+        source.loc[1, source.attrs['weekly_reporting_columns']] = float('nan')
+        source.attrs['failed_units'] = ['ZoneAAAAAAA']
+        summary = available_reporting_summary(source)
+        self.assertEqual(summary['Rapports mensuels disponibles'].tolist(), [0, 90])
+        self.assertEqual(summary.loc[0, 'Rapports hebdomadaires disponibles'], 0)
+        self.assertTrue(pd.isna(summary.loc[1, 'Rapports hebdomadaires disponibles']))
+        self.assertEqual(summary['État des sources'].tolist(), ['Complet', 'Incomplet'])
+
     def favorite(self):
         frame = pd.DataFrame({
             'Organisation unit ID': ['ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC'],

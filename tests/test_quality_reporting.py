@@ -198,12 +198,127 @@ class QualityReportingTests(unittest.TestCase):
         self.assertEqual(len(result.columns), 12)
         self.assertEqual(metrics_from_reporting_source(result, self.targets(UNITS[:1])).loc[0, 'Actual_Reports'], 158)
 
-    def test_unsupported_period_type_missing_weeks_or_unknown_dataset_never_call_api(self):
+    def test_uid_only_labels_are_joined_by_item_id_after_server_names_are_added(self):
+        params, labels, datasets = self.selection()
+        labels = {item: f'{item.rsplit(".", 1)[0]} {METRIC_LABELS[item.rsplit(".", 1)[1]]}' for item in labels}
+        client, _ = self.client()
+        original = client.get.side_effect
+
+        def get(endpoint, params=None):
+            response = original(endpoint, params)
+            response['metaData']['items'].update({
+                'MonthlyAAAA': {'displayName': 'Consultations'},
+                'WeeklyAAAAA': {'displayName': 'Surveillance enrichie'},
+            })
+            return response
+
+        client.get.side_effect = get
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS[:1], WEEKS)
+        expected = {
+            f'{dataset}.{metric}': f'{name} {suffix}'
+            for dataset, name in [('MonthlyAAAA', 'Consultations'), ('WeeklyAAAAA', 'Surveillance enrichie')]
+            for metric, suffix in METRIC_LABELS.items()
+        }
+        self.assertEqual(result.attrs['reporting_item_labels'], expected)
+        self.assertEqual(result.attrs['weekly_reporting_columns'], [expected[item] for item in expected if item.startswith('WeeklyAAAAA.')])
+        self.assertEqual(result[expected['MonthlyAAAA.ACTUAL_REPORTS']].tolist(), [90])
+        self.assertEqual(result[expected['WeeklyAAAAA.ACTUAL_REPORTS']].tolist(), [68])
+        self.assertEqual(metrics_from_reporting_source(result, self.targets(UNITS[:1])).loc[0, 'Actual_Reports'], 158)
+
+    def test_metadata_homonyms_from_separate_sources_keep_distinct_dataset_families(self):
+        params, labels, datasets = self.selection()
+        labels = {item: f'{item.rsplit(".", 1)[0]} {METRIC_LABELS[item.rsplit(".", 1)[1]]}' for item in labels}
+        client, _ = self.client()
+        original = client.get.side_effect
+
+        def get(endpoint, params=None):
+            response = original(endpoint, params)
+            response['metaData']['items'].update({dataset: {'displayName': 'Commun'} for dataset in ['MonthlyAAAA', 'WeeklyAAAAA']})
+            return response
+
+        client.get.side_effect = get
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS[:1], WEEKS)
+        expected = {f'{dataset}.{metric}': f'Commun ({dataset}) {suffix}'
+                    for dataset in ['MonthlyAAAA', 'WeeklyAAAAA'] for metric, suffix in METRIC_LABELS.items()}
+        self.assertEqual(result.attrs['reporting_item_labels'], expected)
+        self.assertEqual(len(set(result.columns)), 12)
+        self.assertEqual(result[expected['MonthlyAAAA.ACTUAL_REPORTS']].tolist(), [90])
+        self.assertEqual(result[expected['WeeklyAAAAA.ACTUAL_REPORTS']].tolist(), [68])
+        self.assertEqual(metrics_from_reporting_source(result, self.targets(UNITS[:1])).loc[0, 'Nombre_Datasets_95'], 1)
+
+    def test_one_enriched_metric_supplies_a_coherent_prefix_for_its_whole_family(self):
+        params, labels, datasets = self.selection()
+        labels = {item: f'{item.rsplit(".", 1)[0]} {METRIC_LABELS[item.rsplit(".", 1)[1]]}' for item in labels}
+        client, _ = self.client()
+        original = client.get.side_effect
+
+        def get(endpoint, params=None):
+            response = original(endpoint, params)
+            response['metaData']['items']['MonthlyAAAA.ACTUAL_REPORTS'] = {'displayName': 'Consultations Actual reports'}
+            return response
+
+        client.get.side_effect = get
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS[:1], WEEKS)
+        mapping = result.attrs['reporting_item_labels']
+        self.assertEqual({mapping[f'MonthlyAAAA.{metric}'] for metric in METRIC_LABELS},
+                         {f'Consultations {suffix}' for suffix in METRIC_LABELS.values()})
+        self.assertEqual(metrics_from_reporting_source(result, self.targets(UNITS[:1])).loc[0, 'Actual_Reports'], 158)
+
+    def test_failed_metrics_keep_their_item_identity_when_other_unit_metadata_enriches_names(self):
+        params, labels, datasets = self.selection()
+        labels = {item: f'{item.rsplit(".", 1)[0]} {METRIC_LABELS[item.rsplit(".", 1)[1]]}' for item in labels}
+        client, _ = self.client(weekly_failure=UNITS[0])
+        original = client.get.side_effect
+
+        def get(endpoint, params=None):
+            response = original(endpoint, params)
+            response['metaData']['items'].update({
+                'MonthlyAAAA': {'displayName': 'Mensuel enrichi'},
+                'WeeklyAAAAA': {'displayName': 'Hebdomadaire enrichi'},
+            })
+            return response
+
+        client.get.side_effect = get
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS, WEEKS)
+        self.assertEqual(result.attrs['failed_metrics_by_unit'], {UNITS[0]: [f'WeeklyAAAAA.{metric}' for metric in METRIC_LABELS]})
+        self.assertTrue(result.loc[0, result.attrs['weekly_reporting_columns']].isna().all())
+        self.assertEqual(result.loc[1, result.attrs['reporting_item_labels']['WeeklyAAAAA.ACTUAL_REPORTS']], 68)
+        masked = mask_failed_reporting_units(metrics_from_reporting_source(result, self.targets()), result)
+        self.assertTrue(masked.iloc[0, 1:].isna().all())
+        self.assertEqual(masked.loc[1, 'Actual_Reports'], 158)
+
+    def test_missing_week_selection_preserves_received_monthly_values_without_a_weekly_request(self):
+        params, labels, datasets = self.selection()
+        client, calls = self.client()
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS[:1], [])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]['weekly'])
+        self.assertEqual(result['Mensuel Actual reports'].tolist(), [90])
+        self.assertTrue(result[result.attrs['weekly_reporting_columns']].isna().all().all())
+        self.assertEqual(result.attrs['reporting_periods'], {'monthly': ('202609',), 'weekly': ()})
+        self.assertEqual(result.attrs['failed_units'], UNITS[:1])
+        self.assertEqual(result.attrs['failed_metrics_by_unit'], {UNITS[0]: [f'WeeklyAAAAA.{metric}' for metric in METRIC_LABELS]})
+        self.assertTrue(any('Aucune semaine de surveillance sélectionnée' in warning for warning in result.attrs['reporting_warnings']))
+        masked = mask_failed_reporting_units(metrics_from_reporting_source(result, self.targets(UNITS[:1])), result)
+        self.assertTrue(masked.iloc[0, 1:].isna().all())
+
+    def test_weekly_only_missing_selection_keeps_known_units_and_schema_without_any_request(self):
+        params, labels, datasets = self.selection(weekly_only=True)
+        client, _ = self.client()
+        result = fetch_quality_reporting(client, params, labels, datasets, UNITS, [])
+        client.get.assert_not_called()
+        self.assertEqual(result['Organisation unit ID'].tolist(), UNITS)
+        self.assertEqual(result.attrs['failed_units'], UNITS)
+        self.assertEqual(result.attrs['reporting_item_labels'], labels)
+        self.assertTrue(result[result.attrs['weekly_reporting_columns']].isna().all().all())
+        self.assertEqual(result.attrs['reporting_status'], 'unavailable')
+
+    def test_unsupported_period_type_or_invalid_week_periods_never_call_api(self):
         params, labels, datasets = self.selection()
         client, _ = self.client()
         invalid = deepcopy(datasets)
         invalid[0]['periodType'] = 'Quarterly'
-        for records, weeks in [(invalid, WEEKS), (datasets, []), (datasets[:1], WEEKS), (datasets, ['2026W54'])]:
+        for records, weeks in [(invalid, WEEKS), (datasets[:1], WEEKS), (datasets, ['2026W54'])]:
             with self.subTest(records=records, weeks=weeks):
                 with self.assertRaises(ValueError):
                     fetch_quality_reporting(client, params, labels, records, UNITS, weeks)

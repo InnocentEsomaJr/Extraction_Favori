@@ -5,6 +5,7 @@ from datetime import date
 import unittest
 from unittest import mock
 
+import pandas as pd
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
@@ -49,6 +50,8 @@ def get_dhis2_client():
                             (8, 10) if dataset == "Data0000001" else (14, 14))))
                 if dataset != "SurveillAAA":
                     actual, expected = actual * len(periods), expected * len(periods)
+                if dataset == "Data0000000" and st.session_state.get("_dataset_zero_monthly"):
+                    actual = 0
                 number = {"ACTUAL_REPORTS": actual, "EXPECTED_REPORTS": expected,
                           "ACTUAL_REPORTS_ON_TIME": actual, "REPORTING_RATE": actual / expected * 100,
                           "REPORTING_RATE_ON_TIME": actual / expected * 100}[metric]
@@ -82,7 +85,7 @@ class DashboardQualityDatasetsTests(unittest.TestCase):
         app.run(timeout=60)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
 
-    def new_app(self):
+    def new_app(self, replacements=None):
         tree = ast.parse(dashboard_test.DASHBOARD.read_text(encoding='utf-8-sig'))
         names = {'get_data', 'get_quality_reporting_data', 'get_quality_dataset_options'}
         boundaries = {
@@ -95,12 +98,45 @@ class DashboardQualityDatasetsTests(unittest.TestCase):
 def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
     return {}, {}, []
 ''',
+            **(replacements or {}),
         })
         app = AppTest.from_string(source, default_timeout=60)
         app.session_state['connected'] = True
         app.session_state['dhis2_user'] = 'fixture-datasets-' + self._testMethodName
         app.session_state['dhis2_pass'] = 'fixture-password'
         return app
+
+    def available_view(self, app):
+        return next(item.value for item in app.dataframe if 'Rapports mensuels disponibles' in item.value.columns)
+
+    def assert_partial_monthly_visible(self, app, monthly=118):
+        raw = app.session_state['_test_main_raw']
+        monthly_columns = raw.attrs['monthly_reporting_columns']
+        actual_columns = [column for column in monthly_columns if column.endswith(' Actual reports')]
+        self.assertEqual(raw[actual_columns].sum(axis=1, min_count=1).tolist(), [monthly])
+        for key, suffix in [('_test_main_comp', ' Reporting rate'), ('_test_main_prompt', ' Reporting rate on time')]:
+            frame = app.session_state[key]
+            columns = [column for column in monthly_columns if column.endswith(suffix)]
+            self.assertTrue(columns)
+            self.assertFalse(frame[columns].isna().any().any())
+            self.assertIn(80, frame[columns].iloc[0].tolist())
+        weekly_columns = raw.attrs.get('weekly_reporting_columns', [])
+        if weekly_columns:
+            self.assertTrue(raw[weekly_columns].isna().all().all())
+        for key, columns in [
+            ('_test_main_summary', ['Reports_Actual', 'Complétude_Globale (%)', 'Promptitude_Globale (%)']),
+            ('_test_main_comp', ['Reports_Actual', 'Complétude_Globale (%)']),
+            ('_test_main_prompt', ['Reports_Actual_On_Time', 'Promptitude_Globale (%)']),
+            ('_test_export_frame', ['Reports_Actual', 'Complétude globale (%)', 'Promptitude globale (%)', TOTAL_COL]),
+        ]:
+            self.assertTrue(app.session_state[key][columns].isna().all().all())
+        available = self.available_view(app)
+        self.assertEqual(pd.to_numeric(available['Rapports mensuels disponibles']).tolist(), [monthly])
+        self.assertTrue(pd.to_numeric(available['Rapports hebdomadaires disponibles'], errors='coerce').isna().all())
+        self.assertEqual(available['État des sources'].tolist(), ['Incomplet'])
+        text = '\n'.join(str(item.value) for kind in ['markdown', 'warning', 'text'] for item in getattr(app, kind))
+        self.assertIn('Rapports disponibles par source', text)
+        self.assertFalse(any('tertiaire' in str(column).casefold() for column in raw.columns))
 
     def select_month_range(self, app, first, last, first_year='2026', last_year='2026'):
         self.widget(app, 'selectbox', "Choisir l'année :").select(first_year)
@@ -189,15 +225,61 @@ def get_validation_detail_metadata(rule_ids, org_ids, cache_user=None):
 
             app.session_state['_dataset_fail_weekly'] = True
             self.select_month_range(app, 'Octobre', 'Octobre')
-            for key, columns in [
-                ('_test_main_summary', ['Reports_Actual', 'Complétude_Globale (%)', 'Promptitude_Globale (%)']),
-                ('_test_main_comp', ['Reports_Actual', 'Complétude_Globale (%)']),
-                ('_test_main_prompt', ['Reports_Actual_On_Time', 'Promptitude_Globale (%)']),
-                ('_test_export_frame', ['Reports_Actual', 'Complétude globale (%)', 'Promptitude globale (%)', TOTAL_COL]),
-            ]:
-                self.assertTrue(app.session_state[key][columns].isna().all().all())
+            self.assert_partial_monthly_visible(app)
+            _, available = excel_sheet(downloads['Télécharger Excel'], 'Reporting_Disponible')
+            self.assertEqual(available[0]['Rapports mensuels disponibles'], 118)
+            self.assertEqual(available[0]['Attendus mensuels disponibles'], 118)
+            self.assertIsNone(available[0]['Rapports hebdomadaires disponibles'])
+            self.assertEqual(available[0]['État des sources'], 'Incomplet')
             self.assertNotIn('categorisation_result', app.session_state)
             self.assertEqual(app.session_state['_dataset_posts'], 2)
+
+    def test_no_selected_week_preserves_monthly_data_without_a_weekly_request_or_complete_score(self):
+        app = self.new_app()
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_month_range(app, 'Septembre', 'Septembre')
+            app.session_state['_dataset_queries'] = []
+            for period in tuple(app.session_state['reporting_weeks_selected']):
+                self.widget(app, 'multiselect', 'Semaines de surveillance').unselect(period)
+            self.run_app(app)
+            self.assertEqual(app.session_state['reporting_weeks_selected'], [])
+            self.assert_partial_monthly_visible(app)
+            self.assertFalse(any(
+                any(item.startswith('SurveillAAA.') for item in query['items'])
+                for query in app.session_state['_dataset_queries']
+            ))
+            self.assertNotIn('_dataset_posts', app.session_state)
+
+    def test_outer_combined_failure_recovers_only_selected_monthly_datasets(self):
+        app = self.new_app({'get_quality_reporting_data': '''
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None,
+                               unit_ids=None, dataset_ids=None, weekly_periods=None):
+    result = pd.DataFrame()
+    result.attrs['quality_warnings'] = ['Préparation combinée indisponible pour cette analyse.']
+    return result
+'''})
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_month_range(app, 'Septembre', 'Septembre')
+            self.assert_partial_monthly_visible(app)
+            self.assertNotEqual(self.available_view(app)['Rapports mensuels disponibles'].iloc[0], 1117)
+            self.assertTrue(app.session_state['_test_main_raw'].attrs['monthly_reporting_fallback'])
+            self.assertNotIn('_dataset_posts', app.session_state)
+
+    def test_observed_monthly_zero_stays_visible_during_a_weekly_failure(self):
+        app = self.new_app()
+        app.session_state['_dataset_zero_monthly'] = True
+        app.session_state['_dataset_fail_weekly'] = True
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            self.select_month_range(app, 'Septembre', 'Septembre')
+            self.assert_partial_monthly_visible(app, monthly=106)
+            raw = app.session_state['_test_main_raw']
+            for column in ['Service 0 Actual reports', 'Service 0 Reporting rate', 'Service 0 Reporting rate on time']:
+                self.assertEqual(raw[column].tolist(), [0])
+            self.assertEqual(app.session_state['_test_main_comp']['Service 0 Reporting rate'].tolist(), [0])
+            self.assertEqual(app.session_state['_test_main_prompt']['Service 0 Reporting rate on time'].tolist(), [0])
 
     def test_fixed_semester_quarter_year_and_cross_year_interval_use_all_selected_periods(self):
         app = self.new_app()

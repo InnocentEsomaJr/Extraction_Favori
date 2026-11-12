@@ -203,7 +203,20 @@ rapport hebdomadaire ni mensuel n'est découpé ou calculé au prorata des jours
 L'export ajoute les feuilles `Periodes_Surveillance` et `Reporting_Surveillance`.
 
 Une surveillance indisponible ne devient pas un dataset inactif : le score de l'unité
-reste incomplet, tandis que les autres unités restent affichées. La source combinée
+reste incomplet, tandis que les **cellules mensuelles déjà reçues restent visibles**.
+L'affichage « Rapports disponibles par source » et la feuille Excel
+`Reporting_Disponible` distinguent les comptes mensuels et hebdomadaires reçus des
+totaux combinés. Seuls ces totaux et les scores concernés restent indisponibles ;
+une erreur hebdomadaire n'efface plus les colonnes mensuelles. Si la préparation
+combinée échoue, les seules cellules mensuelles du favori rattachées aux UID de datasets
+sélectionnés sont conservées comme données partielles, sans réintroduire le tertiaire.
+
+Les colonnes sont rattachées par identifiant DXID, y compris lorsque DHIS2 remplace
+un libellé provisoire par le vrai nom du dataset. Les datasets d'un autre type de
+période que mensuel ou hebdomadaire sont signalés et exclus de cette sélection,
+pour qu'un favori mixte ne bloque pas le chargement des sources compatibles.
+
+La source combinée
 mensuelle et hebdomadaire alimente désormais **tous les tableaux** : complétude,
 promptitude, analyse comparative et qualité. Les anciennes colonnes de reporting du
 favori sont remplacées avant les calculs, afin de ne compter aucun dataset deux fois ;

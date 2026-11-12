@@ -24,7 +24,7 @@ from period_selection import (
     MONTH_NAMES, period_choices, period_info, period_interval, selection_bounds,
     selection_months, weekly_choices_for_range,
 )
-from reporting_source import replace_reporting_source
+from reporting_source import replace_reporting_source, recover_monthly_reporting, available_reporting_summary
 from quality_scope import quality_target_catalog
 from quality_batch import run_quality_batch
 from validation_job import (
@@ -40,7 +40,7 @@ from validation_detail_view import (
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from reporting_loader import fetch_reporting_chunks, format_reporting_error
-from reporting_availability import mask_failed_reporting_units
+from reporting_availability import mask_failed_reporting_units, mask_failed_reporting_cells
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from dhis_auth import check_dhis2_credentials
@@ -326,7 +326,7 @@ def default_surveillance_weeks(months):
 
 
 def render_dataset_selection(favori_id, cache_user, surface):
-    context = ('shared-explicit-reporting-v2', favori_id, cache_user)
+    context = ('reporting-availability-v3', favori_id, cache_user)
     if st.session_state.get('quality_dataset_context') != context:
         st.session_state['quality_dataset_context'] = context
         st.session_state.pop('quality_evaluation_datasets', None)
@@ -674,6 +674,7 @@ def to_excel_dashboard_report(
     df_previous_violations=None,
     df_weekly_periods=None,
     df_surveillance=None,
+    df_reporting_status=None,
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -784,6 +785,10 @@ def to_excel_dashboard_report(
             df_surveillance.to_excel(writer, index=False, sheet_name='Reporting_Surveillance')
             writer.sheets['Reporting_Surveillance'].set_column(0, len(df_surveillance.columns) - 1, 24)
             writer.sheets['Reporting_Surveillance'].freeze_panes(1, 2)
+        if df_reporting_status is not None and not df_reporting_status.empty:
+            df_reporting_status.to_excel(writer, index=False, sheet_name='Reporting_Disponible')
+            writer.sheets['Reporting_Disponible'].set_column(0, len(df_reporting_status.columns) - 1, 25)
+            writer.sheets['Reporting_Disponible'].freeze_panes(1, 2)
         for name in ['Resultats_Regles', 'Baremes_Categorisation']:
             sheet = writer.sheets[name]
             sheet.freeze_panes(1, 1)
@@ -1420,7 +1425,7 @@ def get_reporting_visualization(favori_id, cache_user=None):
 
 @st.cache_data(ttl=3600)
 def get_quality_dataset_options(favori_id, cache_user=None):
-    """Identifie les datasets évalués depuis les métadonnées DHIS2 accessibles."""
+    """Identifie les datasets mensuels/hebdomadaires compatibles depuis DHIS2."""
     visualization = get_reporting_visualization(favori_id, cache_user=cache_user)
     try:
         catalog = get_dhis2_client().get(
@@ -1487,6 +1492,7 @@ def load_reporting_for_units(favori_id, period, ou_dimension, unit_ids, cache_us
 
 @st.cache_data(ttl=60)
 def get_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None):
+    """Charge le favori en conservant la correspondance DXID/colonne de reporting."""
     _ = cache_user
     if not favori_id: return None
     try:
@@ -1517,7 +1523,7 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_id
 
 @st.cache_data(ttl=60)
 def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None, unit_ids=None, dataset_ids=None, weekly_periods=None):
-    """Charge les cinq mesures des datasets évalués, sans analyse de règles."""
+    """Joint les cinq mesures par DXID et conserve les réponses mensuelles partielles."""
     _ = cache_user
     try:
         if ou_dimension and unit_ids is not None:
@@ -1547,6 +1553,7 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
         else:
             result = analytics_to_reporting_frame(dhis.get('analytics.json', params=params), labels)
         result.attrs['quality_source'] = 'Reporting DHIS2 des datasets évalués'
+        result.attrs['quality_warnings'] = list(result.attrs.get('reporting_warnings', []))
         return result
     except ValueError as error:
         warning = str(error)
@@ -2011,14 +2018,16 @@ if quality_dataset_ids is not None:
         combined_reporting = pd.DataFrame()
     if combined_reporting.empty:
         attributes = dict(combined_reporting.attrs)
-        combined_reporting = pd.DataFrame({
-            'Organisation unit ID': selected_zones_df['Zone_ID'],
-            'Organisation unit': selected_zones_df['Zone'],
-        })
-        combined_reporting.attrs = {
-            **attributes, 'failed_units': list(selected_zones_df['Zone_ID']),
-            'reporting_columns': [], 'reporting_warnings': attributes.get('quality_warnings', []),
-        }
+        monthly_ids = [
+            dataset['id'] for dataset in (quality_dataset_options or {}).get('datasets', [])
+            if dataset['id'] in (quality_dataset_ids or ()) and not dataset.get('is_weekly')
+            and dataset.get('supported_for_quality', True)
+            and str(dataset.get('periodType') or '').casefold() in ('', 'monthly')
+        ]
+        combined_reporting = recover_monthly_reporting(
+            df_favorite, selected_zones_df['Zone_ID'], monthly_ids,
+            warnings=attributes.get('quality_warnings', []),
+        )
     combined_reporting.attrs['quality_dataset_ids'] = quality_dataset_ids
     df_raw = replace_reporting_source(df_favorite, combined_reporting)
 if df_raw is not None:
@@ -2036,7 +2045,9 @@ if df_raw is not None:
     default_cols = ['Organisation unit code', 'Organisation unit description',
                     'Reporting month', 'Organisation unit parameter', 'Organisation unit is parent']
     target_df_all = target_df_all.drop(columns=default_cols, errors='ignore')
+    target_df_all = mask_failed_reporting_cells(target_df_all, df_raw)
     target_df = target_df_all.copy()
+    target_df = mask_failed_reporting_cells(target_df, df_raw)
     reporting_columns = [
         column for column in target_df.attrs.get('reporting_columns', target_df.columns)
         if column in target_df and column not in ['Organisation unit', 'Organisation unit ID']
@@ -2096,12 +2107,16 @@ if df_raw is not None:
             "Les rapports mensuels et hebdomadaires sont additionnés avant de calculer les taux."
         )
     failed_reporting_units = target_df.attrs.get('failed_units', [])
+    df_reporting_status_export = pd.DataFrame()
     if failed_reporting_units:
         st.warning(
-            f"Indicateurs indisponibles pour {len(failed_reporting_units)} unité(s). "
-            "Les autres données restent affichées et l'analyse des règles reste accessible. "
-            "Les valeurs manquantes ne sont pas comptées comme des zéros ; les totaux portent sur les données disponibles."
+            f"Chargement incomplet pour {len(failed_reporting_units)} unité(s). "
+            "Les cellules reçues restent affichées par dataset. "
+            "Les totaux combinés et les scores concernés restent indisponibles tant qu'une source manque."
         )
+        df_reporting_status_export = available_reporting_summary(target_df)
+        st.write('Rapports disponibles par source')
+        st.dataframe(df_reporting_status_export.style.format(precision=0, na_rep='—'), hide_index=True, use_container_width=True)
         with st.expander("Voir les unités dont les indicateurs sont indisponibles"):
             for message in target_df.attrs.get('reporting_warnings', []):
                 st.text(message)
@@ -2139,7 +2154,7 @@ if df_raw is not None:
         if df_tab1.empty:
             st.warning("Aucune zone de santé à afficher avec ce filtre.")
         else:
-            st.dataframe(df_tab1.head(15), use_container_width=True)
+            st.dataframe(df_tab1.head(15).style.format(na_rep='—'), use_container_width=True)
         df_tab1_export = df_tab1.copy()
 
     # --- ONGLET 2 : COMPLÉTUDE ---
@@ -2148,18 +2163,20 @@ if df_raw is not None:
         col_actual_strict = [c for c in reporting_columns if 'actual reports' in c.lower() and 'time' not in c.lower()]
         if col_actual_strict:
             df_actual = target_df[['Organisation unit'] + col_actual_strict].copy()
-            for col in col_actual_strict: df_actual[col] = pd.to_numeric(df_actual[col], errors='coerce').fillna(0)
-            df_actual['Reports_Actual'] = df_actual[col_actual_strict].sum(axis=1).round(2)
-            df_actual = mask_failed_reporting_units(df_actual, target_df)
+            for col in col_actual_strict: df_actual[col] = pd.to_numeric(df_actual[col], errors='coerce')
+            df_actual = mask_failed_reporting_cells(df_actual, target_df)
+            df_actual['Reports_Actual'] = df_actual[col_actual_strict].sum(axis=1, min_count=1).round(2)
+            df_actual = mask_failed_reporting_units(df_actual, target_df, metric_columns=['Reports_Actual'])
             with st.expander("Détail Reports Actuals"): st.dataframe(df_actual.head(15))
             df_actual_detail_export = df_actual.copy()
 
         col_expected_strict = [c for c in reporting_columns if 'expected reports' in c.lower() and 'time' not in c.lower()]
         if col_expected_strict:
             df_expected = target_df[['Organisation unit'] + col_expected_strict].copy()
-            for col in col_expected_strict: df_expected[col] = pd.to_numeric(df_expected[col], errors='coerce').fillna(0)
-            df_expected['Reports_Attendu'] = df_expected[col_expected_strict].sum(axis=1).round(2)
-            df_expected = mask_failed_reporting_units(df_expected, target_df)
+            for col in col_expected_strict: df_expected[col] = pd.to_numeric(df_expected[col], errors='coerce')
+            df_expected = mask_failed_reporting_cells(df_expected, target_df)
+            df_expected['Reports_Attendu'] = df_expected[col_expected_strict].sum(axis=1, min_count=1).round(2)
+            df_expected = mask_failed_reporting_units(df_expected, target_df, metric_columns=['Reports_Attendu'])
             with st.expander("Détail Reports Attendus"): st.dataframe(df_expected.head(15))
             df_expected_detail_export = df_expected.copy()
 
@@ -2167,8 +2184,8 @@ if df_raw is not None:
         df_affichage = target_df[['Organisation unit']].copy()
         if col_rate_uniquement:
             df_affichage = target_df[['Organisation unit'] + col_rate_uniquement].copy()
-            for col in col_rate_uniquement: df_affichage[col] = pd.to_numeric(df_affichage[col], errors='coerce').fillna(0).round(2)
-            df_affichage = mask_failed_reporting_units(df_affichage, target_df)
+            for col in col_rate_uniquement: df_affichage[col] = pd.to_numeric(df_affichage[col], errors='coerce').round(2)
+            df_affichage = mask_failed_reporting_cells(df_affichage, target_df)
             with st.expander(f"Affichage de {len(col_rate_uniquement)} indicateurs"): st.dataframe(df_affichage.head(15), use_container_width=True)
 
         df_synthese = target_df[['Organisation unit']].copy()
@@ -2179,7 +2196,9 @@ if df_raw is not None:
         st.subheader("Tableau de Performance Final (Stylisé)")
         df_final_c = pd.merge(df_affichage, df_synthese[['Organisation unit', 'Reports_Actual', 'Reports_Attendu', 'Complétude_Globale (%)']], on='Organisation unit')
         df_final_c['Nombre des data set complétude >/=95%'] = (df_final_c[col_rate_uniquement] >= 95).sum(axis=1) if col_rate_uniquement else 0
-        df_final_c = mask_failed_reporting_units(df_final_c, target_df)
+        df_final_c = mask_failed_reporting_units(df_final_c, target_df, metric_columns=[
+            'Reports_Actual', 'Reports_Attendu', 'Complétude_Globale (%)', 'Nombre des data set complétude >/=95%',
+        ])
 
         st.dataframe(
             df_final_c.style.format({c: "{:.2f}" for c in df_final_c.columns if c not in ['Organisation unit', 'Nombre des data set complétude >/=95%']}, na_rep='—')
@@ -2199,14 +2218,17 @@ if df_raw is not None:
         actual_ot_cols = [c for c in reporting_columns if 'actual reports' in c.lower() and 'on time' in c.lower()]
 
         df_final_p = target_df[['Organisation unit']].copy()
-        for col in col_rate_ot: df_final_p[col] = pd.to_numeric(target_df[col], errors='coerce').fillna(0).round(2)
+        for col in col_rate_ot: df_final_p[col] = pd.to_numeric(target_df[col], errors='coerce').round(2)
+        df_final_p = mask_failed_reporting_cells(df_final_p, target_df)
         df_final_p['Reports_Actual_On_Time'] = target_df[actual_ot_cols].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1).round(2) if actual_ot_cols else 0
         df_final_p['Reports_Attendu'] = target_df[col_expected_strict].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1).round(2) if col_expected_strict else 0
         df_final_p['Promptitude_Globale (%)'] = (df_final_p['Reports_Actual_On_Time'] / df_final_p['Reports_Attendu'].replace(0, np.nan) * 100).fillna(0).round(2)
 
         nom_col_score_p = 'Nombre des data set promptitude >/=95%'
         df_final_p[nom_col_score_p] = (df_final_p[col_rate_ot] >= 95).sum(axis=1) if col_rate_ot else 0
-        df_final_p = mask_failed_reporting_units(df_final_p, target_df)
+        df_final_p = mask_failed_reporting_units(df_final_p, target_df, metric_columns=[
+            'Reports_Actual_On_Time', 'Reports_Attendu', 'Promptitude_Globale (%)', nom_col_score_p,
+        ])
 
         st.dataframe(
             df_final_p.style.format({c: "{:.2f}" for c in df_final_p.columns if c not in ['Organisation unit', nom_col_score_p]}, na_rep='—')
@@ -3172,6 +3194,7 @@ if df_raw is not None:
             df_previous_violations=df_previous_violations_export,
             df_weekly_periods=df_weekly_periods_export,
             df_surveillance=df_surveillance_export,
+            df_reporting_status=df_reporting_status_export,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"

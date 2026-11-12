@@ -112,3 +112,58 @@ def replace_reporting_source(original_df, combined_df):
     if failed_ids:
         result.attrs['favorite_failed_units'] = [identifier for identifier in identifiers if identifier in failed_ids]
     return result
+
+
+def recover_monthly_reporting(original_df, unit_ids, dataset_ids, warnings=None):
+    """Garde les cellules mensuelles certifiées sans valider un total incomplet."""
+    original = _frame(original_df, 'du favori')
+    identifiers = list(dict.fromkeys(clean_ou_id(value) for value in unit_ids))
+    selected = set(dataset_ids)
+    items = {
+        item: column for item, column in original.attrs.get('reporting_item_labels', {}).items()
+        if item.rpartition('.')[0] in selected and column in original
+    }
+    aligned = original.set_index(UNIT_ID).reindex(identifiers)
+    result = pd.DataFrame({UNIT_ID: identifiers})
+    result[UNIT_NAME] = aligned[UNIT_NAME].to_numpy() if UNIT_NAME in aligned else identifiers
+    for column in dict.fromkeys(items.values()):
+        result[column] = pd.to_numeric(aligned[column], errors='coerce').to_numpy()
+    cell_failures = {}
+    original_failed = set(original.attrs.get('failed_units', []))
+    for identifier in identifiers:
+        failures = original.attrs.get('failed_metrics_by_unit', {}).get(identifier)
+        if failures:
+            selected_failures = [item for item in failures if item in items]
+            if selected_failures:
+                cell_failures[identifier] = selected_failures
+        elif identifier in original_failed:
+            cell_failures[identifier] = list(items)
+    messages = list(warnings or ["Le chargement combiné est incomplet ; les cellules mensuelles déjà reçues restent affichées."])
+    result.attrs.update({
+        'reporting_columns': list(items.values()), 'reporting_item_labels': items,
+        'monthly_reporting_columns': list(items.values()), 'weekly_reporting_columns': [],
+        'failed_units': identifiers, 'failed_cells_by_unit': cell_failures,
+        'failed_metrics_by_unit': cell_failures, 'reporting_warnings': messages,
+        'quality_warnings': messages, 'monthly_reporting_fallback': True,
+        'reporting_status': 'partial' if items and result[list(items.values())].notna().any().any() else 'unavailable',
+    })
+    return result
+
+
+def available_reporting_summary(source_df):
+    """Comptes reçus par source, clairement distincts des totaux combinés."""
+    result = source_df[[UNIT_ID, UNIT_NAME]].copy()
+    for kind, title in [('monthly', 'mensuels'), ('weekly', 'hebdomadaires')]:
+        certified = source_df.attrs.get(kind + '_reporting_columns', [])
+        for suffix, label in [('actual reports', 'Rapports'), ('expected reports', 'Attendus')]:
+            columns = [
+                column for column in certified if column in source_df
+                and str(column).casefold().endswith(' ' + suffix)
+            ]
+            result[f'{label} {title} disponibles'] = (
+                source_df[columns].apply(pd.to_numeric, errors='coerce').sum(axis=1, min_count=1)
+                if columns else float('nan')
+            )
+    failed = set(source_df.attrs.get('failed_units', []))
+    result['État des sources'] = result[UNIT_ID].map(lambda uid: 'Incomplet' if uid in failed else 'Complet')
+    return result

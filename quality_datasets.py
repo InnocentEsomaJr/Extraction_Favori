@@ -44,6 +44,11 @@ def _period_type(value):
     return {'weekly': 'Weekly', 'monthly': 'Monthly'}.get(value.casefold(), value)
 
 
+def _supported_period_type(value):
+    """Une absence historique reste tolérée ; les autres types sont explicites."""
+    return _period_type(value) in ('', 'Monthly', 'Weekly')
+
+
 def _favorite_period_types(visualization):
     """Conserve les types fournis sur les datasets imbriqués du favori."""
     result = {}
@@ -94,8 +99,9 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
     """Construit les options et la sélection initiale du tableau qualité.
 
     ``catalog`` est la liste de métadonnées DHIS2 ou sa réponse ``dataSets``.
-    Le favori constitue la sélection initiale, hors service tertiaire ; ce
-    dernier est aussi retiré des options évaluables. Si le
+    Le favori constitue la sélection initiale, hors service tertiaire et
+    périodicités explicitement non prises en charge. Ces datasets restent
+    dans les métadonnées, mais pas dans les options évaluables. Si le
     favori ne contient pas déjà la surveillance, un unique dataset de ce nom
     est ajouté. Plusieurs candidats restent à choisir explicitement : aucun
     UID n'est inventé et aucun résultat n'est sélectionné arbitrairement.
@@ -122,26 +128,32 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
         words = _words(name)
         period_type = period_types.get(identifier, '')
         is_weekly = (
-            period_type.casefold().startswith('weekly') if period_type else
+            period_type == 'Weekly' if period_type else
             bool({'esurveillance', 'hebdomadaire'} <= words)
         )
         datasets.append({
             'id': identifier, 'name': name,
             'periodType': period_type, 'is_weekly': is_weekly,
+            'supported_for_quality': _supported_period_type(period_type),
             'in_favorite': identifier in favorites,
             'is_surveillance': bool(words & {'surveillance', 'esurveillance'}),
             'is_tertiary': bool(words & {'tertiaire', 'tertiaires', 'tertiary', 'tertiaries'}),
         })
     by_id = {dataset['id']: dataset for dataset in datasets}
-    defaults = [identifier for identifier in favorites if not by_id[identifier]['is_tertiary']]
-    surveillance_ids = [dataset['id'] for dataset in datasets if dataset['is_surveillance'] and not dataset['is_tertiary']]
+    eligible_ids = {
+        dataset['id'] for dataset in datasets
+        if dataset['supported_for_quality'] and not dataset['is_tertiary']
+    }
+    defaults = [identifier for identifier in favorites if identifier in eligible_ids]
+    surveillance_ids = [dataset['id'] for dataset in datasets if dataset['is_surveillance'] and dataset['id'] in eligible_ids]
     ambiguous, warnings = [], []
     if surveillance_name is not None:
         expected_name = _normalized_name(surveillance_name)
         if not expected_name:
             raise ValueError('Le nom du dataset de surveillance attendu est vide.')
-        matches = [dataset['id'] for dataset in datasets
-                   if not dataset['is_tertiary'] and _normalized_name(dataset['name']) == expected_name]
+        matching_records = [dataset for dataset in datasets
+                            if not dataset['is_tertiary'] and _normalized_name(dataset['name']) == expected_name]
+        matches = [dataset['id'] for dataset in matching_records if dataset['id'] in eligible_ids]
         defaults = [identifier for identifier in defaults
                     if not by_id[identifier]['is_surveillance'] or (len(matches) == 1 and identifier in matches)]
         if len(matches) == 1:
@@ -151,6 +163,11 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
             ambiguous = matches
             warnings.append(
                 f'Plusieurs datasets portent le nom « {surveillance_name} » : sélectionnez son UID exact.'
+            )
+        elif matching_records:
+            warnings.append(
+                f'Le dataset « {surveillance_name} » n’est pas inclus : sa périodicité n’est pas prise en charge. '
+                'Aucun autre dataset de surveillance ne le remplace.'
             )
         else:
             warnings.append(
@@ -164,7 +181,20 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
             ambiguous = surveillance_ids
             warnings.append('Plusieurs datasets de surveillance sont disponibles : sélectionnez celui à évaluer.')
         else:
-            warnings.append('Aucun dataset de surveillance identifiable dans les métadonnées disponibles. Vérifiez la sélection des datasets.')
+            warnings.append('Aucun dataset de surveillance mensuel ou hebdomadaire compatible dans les métadonnées disponibles. Vérifiez la sélection des datasets.')
+    excluded_types = [
+        dataset for dataset in datasets
+        if not dataset['supported_for_quality'] and not dataset['is_tertiary']
+        and (dataset['in_favorite'] or (
+            surveillance_name is not None and _normalized_name(dataset['name']) == _normalized_name(surveillance_name)
+        ))
+    ]
+    if excluded_types:
+        warnings.append(
+            'Datasets non inclus dans les calculs mensuels et hebdomadaires : '
+            + '; '.join(f"{dataset['name']} ({dataset['periodType']})" for dataset in excluded_types)
+            + '. Leurs données ne sont pas assimilées à des rapports mensuels.'
+        )
     unnamed_favorites = [identifier for identifier in favorites if names[identifier] == identifier]
     if unnamed_favorites:
         warnings.append(
@@ -177,7 +207,7 @@ def quality_dataset_selection(visualization, catalog=None, surveillance_name=Non
         for identifier, name in names.items()
     }
     options = sorted(
-        (identifier for identifier in names if not by_id[identifier]['is_tertiary']),
+        eligible_ids,
         key=lambda identifier: (labels[identifier].casefold(), identifier),
     )
     return {
@@ -192,8 +222,8 @@ def select_quality_datasets(visualization, selected_ids, datasets=None):
 
     ``datasets`` contient les métadonnées ``datasets`` du sélecteur, une liste
     DHIS2 ou sa réponse ``dataSets``. Les filtres hors dx et leurs sélections
-    sont conservés. La liste vide, les UID invalides et le service tertiaire
-    sont refusés ; aucun
+    sont conservés. La liste vide, les UID invalides, le service tertiaire et
+    les périodicités explicitement non prises en charge sont refusés ; aucun
     dataset retiré du sélecteur ne reste dans les éléments dx du favori.
     """
     favorites = _reporting_items(visualization)
@@ -218,6 +248,13 @@ def select_quality_datasets(visualization, selected_ids, datasets=None):
         raise ValueError('Un dataset sélectionné est absent des métadonnées disponibles.')
     if any(_words(names[identifier]) & {'tertiaire', 'tertiaires', 'tertiary', 'tertiaries'} for identifier in selected):
         raise ValueError('Le service tertiaire est exclu de l’évaluation du score qualité.')
+    unsupported = [identifier for identifier in selected if not _supported_period_type(period_types.get(identifier))]
+    if unsupported:
+        raise ValueError(
+            'Périodicité non prise en charge pour le score qualité : '
+            + '; '.join(f"{names[identifier]} ({period_types[identifier]})" for identifier in unsupported)
+            + '. Choisissez des datasets mensuels ou hebdomadaires.'
+        )
     result = deepcopy(visualization)
     result['dataDimensionItems'] = [
         {'dataDimensionItemType': 'REPORTING_RATE', 'reportingRate': {
