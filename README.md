@@ -41,9 +41,9 @@ Le dashboard est organisé en 5 onglets:
   - `Règles violées (M)`
 - `Ratio / 100 rapports` calculé par:
   - `(Règles violées (M) / Reports_Actual) * 100`
-- `Moyenne complétude / promptitude (%)`
-- `Note moyenne des taux /20`, repère conservé à droite du tableau.
-  Le barème des taux s'applique séparément à la complétude et à la promptitude :
+- `Score de qualité`
+- `Score de qualité /20`, repère historique conservé avec la moyenne des deux taux.
+  Le barème s'applique au score de qualité (moyenne de la complétude et de la promptitude) :
   - moins de 50 % : **0**
   - de 50 à moins de 60 % : **5**
   - de 60 à moins de 80 % : **10**
@@ -52,8 +52,8 @@ Le dashboard est organisé en 5 onglets:
 - **Catégorisation issue du modèle Excel** : toutes les colonnes précédentes sont conservées,
   puis le tableau affiche le barème DPS/ZS, le nombre de datasets à complétude `>=95 %`,
   les anciennes violations restantes, les cinq notes détaillées et leur somme
-  `Score qualité /100`. Ce total prend les valeurs 0, 5, 10, …, 95, 100.
-  La moyenne des deux taux et sa note `/20` restent des repères distincts.
+  `Score catégorisation /100`. Le score de qualité historique et sa note `/20` sont des
+  repères distincts et ne sont pas ajoutés au total.
 
 | Critère | Barème actif sur 20 |
 | --- | --- |
@@ -61,14 +61,13 @@ Le dashboard est organisé en 5 onglets:
 | Datasets à complétude >=95 % (DPS) | `<6 : 0` ; `6–7 : 5` ; `8–9 : 10` ; `10–11 : 15` ; `>=12 : 20` |
 | Datasets à complétude >=95 % (ZS) | `<5 : 0` ; `5 : 5` ; `6–7 : 10` ; `8–9 : 15` ; `>=10 : 20` |
 | Violations pour 100 rapports | `0–5 : 20` ; `>5–10 : 15` ; `>10–15 : 10` ; `>15–20 : 5` ; `>20 : 0` |
-| Violations de M-1 | Aucune violation en M-1 : `20` ; au moins une violation en M-1 : `0`, même corrigée en M |
+| Corrections de M-1 | Aucune ancienne violation restante : `20` ; au moins une restante : `0` |
 
 Le mode **Automatique** déduit DPS/ZS du niveau DHIS2 de chaque unité. Le sélecteur
 permet de choisir explicitement DPS ou ZS si la hiérarchie est indisponible.
 Les règles sont consultables dans l'expandeur « Consulter les barèmes de catégorisation ».
 Les trois ambiguïtés du modèle ont été clarifiées : promptitude `>=95 % = 20`,
-ratio exactement `20 = 5`, et note M-1 selon la loi du tout ou rien sur le nombre
-de violations **présentes en M-1**, indépendamment de leur disparition en M.
+ratio exactement `20 = 5`, et corrections notées sur les violations **restantes**.
 Les notes saisies manuellement dans les exemples du modèle ne remplacent pas les barèmes.
 
 Chaque dataset est compté une seule fois pour l'unité analysée. Une ligne directe de
@@ -127,8 +126,8 @@ résultats des règles sans retirer les nouveaux indicateurs de déclaration.
 
 Le tableau aligne chaque mesure avec sa note, dans l'ordre : complétude globale,
 promptitude globale, nombre de datasets ≥95 %, violations pour 100 rapports et
-corrections de M-1, puis le **Score qualité /100**, nommé de même dans les exports.
-La moyenne des deux taux est conservée à droite sous son nom explicite.
+corrections de M-1, puis le **Score qualité /100** (colonne `Score catégorisation /100`
+dans les exports). La moyenne des deux taux est conservée à droite comme repère.
 
 Les trois boutons utilisent les mêmes filtres pays, province, zone et dates.
 Les analyses sont réparties par zone de santé pour éviter une requête volumineuse
@@ -156,20 +155,9 @@ désactivés afin de ne pas mélanger deux périmètres ; relancer M lance une n
 analyse et retire l'ancien contrôle M-1.
 
 Exemple Aba : 100 % de complétude, 100 % de promptitude, 9 datasets ≥95 %, 5
-violations sur 134 rapports et 2 violations en M-1 donnent
+violations sur 134 rapports et 2 anciennes violations toujours présentes donnent
 20 + 20 + 15 + 20 + 0 = **75/100**. Le ratio exact (3,73/100) sert au barème.
-Même si les 2 anciennes violations sont corrigées en M, la note M-1 reste 0.
-Seule une analyse M-1 réussie sans aucune violation donne 20 points.
-
-La sélection **Datasets évalués pour le score qualité** est alimentée par les
-métadonnées DHIS2. Elle reprend les datasets du favori, retire le service tertiaire
-et ajoute **1y-Surveillance épidémiologique**, identifié par son nom puis son UID DHIS2.
-Si ce nom est absent ou ambigu, un message demande de vérifier la sélection ;
-aucun autre dataset de surveillance n'est substitué automatiquement.
-Aucun identifiant ni résultat d'exemple n'est imposé.
-Les cinq métriques de reporting de chaque dataset choisi alimentent les taux,
-les rapports et le compte des datasets à 95 %. La synthèse des autres onglets est
-réutilisée seulement pour les mêmes mois et exactement la même sélection de datasets.
+Si les 2 anciennes violations sont corrigées, la note des corrections passe à 20.
 
 Les deux actions existantes restent séparées :
 
@@ -376,21 +364,32 @@ La durée de la requête et son délai de lecture sont affichés dans le diagnos
 L'application ne relance pas automatiquement un POST qui a dépassé le délai :
 DHIS2 peut encore être en train de calculer l'analyse.
 
-Le chargement des indicateurs Analytics est aussi réparti **par unité explicite**,
-avec tous les datasets du favori pour cette unité. Le filtre de période et les
+Le tableau reprend la base **b96d1a1**, avec le délai minimal de 900 secondes,
+les sauvegardes par zone et le bouton de reprise. Les datasets évalués sont ceux
+du favori DHIS2 choisi. Le sélecteur ajouté ensuite sur tout le catalogue et
+l'avertissement sur « 1y-Surveillance » sont retirés.
+
+Le chargement des indicateurs Analytics est réparti **par unité explicite et par
+lots de 15 métriques au maximum**, soit trois datasets avec leurs cinq mesures.
+Si DHIS2 refuse encore un lot (400/414), celui-ci est séparé par datasets jusqu'à
+isoler le refus. Les cinq métriques d'un dataset restent ensemble ; une récupération
+réussie n'affiche aucun avertissement. Le filtre de période et les
 filtres supplémentaires restent identiques ; aucun taux n'est moyenné entre lots.
-Une province de 13 zones produit ainsi 13 petites requêtes, avec une progression,
-au lieu d'une requête unique pour toutes ses zones. Ces appels Analytics ne sont
+Une province produit ainsi plusieurs petites requêtes, avec une progression,
+au lieu d'une requête unique pour toutes ses zones et tous ses datasets. Ces appels Analytics ne sont
 pas relancés automatiquement après un timeout.
 
 Les réponses Analytics réussies restent en cache une heure, par compte, révision,
 périmètre et paramètres. La synthèse de chargement, y compris une erreur ou une
 réponse partielle, ne reste en cache que 60 secondes ; **Actualiser les données**
-change immédiatement la révision. Une zone échouée conserve des cellules vides,
-ses scores ne sont pas calculés sur des données partielles et les autres zones
+change immédiatement la révision. Les cellules reçues restent visibles même si un
+autre dataset est refusé. Seuls les totaux et scores incomplets restent indisponibles,
+et les autres zones
 restent affichées. Les trois boutons de validation restent accessibles même si
 les indicateurs Analytics sont indisponibles. Les erreurs réseau sont résumées
-sans afficher l'URL technique ni les identifiants de connexion.
+sans afficher l'URL technique ni les identifiants de connexion. Les détails sont
+regroupés dans un expandeur, sans répéter un bloc d'erreur pour chaque zone après
+le lancement de l'analyse des violations. Les POST de validation ne sont pas relancés.
 
 ## 6. Lancement
 

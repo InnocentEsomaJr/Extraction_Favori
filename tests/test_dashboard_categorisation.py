@@ -110,8 +110,8 @@ class CategorisationExportTests(unittest.TestCase):
         namespace = dashboard_functions("style_taux", "style_score", "_build_styler", "to_excel_dashboard_report")
         frame = pd.DataFrame({
             "Zone de santé": ["ZS A", "ZS B"],
-            "Moyenne complétude / promptitude (%)": [95.0, 80.0],
-            "Note moyenne des taux /20": [20.0, 15.0],
+            "Score de qualité": [95.0, 80.0],
+            "Score de qualité /20": [20.0, 15.0],
             "Score complétude /20": [20.0, 0.0],
             "Score promptitude /20": [20.0, 5.0],
             "Score datasets /20": [20.0, 10.0],
@@ -177,9 +177,6 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
 def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
     return get_data(favori_id, period=period, cache_user=cache_user, ou_dimension=ou_dimension)
 
-def get_quality_dataset_options(favori_id, cache_user=None):
-    return None
-
 def get_organisation_catalog(cache_user=None):
     from geography import build_geography_catalog
     country = {"id": "CountryAAAA", "displayName": "Pays test", "level": 1}
@@ -233,11 +230,6 @@ def app_fixture_source(replacements=None):
             ):
                 fixture.args.kwonlyargs.append(ast.arg(arg='unit_ids'))
                 fixture.args.kw_defaults.append(ast.Constant(value=None))
-            if node.name == 'get_quality_reporting_data' and not any(
-                argument.arg == 'dataset_ids' for argument in fixture.args.args + fixture.args.kwonlyargs
-            ):
-                fixture.args.kwonlyargs.append(ast.arg(arg='dataset_ids'))
-                fixture.args.kw_defaults.append(ast.Constant(value=None))
             return fixture
 
         def visit_Expr(self, node):
@@ -276,7 +268,7 @@ class CategorisationAppTests(unittest.TestCase):
         app = self.new_app()
         with mock.patch("requests.sessions.Session.request", side_effect=AssertionError("Tout réseau est interdit dans ce test")):
             self.run_app(app)
-            self.assertEqual(app.session_state["_test_export_frame"]["Moyenne complétude / promptitude (%)"].tolist(), [100])
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
             self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
@@ -302,7 +294,7 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["_fixture_validation_calls"], calls)
             self.widget(app, "selectbox", "Sélectionner le Groupe de Règles de Validation :").select("Groupe test")
             self.run_app(app)
-            self.assertEqual(app.session_state["_test_export_frame"]["Moyenne complétude / promptitude (%)"].tolist(), [100])
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
             self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
             self.widget(app, "button", "Lancer l'analyse des violations").click()
             self.run_app(app)
@@ -311,7 +303,7 @@ class CategorisationAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["_test_export_frame"][TOTAL_COL].tolist(), [95])
             self.widget(app, "selectbox", "Mois fin :").select("Février")
             self.run_app(app)
-            self.assertEqual(app.session_state["_test_export_frame"]["Moyenne complétude / promptitude (%)"].tolist(), [100])
+            self.assertEqual(app.session_state["_test_export_frame"]["Score de qualité"].tolist(), [100])
             self.assertTrue(app.session_state["_test_export_frame"]["Règles violées (M)"].isna().all())
 
     def test_country_requests_real_zone_level_and_uses_zs_profile(self):

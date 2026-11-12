@@ -40,7 +40,7 @@ class CategorisationTests(unittest.TestCase):
             "Zone de santé": ["Zone test"], "Complétude_Globale": [95.0],
             "Promptitude_Globale": [95.0], "Score_Qualite": [95.0],
             "Actual_Reports": [100.0], "Violations_Actuelles": [5],
-            "Violations_Mois_Precedent": [0], "Violations_Corrigees": [0],
+            "Violations_Mois_Precedent": [8], "Violations_Corrigees": [8],
             "Nombre_Datasets_95": [12], "Profil_Bareme": ["DPS"],
             "Erreur_Validation": [""],
         }
@@ -76,22 +76,21 @@ class CategorisationTests(unittest.TestCase):
                 self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
 
     def test_corrections_remaining_and_incoherent_counts(self):
-        outstanding = calculer_categorisation(self.frame(Violations_Mois_Precedent=8, Violations_Corrigees=5))
+        outstanding = calculer_categorisation(self.frame(Violations_Corrigees=5))
         self.assertEqual(outstanding.loc[0, REMAINING_COL], 3)
         self.assertEqual(outstanding.loc[0, COMPONENT_COLS[4]], 0)
         none_previous = calculer_categorisation(self.frame(Violations_Mois_Precedent=0, Violations_Corrigees=0))
         self.assertEqual(none_previous.loc[0, COMPONENT_COLS[4]], 20)
         for corrected in [None, -1, 9]:
             with self.subTest(corrected=corrected):
-                invalid = calculer_categorisation(self.frame(Violations_Mois_Precedent=8, Violations_Corrigees=corrected))
+                invalid = calculer_categorisation(self.frame(Violations_Corrigees=corrected))
                 self.assertTrue(pd.isna(invalid.loc[0, REMAINING_COL]))
-                self.assertEqual(invalid.loc[0, COMPONENT_COLS[4]], 0)
-                self.assertEqual(invalid.loc[0, TOTAL_COL], 80)
+                self.assertTrue(pd.isna(invalid.loc[0, COMPONENT_COLS[4]]))
+                self.assertTrue(pd.isna(invalid.loc[0, TOTAL_COL]))
 
-    def test_failed_current_analysis_keeps_known_previous_note_independent(self):
+    def test_failed_analysis_keeps_both_violation_components_unavailable(self):
         actual = calculer_categorisation(self.frame(Erreur_Validation="période indisponible"))
-        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[3]]))
-        self.assertEqual(actual.loc[0, COMPONENT_COLS[4]], 20)
+        self.assertTrue(actual.loc[0, COMPONENT_COLS[3:]].isna().all())
         self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
         self.assertIn("analyse des violations indisponible", actual.loc[0, "Statut catégorisation"])
 
@@ -134,12 +133,11 @@ class CategorisationTests(unittest.TestCase):
         self.assertEqual(actual.loc[0, TOTAL_COL], 100)
         self.assertEqual(actual.loc[0, "Statut catégorisation"], "Complète")
 
-    def test_current_failure_blocks_total_but_not_known_reference_note(self):
+    def test_current_failure_still_blocks_both_violation_components_after_control(self):
         actual = calculer_categorisation(self.frame(
             Controle_Corrections_Effectue=True, Erreur_Corrections="", Erreur_Validation="M : HTTP 403",
         ))
-        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[3]]))
-        self.assertEqual(actual.loc[0, COMPONENT_COLS[4]], 20)
+        self.assertTrue(actual.loc[0, COMPONENT_COLS[3:]].isna().all())
         self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
         self.assertIn("analyse des violations indisponible", actual.loc[0, "Statut catégorisation"])
 
@@ -158,53 +156,6 @@ class CategorisationTests(unittest.TestCase):
         actual = calculer_categorisation(self.frame(Violations_Actuelles=20))
         self.assertEqual(actual.loc[0, COMPONENT_COLS[3]], 5)
         self.assertEqual(actual.loc[0, TOTAL_COL], 85)
-
-    def test_previous_period_is_all_or_nothing_even_when_every_violation_is_corrected(self):
-        for previous, corrected in [(1, 0), (1, 1), (2, 2), (8, 8), (8, 0)]:
-            with self.subTest(previous=previous, corrected=corrected):
-                actual = calculer_categorisation(self.frame(
-                    Violations_Mois_Precedent=previous, Violations_Corrigees=corrected,
-                    Controle_Corrections_Effectue=True,
-                ))
-                self.assertEqual(actual.loc[0, COMPONENT_COLS[4]], 0)
-                self.assertEqual(actual.loc[0, REMAINING_COL], previous - corrected)
-                self.assertEqual(actual.loc[0, TOTAL_COL], 80)
-
-    def test_aba_strict_previous_rule_scores_seventy_five(self):
-        actual = calculer_categorisation(self.frame(
-            Profil_Bareme="ZS", Complétude_Globale=100, Promptitude_Globale=100,
-            Score_Qualite=100, Nombre_Datasets_95=9, Actual_Reports=134,
-            Violations_Actuelles=5, Violations_Mois_Precedent=2,
-            Violations_Corrigees=2, Controle_Corrections_Effectue=True,
-        ))
-        self.assertEqual(actual.loc[0, COMPONENT_COLS].tolist(), [20, 20, 15, 20, 0])
-        self.assertEqual(actual.loc[0, TOTAL_COL], 75)
-        self.assertEqual(actual.loc[0, REMAINING_COL], 0)
-
-    def test_missing_previous_count_is_unavailable_even_if_comparison_claims_no_errors(self):
-        actual = calculer_categorisation(self.frame(
-            Violations_Mois_Precedent=None, Violations_Corrigees=0,
-            Controle_Corrections_Effectue=True,
-        ))
-        self.assertTrue(pd.isna(actual.loc[0, COMPONENT_COLS[4]]))
-        self.assertTrue(pd.isna(actual.loc[0, TOTAL_COL]))
-        self.assertIn("violations de la période précédente indisponibles", actual.loc[0, "Statut catégorisation"])
-
-    def test_total_is_an_integer_multiple_of_five_between_zero_and_one_hundred(self):
-        frames = []
-        for rate in [0, 50, 60, 80, 95]:
-            for datasets in [0, 5, 6, 8, 10]:
-                for violations in [0, 7, 12, 17, 25]:
-                    for previous in [0, 1]:
-                        frames.append(self.frame(
-                            Profil_Bareme="ZS", Complétude_Globale=rate,
-                            Promptitude_Globale=rate, Nombre_Datasets_95=datasets,
-                            Violations_Actuelles=violations, Violations_Mois_Precedent=previous,
-                            Violations_Corrigees=previous,
-                        ))
-        totals = calculer_categorisation(pd.concat(frames, ignore_index=True))[TOTAL_COL]
-        self.assertTrue(totals.between(0, 100).all())
-        self.assertTrue(totals.mod(5).eq(0).all())
 
     def test_unrounded_ratios_determine_the_band(self):
         for ratio, expected in [(5.004, 15), (10.004, 10), (15.004, 5), (20.004, 0)]:
@@ -231,8 +182,7 @@ class CategorisationTests(unittest.TestCase):
         legend = build_baremes_df()
         self.assertIn("95 % et plus", legend["Condition"].tolist())
         self.assertIn("Plus de 20", legend["Condition"].tolist())
-        self.assertIn("Aucune règle violée en M-1", legend["Condition"].tolist())
-        self.assertIn("Au moins une règle violée en M-1, même corrigée en M", legend["Condition"].tolist())
+        self.assertIn("Aucune règle restante", legend["Condition"].tolist())
 
 
 if __name__ == "__main__":

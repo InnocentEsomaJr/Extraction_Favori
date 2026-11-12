@@ -64,12 +64,12 @@ class QualityLoaderTests(unittest.TestCase):
 
     def test_missing_numbers_render_as_dashes_while_source_values_remain_numeric(self):
         styler = dashboard_functions('style_taux', 'style_score', '_build_styler')['_build_styler']
-        frame = pd.DataFrame({'Moyenne complétude / promptitude (%)': [89.0, np.nan]})
-        html = styler(frame, score_cols=['Moyenne complétude / promptitude (%)'], missing_text='—').to_html()
+        frame = pd.DataFrame({'Score de qualité': [89.0, np.nan]})
+        html = styler(frame, score_cols=['Score de qualité'], missing_text='—').to_html()
         self.assertIn('—</td>', html)
         self.assertNotIn('>None</td>', html)
         self.assertNotIn('>nan</td>', html)
-        self.assertTrue(pd.api.types.is_numeric_dtype(frame['Moyenne complétude / promptitude (%)']))
+        self.assertTrue(pd.api.types.is_numeric_dtype(frame['Score de qualité']))
         self.assertTrue(pd.isna(frame.iloc[1, 0]))
 
 

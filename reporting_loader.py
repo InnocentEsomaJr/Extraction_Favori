@@ -30,6 +30,8 @@ def format_reporting_error(error):
     status = getattr(response, 'status_code', None)
     if status in (401, 403):
         return f"Accès aux indicateurs refusé par DHIS2 (HTTP {status})."
+    if status in (400, 414):
+        return "DHIS2 n'a pas accepté cette sélection d'indicateurs. Les autres réponses reçues sont conservées."
     if isinstance(status, int):
         return f"Les indicateurs DHIS2 sont indisponibles pour ce lot (HTTP {status})."
     if isinstance(error, requests.exceptions.SSLError):
@@ -49,14 +51,18 @@ def _positive_limit(value, default):
         return default
 
 
-def _item_batches(identifiers, limit):
+def _item_families(identifiers):
     families = {}
     for identifier in identifiers:
         dataset, separator, metric = identifier.rpartition('.')
         key = ('dataset', dataset) if separator and metric in METRIC_LABELS else ('item', identifier)
         families.setdefault(key, []).append(identifier)
+    return list(families.values())
+
+
+def _item_batches(identifiers, limit):
     batches, current = [], []
-    for family in families.values():
+    for family in _item_families(identifiers):
         if current and len(current) + len(family) > limit:
             batches.append(current)
             current = []
@@ -71,9 +77,11 @@ def fetch_reporting_chunks(client, params, labels, unit_ids, units_per_request=3
     """Lit des lots disjoints d'unités et de datasets, puis pivote les valeurs.
 
     Les cinq métriques d'un dataset restent ensemble. Les filtres temporels et
-    supplémentaires sont transmis à l'identique. Aucun lot en échec n'est
-    relancé ni remplacé par une requête plus large. ``unit_ids=None`` conserve
-    le contrat historique d'un appel unique utilisant les paramètres originaux.
+    supplémentaires sont transmis à l'identique. Un refus HTTP 400 ou 414 d'un
+    lot de plusieurs datasets est isolé par subdivisions disjointes, jusqu'au
+    dataset ; ses cinq métriques restent ensemble. Aucun timeout, refus d'accès
+    ni erreur serveur ne provoque de nouvelle tentative. ``unit_ids=None`` garde
+    une requête initiale unique utilisant les paramètres originaux.
     Une liste explicite vide ne provoque jamais un appel de périmètre élargi.
     """
     query = list(params)
@@ -109,10 +117,11 @@ def fetch_reporting_chunks(client, params, labels, unit_ids, units_per_request=3
                 chunks.append((units, items, chunk_query, set(units)))
     rows, metadata, warnings, failed, successes, diagnostics = [], {}, [], {}, set(), []
     completed = 0
+    successful_leaves = 0
     stop_error = None
-    for position, (units, items, chunk_query, allowed_units) in enumerate(chunks, start=1):
-        if on_progress is not None:
-            on_progress(position, len(chunks), tuple(units or ()), tuple(items))
+
+    def fetch_chunk(units, items, chunk_query, allowed_units):
+        nonlocal stop_error, successful_leaves
         try:
             if stop_error is not None:
                 raise stop_error
@@ -128,10 +137,26 @@ def fetch_reporting_chunks(client, params, labels, unit_ids, units_per_request=3
                 normalized.append([record['ou'], record['dx'], record['value']])
             rows.extend(normalized)
             metadata.update((response.get('metaData') or {}).get('items') or {})
-            completed += 1
+            successful_leaves += 1
             successes.update(units or [row[0] for row in normalized])
             diagnostics.append({'Unités': ';'.join(units or ()), 'Métriques': len(items), 'Statut': 'Terminé'})
+            return True
         except Exception as error:
+            status = getattr(getattr(error, 'response', None), 'status_code', None)
+            families = _item_families(items)
+            if stop_error is None and status in (400, 414) and len(families) > 1:
+                diagnostics.append({'Unités': ';'.join(units or ()), 'Métriques': len(items), 'Statut': 'Fractionné'})
+                middle = len(families) // 2
+                outcomes = []
+                for family_group in (families[:middle], families[middle:]):
+                    subset = [item for family in family_group for item in family]
+                    subset_query = [
+                        (key, 'dx:' + ';'.join(subset))
+                        if key == 'dimension' and value.startswith('dx:') else (key, value)
+                        for key, value in chunk_query
+                    ]
+                    outcomes.append(fetch_chunk(units, subset, subset_query, allowed_units))
+                return all(outcomes)
             message = format_reporting_error(error)
             targets = units or list(allowed_units or ())
             for identifier in targets:
@@ -139,9 +164,15 @@ def fetch_reporting_chunks(client, params, labels, unit_ids, units_per_request=3
             if stop_error is None or error is not stop_error:
                 warnings.append((f"{', '.join(targets)} : " if targets else '') + message)
             diagnostics.append({'Unités': ';'.join(targets), 'Métriques': len(items), 'Statut': 'Indisponible'})
-            status = getattr(getattr(error, 'response', None), 'status_code', None)
             if status in (401, 403):
                 stop_error = error
+            return False
+
+    for position, (units, items, chunk_query, allowed_units) in enumerate(chunks, start=1):
+        if on_progress is not None:
+            on_progress(position, len(chunks), tuple(units or ()), tuple(items))
+        if fetch_chunk(units, items, chunk_query, allowed_units):
+            completed += 1
     result = analytics_to_reporting_frame({
         'headers': [{'name': name} for name in ['ou', 'dx', 'value']],
         'rows': rows, 'metaData': {'items': metadata},
@@ -150,7 +181,7 @@ def fetch_reporting_chunks(client, params, labels, unit_ids, units_per_request=3
         'reporting_warnings': warnings,
         'failed_units': list(failed), 'failed_metrics_by_unit': failed,
         'successful_units': [identifier for identifier in (explicit_units or sorted(successes)) if identifier in successes],
-        'reporting_status': 'complete' if completed == len(chunks) and chunks else ('partial' if completed else 'unavailable'),
+        'reporting_status': 'complete' if completed == len(chunks) and chunks else ('partial' if successful_leaves else 'unavailable'),
         'reporting_requests': diagnostics,
     })
     return result

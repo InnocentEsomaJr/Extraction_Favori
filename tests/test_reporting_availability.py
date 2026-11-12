@@ -4,7 +4,8 @@ import unittest
 
 import pandas as pd
 
-from reporting_availability import mask_failed_reporting_units
+from reporting_availability import mask_failed_reporting_cells, mask_failed_reporting_units
+from scoped_analytics import analytics_to_reporting_frame
 
 
 class ReportingAvailabilityTests(unittest.TestCase):
@@ -109,6 +110,124 @@ class ReportingAvailabilityTests(unittest.TestCase):
         pd.testing.assert_frame_equal(mask_failed_reporting_units(frame.iloc[:0], frame), frame.iloc[:0])
         source.attrs['failed_units'] = ['MissingAAAA']
         pd.testing.assert_frame_equal(mask_failed_reporting_units(frame, source), frame)
+
+
+class ReportingCellAvailabilityTests(unittest.TestCase):
+    def test_generic_indicator_failure_does_not_erase_healthy_reporting_cells(self):
+        labels = {
+            'MonthlyAAAA.ACTUAL_REPORTS': 'Mensuel Actual reports',
+            'IndicatorAA': 'Indicateur indépendant',
+        }
+        for rows in [[], [
+            ['ZoneAAAAAAA', 'MonthlyAAAA.ACTUAL_REPORTS', 90],
+            ['ZoneAAAAAAA', 'IndicatorAA', 25],
+        ]]:
+            with self.subTest(empty=not rows):
+                source = analytics_to_reporting_frame({
+                    'headers': [{'name': name} for name in ['ou', 'dx', 'value']],
+                    'rows': rows,
+                }, labels)
+                self.assertEqual(source.attrs['reporting_item_labels'], labels)
+                self.assertEqual(source.attrs['reporting_columns'], ['Mensuel Actual reports'])
+                if rows:
+                    source.attrs.update({
+                        'failed_units': ['ZoneAAAAAAA'],
+                        'failed_metrics_by_unit': {'ZoneAAAAAAA': ['IndicatorAA']},
+                    })
+                    result = mask_failed_reporting_cells(source, source)
+                    self.assertEqual(result['Mensuel Actual reports'].tolist(), [90])
+                    self.assertTrue(result['Indicateur indépendant'].isna().all())
+
+    def source(self):
+        frame = pd.DataFrame({
+            'Organisation unit ID': ['ZoneAAAAAAA', 'ZoneBBBBBBB'],
+            'Organisation unit': ['Aba', 'Autre ZS'],
+            'Mensuel Actual reports': [90.0, 0.0],
+            'Hebdo Actual reports': [999.0, 0.0],
+            'Indicateur indépendant': [25, 30],
+        })
+        frame.attrs.update({
+            'failed_units': ['ZoneAAAAAAA'],
+            'failed_metrics_by_unit': {'ZoneAAAAAAA': ['WeeklyAAAAA.ACTUAL_REPORTS']},
+            'reporting_item_labels': {
+                'MonthlyAAAA.ACTUAL_REPORTS': 'Mensuel Actual reports',
+                'WeeklyAAAAA.ACTUAL_REPORTS': 'Hebdo Actual reports',
+            },
+            'reporting_columns': ['Mensuel Actual reports', 'Hebdo Actual reports'],
+        })
+        return frame
+
+    def test_only_failed_dataset_cells_are_masked_and_other_unit_zero_is_preserved(self):
+        source = self.source()
+        before = source.copy(deep=True)
+        result = mask_failed_reporting_cells(source, source)
+        self.assertEqual(result['Mensuel Actual reports'].tolist(), [90, 0])
+        self.assertTrue(pd.isna(result.loc[0, 'Hebdo Actual reports']))
+        self.assertEqual(result.loc[1, 'Hebdo Actual reports'], 0)
+        self.assertEqual(result['Indicateur indépendant'].tolist(), [25, 30])
+        self.assertEqual(result.attrs, source.attrs)
+        pd.testing.assert_frame_equal(source, before)
+
+    def test_bijective_display_bridge_handles_reordered_rows(self):
+        source = self.source()
+        frame = source.drop(columns='Organisation unit ID').iloc[::-1].copy()
+        result = mask_failed_reporting_cells(frame, source)
+        self.assertEqual(result.loc[1, 'Hebdo Actual reports'], 0)
+        self.assertTrue(pd.isna(result.loc[0, 'Hebdo Actual reports']))
+        self.assertEqual(result.loc[0, 'Mensuel Actual reports'], 90)
+
+    def test_homonymous_names_do_not_invent_a_unit_match(self):
+        source = self.source()
+        source['Organisation unit'] = 'Même nom'
+        frame = source.drop(columns='Organisation unit ID').copy()
+        pd.testing.assert_frame_equal(mask_failed_reporting_cells(frame, source), frame)
+        alias = self.source().iloc[:1].copy()
+        alias['Organisation unit'] = 'Alias Aba'
+        source = pd.concat([self.source(), alias], ignore_index=True)
+        source.attrs = self.source().attrs
+        frame = self.source().drop(columns='Organisation unit ID')
+        pd.testing.assert_frame_equal(mask_failed_reporting_cells(frame, source), frame)
+
+    def test_exact_ids_win_over_wrong_display_names(self):
+        source = self.source()
+        frame = source.copy()
+        frame['Organisation unit'] = ['Autre ZS', 'Aba']
+        result = mask_failed_reporting_cells(frame, source)
+        self.assertTrue(pd.isna(result.loc[0, 'Hebdo Actual reports']))
+        self.assertEqual(result.loc[1, 'Hebdo Actual reports'], 0)
+
+    def test_unmapped_failure_uses_only_certified_columns(self):
+        source = self.source()
+        source.attrs['reporting_item_labels'] = {}
+        result = mask_failed_reporting_cells(source, source)
+        self.assertTrue(result.loc[0, ['Mensuel Actual reports', 'Hebdo Actual reports']].isna().all())
+        self.assertEqual(result.loc[0, 'Indicateur indépendant'], 25)
+
+    def test_legacy_failure_without_metadata_keeps_conservative_numeric_mask(self):
+        source = self.source()
+        source.attrs = {'failed_units': ['ZoneAAAAAAA']}
+        result = mask_failed_reporting_cells(source, source)
+        self.assertTrue(result.loc[0, ['Mensuel Actual reports', 'Hebdo Actual reports', 'Indicateur indépendant']].isna().all())
+        self.assertEqual(result.loc[0, 'Organisation unit'], 'Aba')
+        self.assertEqual(result.loc[0, 'Organisation unit ID'], 'ZoneAAAAAAA')
+        self.assertEqual(result.loc[1, 'Mensuel Actual reports'], 0)
+
+    def test_per_metric_failure_alone_is_used_and_missing_failure_is_noop(self):
+        source = self.source()
+        source.attrs.pop('failed_units')
+        result = mask_failed_reporting_cells(source, source)
+        self.assertTrue(pd.isna(result.loc[0, 'Hebdo Actual reports']))
+        self.assertEqual(result.loc[0, 'Mensuel Actual reports'], 90)
+        source.attrs = {}
+        pd.testing.assert_frame_equal(mask_failed_reporting_cells(source, source), source)
+        pd.testing.assert_frame_equal(mask_failed_reporting_cells(source.iloc[:0], source), source.iloc[:0])
+
+    def test_raw_preservation_does_not_weaken_the_combined_total_mask(self):
+        source = self.source()
+        total = pd.DataFrame({'Zone_ID': ['ZoneAAAAAAA', 'ZoneBBBBBBB'], 'Reports_Actual': [90.0, 0.0]})
+        result = mask_failed_reporting_units(total, source)
+        self.assertTrue(pd.isna(result.loc[0, 'Reports_Actual']))
+        self.assertEqual(result.loc[1, 'Reports_Actual'], 0)
 
 
 if __name__ == '__main__':

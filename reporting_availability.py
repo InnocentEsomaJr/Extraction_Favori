@@ -20,6 +20,76 @@ def _identifiers(frame):
     return None
 
 
+def _cell_identifiers(frame, source_df):
+    """Privilégie les UID ; un pont de noms doit être strictement bijectif."""
+    identifiers = _identifiers(frame)
+    if identifiers is not None:
+        return identifiers
+    source_ids = _identifiers(source_df)
+    if source_ids is None or 'Organisation unit' not in source_df or 'Organisation unit' not in frame:
+        return None
+    pairs = pd.DataFrame({
+        'id': source_ids, 'label': source_df['Organisation unit'].map(_label),
+    }).drop_duplicates()
+    pairs = pairs.loc[pairs['id'].ne('') & pairs['label'].ne('')]
+    one_id = pairs.groupby('label')['id'].nunique().eq(1)
+    one_label = pairs.groupby('id')['label'].nunique().eq(1)
+    pairs = pairs.loc[pairs['label'].map(one_id) & pairs['id'].map(one_label)]
+    bridge = dict(zip(pairs['label'], pairs['id']))
+    return frame['Organisation unit'].map(_label).map(bridge).fillna('')
+
+
+def mask_failed_reporting_cells(frame, source_df):
+    """Masque les métriques refusées sans effacer les autres datasets reçus.
+
+    Les totaux combinés restent soumis au masque strict par unité. Ce masque
+    concerne uniquement les cellules du reporting identifié par DXID. Sans
+    correspondance exploitable, le comportement conservateur historique est
+    maintenu sur les colonnes certifiées, ou numériques à défaut.
+    """
+    result = frame.copy()
+    if result.empty or not isinstance(source_df, pd.DataFrame):
+        return result
+    per_unit = source_df.attrs.get('failed_metrics_by_unit') or {}
+    if not isinstance(per_unit, dict):
+        per_unit = {}
+    per_unit = {clean_ou_id(uid): items for uid, items in per_unit.items() if clean_ou_id(uid)}
+    failed = source_df.attrs.get('failed_units') or []
+    if isinstance(failed, str):
+        failed = [failed]
+    failed_ids = {clean_ou_id(uid) for uid in failed if clean_ou_id(uid)} | set(per_unit)
+    if not failed_ids:
+        return result
+    identifiers = _cell_identifiers(result, source_df)
+    if identifiers is None:
+        return result
+    labels = source_df.attrs.get('reporting_item_labels') or {}
+    if not isinstance(labels, dict):
+        labels = {}
+    certified = source_df.attrs.get('reporting_columns')
+    fallback = (
+        list(certified) if isinstance(certified, (list, tuple, set)) else
+        [column for column in result if pd.api.types.is_numeric_dtype(result[column])]
+    )
+    excluded = {*_ID_COLUMNS, *_LABEL_COLUMNS}
+    for uid in failed_ids:
+        affected = identifiers.eq(uid)
+        if not affected.any():
+            continue
+        items = per_unit.get(uid)
+        if isinstance(items, str):
+            items = [items]
+        mapped = isinstance(items, (list, tuple, set)) and bool(items) and all(
+            isinstance(item, str) and isinstance(labels.get(item), str) and labels[item]
+            for item in items
+        )
+        columns = [labels[item] for item in items] if mapped else fallback
+        columns = [column for column in dict.fromkeys(columns) if column in result and column not in excluded]
+        if columns:
+            result.loc[affected, columns] = float('nan')
+    return result
+
+
 def mask_failed_reporting_units(frame, source_df, metric_columns=None):
     """Masque les mesures d'unités dont le chargement Analytics est incomplet.
 

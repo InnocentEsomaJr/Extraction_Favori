@@ -261,6 +261,7 @@ def analytics_to_reporting_frame(response, labels=None):
         result.attrs['reporting_columns'] = [
             label for identifier, label in requested_labels.items() if _metric_parts(identifier)[0] is not None
         ]
+        result.attrs['reporting_item_labels'] = dict(requested_labels)
         return result
     headers = [header.get("name", header.get("column")) for header in response.get("headers", [])]
     if set(headers) != {"ou", "dx", "value"} or len(headers) != 3:
@@ -291,4 +292,5 @@ def analytics_to_reporting_frame(response, labels=None):
     result.attrs['reporting_columns'] = [
         label for identifier, label in requested_labels.items() if _metric_parts(identifier)[0] is not None
     ]
+    result.attrs['reporting_item_labels'] = dict(requested_labels)
     return result

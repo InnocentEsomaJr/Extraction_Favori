@@ -341,7 +341,10 @@ def reporting_quality_warnings(reporting_df, metrics, targets):
         name = target.get("Zone")
         label = str(name).strip() if _normalise_name(name) else identifier
         zone_label = f"{label} ({identifier})" if label != identifier else identifier
-        rows = source.loc[source_ids.eq(identifier)]
+        rows = source.loc[source_ids.eq(identifier)].copy()
+        # Les calculs de diagnostic n'utilisent pas les métadonnées Analytics.
+        # Pandas les recopierait pour chaque colonne lors des conversions.
+        rows.attrs = {}
         if rows.empty:
             messages.append(f"{zone_label} : aucune donnée de déclaration reçue pour cette zone et cette période.")
             continue

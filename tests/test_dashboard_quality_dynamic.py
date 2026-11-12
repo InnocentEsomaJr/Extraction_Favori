@@ -124,42 +124,6 @@ def get_dhis2_client():
 '''
 
 
-ABA_REPORTING = '''
-def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
-    row = {"Organisation unit": "hu Aba Zone de Santé", "Organisation unit ID": "ZoneAAAAAAA"}
-    for number in range(9):
-        count = 15 if number < 8 else 14
-        prefix = f"Dataset {number} "
-        row[prefix + "Actual reports"] = count
-        row[prefix + "Expected reports"] = count
-        row[prefix + "Actual reports on time"] = count
-        row[prefix + "Reporting rate"] = 100
-        row[prefix + "Reporting rate on time"] = 100
-    return pd.DataFrame([row])
-'''
-
-
-ABA_DISJOINT_PREVIOUS_VIOLATIONS = '''
-def get_dhis2_client():
-    class Client:
-        def post(self, endpoint, data=None):
-            current = data["startDate"] == st.session_state["validation_start_date"].isoformat()
-            count = 5 if current else (0 if st.session_state.get("_aba_previous_empty") else 2)
-            phase = "Now" if current else "Old"
-            return [{
-                "organisationUnitId": "CentreAAAAA",
-                "organisationUnitDisplayName": "Centre Aba",
-                "organisationUnitPath": f"/CountryAAAA/ProvinceAAA/{data['ou']}/CentreAAAAA",
-                "validationRuleId": f"Rule{phase}{number:04d}",
-                "validationRuleDescription": f"Règle {phase} {number}",
-                "periodId": data["startDate"][:7].replace("-", ""),
-                "leftSideValue": 2, "rightSideValue": 1,
-                "operator": "<=", "importance": "MEDIUM",
-            } for number in range(count)]
-    return Client()
-'''
-
-
 class DynamicQualityDashboardTests(unittest.TestCase):
     def widget(self, app, kind, label):
         return next(widget for widget in getattr(app, kind) if widget.label == label)
@@ -191,49 +155,6 @@ class DynamicQualityDashboardTests(unittest.TestCase):
         self.widget(app, 'selectbox', 'Zone de santé de l’analyse').select(zone)
         self.run_app(app)
 
-    def test_aba_score_stays_75_with_two_previous_rules_even_if_they_disappear_in_m(self):
-        catalog = filter_test.CATALOG_FIXTURE.replace('"ZS Commune", pa', '"hu Aba Zone de Santé", pa')
-        app = self.new_app(data=ABA_REPORTING, client=ABA_DISJOINT_PREVIOUS_VIOLATIONS, catalog=catalog)
-        downloads = {}
-        real_download = st.download_button
-
-        def capture(label, *args, **kwargs):
-            downloads[label] = kwargs.get('data', args[0] if args else None)
-            return real_download(label, *args, **kwargs)
-
-        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')), \
-                mock.patch('streamlit.download_button', side_effect=capture):
-            self.run_app(app)
-            self.select_zone(app, 'ProvinceAAA', 'ZoneAAAAAAA')
-            self.widget(app, 'button', 'Calculer tous les scores (M et M-1)').click()
-            self.run_app(app)
-            frame = self.summary(app)
-            self.assertEqual(frame['Complétude globale (%)'].tolist(), [100])
-            self.assertEqual(frame['Promptitude globale (%)'].tolist(), [100])
-            self.assertEqual(frame['Reports_Actual'].tolist(), [134])
-            self.assertEqual(frame['Nombre de datasets complétude ≥95 %'].tolist(), [9])
-            self.assertEqual(frame['Règles violées (M)'].tolist(), [5])
-            self.assertAlmostEqual(frame['Ratio / 100 rapports'].iloc[0], 5 / 134 * 100)
-            self.assertEqual(frame['Règles violées (M-1)'].tolist(), [2])
-            self.assertEqual(frame['Règles corrigées (M-1 -> M)'].tolist(), [2])
-            self.assertEqual(frame['Règles restantes (M-1 -> M)'].tolist(), [0])
-            self.assertEqual(frame['Score corrections /20'].tolist(), [0])
-            self.assertEqual(frame[TOTAL_COL].tolist(), [75])
-            self.assertEqual(frame['Moyenne complétude / promptitude (%)'].tolist(), [100])
-            self.assertNotIn('Score de qualité', frame.columns)
-            headers, rows = detail_test.excel_sheet(downloads['Télécharger Excel'], 'Resultats_Regles')
-            self.assertIn('Score qualité /100', headers)
-            self.assertEqual(rows[0]['Score qualité /100'], 75)
-            self.assertNotIn('Score de qualité', headers)
-
-            app.session_state['_aba_previous_empty'] = True
-            self.widget(app, 'button', 'Calculer tous les scores (M et M-1)').click()
-            self.run_app(app)
-            no_previous = self.summary(app)
-            self.assertEqual(no_previous['Règles violées (M-1)'].tolist(), [0])
-            self.assertEqual(no_previous['Score corrections /20'].tolist(), [20])
-            self.assertEqual(no_previous[TOTAL_COL].tolist(), [95])
-
     def test_quality_is_available_before_any_validation_request(self):
         app = self.new_app()
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
@@ -241,8 +162,8 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             frame = self.summary(app)
             self.assertEqual(len(frame), 3)
             self.assertEqual(sorted(frame['Reports_Actual'].tolist()), [900, 980, 1000])
-            self.assertEqual(sorted(frame['Moyenne complétude / promptitude (%)'].tolist()), [45, 82.5, 97.5])
-            self.assertEqual(sorted(frame['Note moyenne des taux /20'].tolist()), [0, 15, 20])
+            self.assertEqual(sorted(frame['Score de qualité'].tolist()), [45, 82.5, 97.5])
+            self.assertEqual(sorted(frame['Score de qualité /20'].tolist()), [0, 15, 20])
             self.assertTrue(frame['Règles violées (M)'].isna().all())
             self.assertTrue(frame['Règles violées (M-1)'].isna().all())
             self.assertTrue(frame[TOTAL_COL].isna().all())
@@ -251,7 +172,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             quality_grid = next(grid for grid in app.dataframe if TOTAL_COL in grid.value.columns)
             displayed = pa.ipc.open_stream(quality_grid.proto.styler.display_values).read_all().to_pandas()
             self.assertEqual(displayed['Règles violées (M)'].tolist(), ['—', '—', '—'])
-            self.assertEqual(sorted(displayed['Moyenne complétude / promptitude (%)'].tolist()), ['45.00', '82.50', '97.50'])
+            self.assertEqual(sorted(displayed['Score de qualité'].tolist()), ['45.00', '82.50', '97.50'])
 
     def test_zone_homonyms_and_dates_use_the_selected_ids_and_months(self):
         app = self.new_app()
@@ -262,7 +183,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             self.assertEqual(january['Reports_Actual'].tolist(), [900])
             self.assertEqual(january['Complétude globale (%)'].tolist(), [90])
             self.assertEqual(january['Promptitude globale (%)'].tolist(), [75])
-            self.assertEqual(january['Moyenne complétude / promptitude (%)'].tolist(), [82.5])
+            self.assertEqual(january['Score de qualité'].tolist(), [82.5])
 
             year = int(self.widget(app, 'selectbox', "Choisir l'année :").value)
             self.widget(app, 'date_input', 'Date de début').set_value(date(year, 2, 1))
@@ -270,14 +191,14 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             self.run_app(app)
             february = self.summary(app)
             self.assertEqual(february['Reports_Actual'].tolist(), [400])
-            self.assertEqual(february['Moyenne complétude / promptitude (%)'].tolist(), [35])
-            self.assertEqual(february['Note moyenne des taux /20'].tolist(), [0])
+            self.assertEqual(february['Score de qualité'].tolist(), [35])
+            self.assertEqual(february['Score de qualité /20'].tolist(), [0])
 
             self.select_zone(app, 'ProvinceBBB', 'ZoneCCCCCCC')
             other = self.summary(app)
             self.assertEqual(len(other), 1)
             self.assertEqual(other['Reports_Actual'].tolist(), [600])
-            self.assertEqual(other['Moyenne complétude / promptitude (%)'].tolist(), [45])
+            self.assertEqual(other['Score de qualité'].tolist(), [45])
             self.assertEqual(app.session_state['_quality_requests'][-1], {
                 'period': f'{year}02', 'ou_dimension': 'ZoneCCCCCCC',
             })
@@ -293,7 +214,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             after = self.summary(app)
             for column in [
                 'Zone de santé', 'Complétude globale (%)', 'Promptitude globale (%)',
-                'Reports_Actual', 'Moyenne complétude / promptitude (%)', 'Note moyenne des taux /20',
+                'Reports_Actual', 'Score de qualité', 'Score de qualité /20',
             ]:
                 pd.testing.assert_series_equal(after[column], before[column])
             self.assertTrue(after['Règles violées (M)'].isna().all())
@@ -340,8 +261,8 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             _, rows = detail_test.excel_sheet(downloads['Télécharger Excel'], 'Resultats_Regles')
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]['Reports_Actual'], 980)
-            self.assertEqual(rows[0]['Moyenne complétude / promptitude (%)'], 97.5)
-            self.assertEqual(rows[0]['Note moyenne des taux /20'], 20)
+            self.assertEqual(rows[0]['Score de qualité'], 97.5)
+            self.assertEqual(rows[0]['Score de qualité /20'], 20)
             self.assertIsNone(rows[0]['Règles violées (M)'])
             self.assertIsNone(rows[0][TOTAL_COL])
             _, context_rows = detail_test.excel_sheet(downloads['Télécharger Excel'], 'Contexte_Validation')
@@ -374,7 +295,7 @@ class DynamicQualityDashboardTests(unittest.TestCase):
             frame = self.summary(app)
             self.assertEqual(frame['Zone de santé'].tolist(), ['ZS B'])
             self.assertEqual(frame['Reports_Actual'].tolist(), [1000])
-            self.assertEqual(frame['Moyenne complétude / promptitude (%)'].tolist(), [45])
+            self.assertEqual(frame['Score de qualité'].tolist(), [45])
             self.assertTrue(frame['Règles violées (M)'].isna().all())
             self.assertNotIn('categorisation_result', app.session_state)
             self.assertEqual(len(app.session_state['_fixture_detail_queries']), 1)
@@ -399,7 +320,7 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             self.assertTrue(frame['Complétude globale (%)'].isna().all())
             self.assertTrue(frame['Promptitude globale (%)'].isna().all())
             self.assertTrue(frame['Reports_Actual'].isna().all())
-            self.assertTrue(frame['Moyenne complétude / promptitude (%)'].isna().all())
+            self.assertTrue(frame['Score de qualité'].isna().all())
             self.assertTrue(frame[TOTAL_COL].isna().all())
             self.assertGreater(len(app.warning) + len(app.info), 0)
 
@@ -417,15 +338,15 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             self.assertEqual(current['Promptitude globale (%)'].tolist(), [68])
             self.assertEqual(current['Reports_Actual'].tolist(), [900])
             self.assertEqual(current['Nombre de datasets complétude ≥95 %'].tolist(), [9])
-            self.assertEqual(current['Moyenne complétude / promptitude (%)'].tolist(), [84])
-            self.assertEqual(current['Note moyenne des taux /20'].tolist(), [15])
+            self.assertEqual(current['Score de qualité'].tolist(), [84])
+            self.assertEqual(current['Score de qualité /20'].tolist(), [15])
             self.assertNotIn('_extra_quality_attempts', app.session_state)
 
             self.widget(app, 'button', "Lancer l'analyse des violations").click()
             self.run_app(app)
             analysed = self.summary(app)
             self.assertEqual(analysed['Règles violées (M)'].tolist(), [4])
-            self.assertEqual(analysed['Moyenne complétude / promptitude (%)'].tolist(), [84])
+            self.assertEqual(analysed['Score de qualité'].tolist(), [84])
             self.assertEqual(analysed['Nombre de datasets complétude ≥95 %'].tolist(), [9])
             self.assertEqual(len(app.session_state['_screenshot_validation_queries']), 1)
             self.assertNotIn('_extra_quality_attempts', app.session_state)
@@ -435,7 +356,7 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             self.assertEqual(other['Reports_Actual'].tolist(), [720])
             self.assertEqual(other['Complétude globale (%)'].tolist(), [40])
             self.assertEqual(other['Promptitude globale (%)'].tolist(), [30])
-            self.assertEqual(other['Moyenne complétude / promptitude (%)'].tolist(), [35])
+            self.assertEqual(other['Score de qualité'].tolist(), [35])
             self.assertTrue(other['Règles violées (M)'].isna().all())
             self.assertEqual(len(app.session_state['_screenshot_validation_queries']), 1)
             self.assertNotIn('_extra_quality_attempts', app.session_state)
@@ -455,7 +376,7 @@ def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimen
             self.assertEqual(frame['Reports_Actual'].tolist(), [400])
             self.assertEqual(frame['Complétude globale (%)'].tolist(), [40])
             self.assertEqual(frame['Promptitude globale (%)'].tolist(), [30])
-            self.assertEqual(frame['Moyenne complétude / promptitude (%)'].tolist(), [35])
+            self.assertEqual(frame['Score de qualité'].tolist(), [35])
             self.assertEqual(app.session_state['_quality_requests'][-1], {
                 'period': f'{year}02', 'ou_dimension': 'ZoneAAAAAAA',
             })

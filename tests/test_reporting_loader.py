@@ -17,6 +17,11 @@ SUFFIXES = ['Actual reports', 'Expected reports', 'Actual reports on time',
 
 
 class ReportingChunkTests(unittest.TestCase):
+    def http_error(self, status):
+        response = requests.Response()
+        response.status_code = status
+        return requests.HTTPError('private password URL', response=response)
+
     def query(self, count=4):
         labels = {f'Dataset{number:04d}.{metric}': f'Dataset {number} {suffix}'
                   for number in range(count) for metric, suffix in zip(METRICS, SUFFIXES)}
@@ -162,6 +167,130 @@ class ReportingChunkTests(unittest.TestCase):
         self.assertIn('Délai', format_reporting_error(timed_out))
         self.assertNotIn('password', format_reporting_error(timed_out))
         self.assertNotIn('private', format_reporting_error(ValueError('private URL')))
+
+    def test_ninety_six_datasets_use_small_requests_and_keep_every_value(self):
+        params, labels = self.query(96)
+
+        def reject_large(dimensions):
+            if len(dimensions['dx']) > 15:
+                raise self.http_error(400)
+
+        client = self.client(reject_large)
+        units = ['ZoneAAAAAAA', 'ZoneBBBBBBB']
+        result = fetch_reporting_chunks(client, params, labels, units, units_per_request=1, items_per_request=15)
+        self.assertEqual(client.get.call_count, 64)
+        self.assertEqual(result['Organisation unit ID'].tolist(), units)
+        self.assertEqual(result['Dataset 95 Actual reports'].tolist(), [134, 134])
+        self.assertFalse(result.iloc[:, 2:].isna().any().any())
+        self.assertEqual(result.attrs['reporting_status'], 'complete')
+        self.assertEqual(result.attrs['reporting_warnings'], [])
+        self.assertEqual(result.attrs['failed_units'], [])
+
+    def test_bad_request_or_long_uri_recovers_by_disjoint_complete_datasets(self):
+        params, labels = self.query(4)
+        for status in (400, 414):
+            with self.subTest(status=status):
+                def reject_large(dimensions):
+                    if len(dimensions['dx']) > 5:
+                        raise self.http_error(status)
+                client = self.client(reject_large)
+                frame = fetch_reporting_chunks(
+                    client, params, labels, ['ZoneAAAAAAA'], units_per_request=1, items_per_request=20,
+                )
+                self.assertEqual(client.get.call_count, 7)  # 2 * 4 familles - 1.
+                self.assertEqual(frame.attrs['reporting_status'], 'complete')
+                self.assertEqual(frame.attrs['failed_units'], [])
+                self.assertEqual(frame.attrs['reporting_warnings'], [])
+                self.assertFalse(frame.iloc[:, 2:].isna().any().any())
+                leaf_items = []
+                for call in client.get.call_args_list:
+                    query = call.kwargs['params']
+                    self.assertEqual(call.args[0], 'analytics.json')
+                    for parameter in params[2:]:
+                        self.assertIn(parameter, query)
+                    self.assertIn(('dimension', 'ou:ZoneAAAAAAA'), query)
+                    items = next(value[3:].split(';') for key, value in query
+                                 if key == 'dimension' and value.startswith('dx:'))
+                    for dataset in {item.split('.')[0] for item in items}:
+                        self.assertEqual({item.split('.')[1] for item in items if item.startswith(dataset + '.')}, set(METRICS))
+                    if len(items) == 5:
+                        leaf_items.extend(items)
+                self.assertEqual(len(leaf_items), len(set(leaf_items)))
+                self.assertEqual(set(leaf_items), set(labels))
+                self.assertTrue(any(entry['Statut'] == 'Fractionné' for entry in frame.attrs['reporting_requests']))
+
+    def test_one_rejected_dataset_keeps_all_other_cells_and_only_marks_its_metrics(self):
+        params, labels = self.query(4)
+
+        def reject_bad_dataset(dimensions):
+            if dimensions['ou'] == ['ZoneAAAAAAA'] and any(item.startswith('Dataset0002.') for item in dimensions['dx']):
+                raise self.http_error(400)
+
+        client = self.client(reject_bad_dataset)
+        result = fetch_reporting_chunks(client, params, labels, ['ZoneAAAAAAA', 'ZoneBBBBBBB'],
+                                        units_per_request=1, items_per_request=20)
+        frame = result.set_index('Organisation unit ID')
+        self.assertEqual(client.get.call_count, 6)
+        for number in (0, 1, 3):
+            self.assertEqual(frame.loc['ZoneAAAAAAA', f'Dataset {number} Actual reports'], 134)
+        self.assertTrue(pd.isna(frame.loc['ZoneAAAAAAA', 'Dataset 2 Actual reports']))
+        self.assertEqual(frame.loc['ZoneBBBBBBB', 'Dataset 2 Actual reports'], 134)
+        self.assertEqual(result.attrs['failed_units'], ['ZoneAAAAAAA'])
+        self.assertEqual(set(result.attrs['failed_metrics_by_unit']['ZoneAAAAAAA']),
+                         {item for item in labels if item.startswith('Dataset0002.')})
+        self.assertEqual(result.attrs['reporting_status'], 'partial')
+        self.assertEqual(len(result.attrs['reporting_warnings']), 1)
+        self.assertNotIn('private', str(result.attrs))
+        self.assertNotIn('password', str(result.attrs))
+
+    def test_authorization_failure_inside_a_subdivision_stops_remaining_gets(self):
+        params, labels = self.query(4)
+        client = self.client()
+        client.get.side_effect = [self.http_error(400), self.http_error(403)]
+        result = fetch_reporting_chunks(client, params, labels, ['ZoneAAAAAAA', 'ZoneBBBBBBB'],
+                                        units_per_request=1, items_per_request=20)
+        self.assertEqual(client.get.call_count, 2)
+        self.assertEqual(result.attrs['reporting_status'], 'unavailable')
+        self.assertEqual(set(result.attrs['failed_units']), {'ZoneAAAAAAA', 'ZoneBBBBBBB'})
+        self.assertEqual(len(result.attrs['reporting_warnings']), 1)
+        self.assertIn('403', result.attrs['reporting_warnings'][0])
+        for failed in result.attrs['failed_metrics_by_unit'].values():
+            self.assertEqual(set(failed), set(labels))
+
+    def test_timeout_or_server_failure_never_triggers_subdivision(self):
+        params, labels = self.query(4)
+        for error in (requests.ReadTimeout('private'), self.http_error(500), self.http_error(504)):
+            with self.subTest(error=type(error).__name__):
+                client = mock.Mock()
+                client.get.side_effect = error
+                result = fetch_reporting_chunks(client, params, labels, ['ZoneAAAAAAA'], items_per_request=20)
+                self.assertEqual(client.get.call_count, 1)
+                self.assertEqual(result.attrs['reporting_status'], 'unavailable')
+
+    def test_recovered_request_keeps_legacy_initial_scope_and_rejects_out_of_scope_leaf(self):
+        params, labels = self.query(2)
+        params[1] = ('dimension', 'ou:ZoneAAAAAAA')
+        client = self.client()
+        normal = client.get.side_effect
+
+        def get(endpoint, params):
+            items = next(value[3:].split(';') for key, value in params
+                         if key == 'dimension' and value.startswith('dx:'))
+            if len(items) > 5:
+                raise self.http_error(400)
+            response = normal(endpoint, params)
+            if items[0].startswith('Dataset0001.'):
+                response['rows'][0][0] = 'OtherZoneAA'
+            return response
+
+        client.get.side_effect = get
+        result = fetch_reporting_chunks(client, params, labels, None)
+        self.assertEqual(client.get.call_count, 3)
+        self.assertEqual(client.get.call_args_list[0], mock.call('analytics.json', params=params))
+        self.assertEqual(result['Organisation unit ID'].tolist(), ['ZoneAAAAAAA'])
+        self.assertEqual(result['Dataset 0 Actual reports'].tolist(), [134])
+        self.assertTrue(result['Dataset 1 Actual reports'].isna().all())
+        self.assertEqual(result.attrs['failed_units'], ['ZoneAAAAAAA'])
 
 
 if __name__ == '__main__':
