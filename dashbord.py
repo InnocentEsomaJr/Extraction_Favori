@@ -1838,7 +1838,14 @@ if df_raw is not None:
         if df_tab1.empty:
             st.warning("Aucune zone de santé à afficher avec ce filtre.")
         else:
-            st.dataframe(df_tab1.head(15).style.format(na_rep='—'), use_container_width=True)
+            st.dataframe(
+                df_tab1.head(15).style.format(
+                    {column: lambda value: str(value).removesuffix('.0')
+                     for column in df_tab1.select_dtypes(include='number').columns},
+                    na_rep='—',
+                ),
+                use_container_width=True,
+            )
         df_tab1_export = df_tab1.copy()
 
     # --- ONGLET 2 : COMPLÉTUDE ---
