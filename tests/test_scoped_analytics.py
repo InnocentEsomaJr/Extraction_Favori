@@ -247,21 +247,6 @@ class AnalyticsFrameTests(unittest.TestCase):
         frame = analytics_to_reporting_frame({"rows": [], "metaData": response["metaData"]}, {"IndicatorAA": "IndicatorAA"})
         self.assertIn("Indicateur lisible", frame.columns)
 
-    def test_item_column_identity_survives_metadata_enrichment_and_missing_metrics(self):
-        labels = {f'DatasetAAAA.{metric}': f'DatasetAAAA {suffix}' for metric, suffix in METRIC_LABELS.items()}
-        frame = analytics_to_reporting_frame(self.response(), labels)
-        self.assertEqual(frame.attrs['reporting_item_labels'], {
-            f'DatasetAAAA.{metric}': f'Consultations {suffix}' for metric, suffix in METRIC_LABELS.items()
-        })
-        self.assertTrue(frame[frame.attrs['reporting_item_labels']['DatasetAAAA.REPORTING_RATE']].isna().all())
-
-    def test_empty_item_column_identity_uses_final_names_and_excludes_generic_indicators(self):
-        frame = analytics_to_reporting_frame({'rows': [], 'metaData': {'items': {
-            'DatasetAAAA': {'displayName': 'Consultations'},
-        }}}, {'DatasetAAAA.ACTUAL_REPORTS': 'DatasetAAAA Actual reports', 'IndicatorAA': 'Faux Actual reports'})
-        self.assertEqual(frame.attrs['reporting_item_labels'], {'DatasetAAAA.ACTUAL_REPORTS': 'Consultations Actual reports'})
-        self.assertIn('Faux Actual reports', frame.columns)
-
     def test_metadata_enrichment_resolves_homonymous_dataset_names_without_collision(self):
         response = self.response()
         response["rows"].append(["DatasetBBBB.ACTUAL_REPORTS", "ZoneAAAAAAA", "7"])

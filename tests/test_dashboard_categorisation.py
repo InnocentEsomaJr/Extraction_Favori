@@ -233,15 +233,10 @@ def app_fixture_source(replacements=None):
             ):
                 fixture.args.kwonlyargs.append(ast.arg(arg='unit_ids'))
                 fixture.args.kw_defaults.append(ast.Constant(value=None))
-            if node.name in {'get_data', 'get_quality_reporting_data'} and not any(
+            if node.name == 'get_quality_reporting_data' and not any(
                 argument.arg == 'dataset_ids' for argument in fixture.args.args + fixture.args.kwonlyargs
             ):
                 fixture.args.kwonlyargs.append(ast.arg(arg='dataset_ids'))
-                fixture.args.kw_defaults.append(ast.Constant(value=None))
-            if node.name in {'get_data', 'get_quality_reporting_data'} and not any(
-                argument.arg == 'weekly_periods' for argument in fixture.args.args + fixture.args.kwonlyargs
-            ):
-                fixture.args.kwonlyargs.append(ast.arg(arg='weekly_periods'))
                 fixture.args.kw_defaults.append(ast.Constant(value=None))
             return fixture
 
@@ -257,12 +252,7 @@ def app_fixture_source(replacements=None):
     source = ('import streamlit as st\n'
               'if "quality_detail_level" not in st.session_state:\n'
               '    st.session_state["quality_detail_level"] = "Zones de santé"\n'
-              + ast.unparse(transformed)
-              + '\nst.session_state["_test_export_frame"] = df_tab5_export.copy()\n'
-              + 'st.session_state["_test_main_summary"] = df_synth.copy()\n'
-              + 'st.session_state["_test_main_comp"] = df_final_c.copy()\n'
-              + 'st.session_state["_test_main_prompt"] = df_final_p.copy()\n'
-              + 'st.session_state["_test_main_raw"] = target_df.copy()\n')
+              + ast.unparse(transformed) + '\nst.session_state["_test_export_frame"] = df_tab5_export.copy()\n')
     # AppTest écrit son fichier temporaire avec l'encodage système de Windows.
     return source.encode("ascii", errors="backslashreplace").decode("ascii")
 

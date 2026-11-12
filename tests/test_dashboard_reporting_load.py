@@ -42,13 +42,10 @@ def get_dhis2_client():
             if units not in ["ZoneAAAAAAA", "ZoneBBBBBBB"]:
                 raise AssertionError("Unité fixture hors périmètre : " + units)
             actual, timely = (1, 0.68) if units == "ZoneAAAAAAA" else (2, 1.6)
-            expected = actual
-            if units in st.session_state.get("_reporting_zero_units", []):
-                actual, timely, expected = 0, 0, 1
             values = {
-                "ACTUAL_REPORTS": actual, "EXPECTED_REPORTS": expected,
-                "REPORTING_RATE": actual / expected * 100, "ACTUAL_REPORTS_ON_TIME": timely,
-                "REPORTING_RATE_ON_TIME": timely / expected * 100,
+                "ACTUAL_REPORTS": actual, "EXPECTED_REPORTS": actual,
+                "REPORTING_RATE": 100, "ACTUAL_REPORTS_ON_TIME": timely,
+                "REPORTING_RATE_ON_TIME": timely / actual * 100,
             }
             return {
                 "headers": [{"name": name} for name in ["ou", "dx", "value"]],
@@ -179,27 +176,6 @@ class DashboardReportingLoadTests(unittest.TestCase):
             self.assertEqual({query['ou'] for query in app.session_state['_reporting_validation_queries']}, {'ZoneAAAAAAA', 'ZoneBBBBBBB'})
             self.assertEqual(self.scores(app)['Règles violées (M)'].tolist(), [0, 0])
             self.assertTrue(self.scores(app)[['Complétude globale (%)', 'Reports_Actual', 'Moyenne complétude / promptitude (%)']].isna().all().all())
-            self.assert_no_technical_exception(app)
-
-    def test_observed_zero_in_a_successful_zone_is_not_hidden_by_another_zone_failure(self):
-        app = self.new_app(failed=['ZoneBBBBBBB'])
-        app.session_state['_reporting_zero_units'] = ['ZoneAAAAAAA']
-        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
-            self.run_app(app)
-            frame = self.scores(app).set_index('Zone de santé')
-            measured = [
-                'Reports_Actual', 'Complétude globale (%)', 'Promptitude globale (%)',
-                'Nombre de datasets complétude ≥95 %', 'Moyenne complétude / promptitude (%)',
-            ]
-            self.assertEqual(frame.loc['ZS Commune', measured].tolist(), [0, 0, 0, 0, 0])
-            self.assertTrue(frame.loc['ZS B', measured].isna().all())
-            raw = app.session_state['_test_main_raw'].set_index('Organisation unit ID')
-            self.assertEqual(raw.loc['ZoneAAAAAAA', 'Dataset 0 Actual reports'], 0)
-            self.assertEqual(raw.loc['ZoneAAAAAAA', 'Dataset 0 Expected reports'], 1)
-            self.assertTrue(pd.isna(raw.loc['ZoneBBBBBBB', 'Dataset 0 Actual reports']))
-            comp = app.session_state['_test_main_comp'].set_index('Organisation unit')
-            self.assertEqual(comp.loc['ZS Commune', 'Dataset 0 Reporting rate'], 0)
-            self.assertTrue(pd.isna(comp.loc['ZS B', 'Dataset 0 Reporting rate']))
             self.assert_no_technical_exception(app)
 
 

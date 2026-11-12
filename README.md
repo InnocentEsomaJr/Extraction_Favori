@@ -163,67 +163,13 @@ Seule une analyse M-1 réussie sans aucune violation donne 20 points.
 
 La sélection **Datasets évalués pour le score qualité** est alimentée par les
 métadonnées DHIS2. Elle reprend les datasets du favori, retire le service tertiaire
-et ajoute **eSurveillance Hebdomadaire-Edition 2025**, identifié par son nom puis son UID DHIS2.
+et ajoute **1y-Surveillance épidémiologique**, identifié par son nom puis son UID DHIS2.
 Si ce nom est absent ou ambigu, un message demande de vérifier la sélection ;
 aucun autre dataset de surveillance n'est substitué automatiquement.
 Aucun identifiant ni résultat d'exemple n'est imposé.
 Les cinq métriques de reporting de chaque dataset choisi alimentent les taux,
-les rapports et le compte des datasets à 95 %. Les datasets mensuels et hebdomadaires
-font l'objet de requêtes séparées, avec les mêmes filtres d'unités et les mêmes
-filtres supplémentaires du favori. eSurveillance est interrogé sur les semaines ISO,
-puis rattaché par UID aux indicateurs mensuels. Les rapports réels, attendus et à
-temps sont additionnés avant de recalculer les taux globaux ; eSurveillance compte
-une seule fois parmi les datasets à 95 %, quel que soit le nombre de semaines.
-Ces requêtes utilisent les [métriques de reporting Analytics de DHIS2](https://docs.dhis2.org/en/develop/using-the-api/dhis-core-version-242/analytics.html).
-
-**Périodes et semaines choisies :** la barre latérale propose une période fixe
-mensuelle, trimestrielle, semestrielle, annuelle, hebdomadaire ou journalière, ainsi qu'un intervalle
-de ces périodes sur une ou plusieurs années. Les trimestres, semestres et années sont
-développés en mois entiers pour les datasets mensuels. Les deux bornes affichées sont
-**incluses** : un trimestre se termine le dernier jour de son troisième mois, et le
-trimestre suivant commence le lendemain. Les dates de validation sont initialisées
-sur les bornes exactes demandées et restent modifiables.
-
-Une semaine ISO reste entière, du lundi au dimanche, et est rattachée au **mois de
-son dimanche de fin**. W36–W39 de 2026 couvre réellement le 31 août–27 septembre,
-mais n'ajoute pas août aux datasets mensuels : seul septembre est agrégé. W40 se
-termine le 4 octobre et appartient à octobre. La référence M-1 suit le mois précédant
-le premier mois de reporting retenu. Les mois agrégés, les dates demandées et la
-couverture réelle des semaines sont affichés et exportés séparément.
-
-Les semaines de surveillance se choisissent librement ou par semaine de début et de
-fin. Par défaut, la sélection couvre les semaines dont le dimanche est compris dans
-l'intervalle inclusif. L'option « Semaines entièrement comprises » exige que le lundi
-et le dimanche soient tous deux dans cet intervalle. La sélection
-peut être modifiée et ne comporte aucune limite de quatre ou cinq semaines. Aucun
-report automatique de cinquième semaine n'est appliqué. Un semestre peut ainsi utiliser
-toutes ses semaines, ou seulement celles que l'utilisateur a retenues.
-Une semaine ajoutée manuellement hors des bornes reste visible et signalée ; aucun
-rapport hebdomadaire ni mensuel n'est découpé ou calculé au prorata des jours.
-L'export ajoute les feuilles `Periodes_Surveillance` et `Reporting_Surveillance`.
-
-Une surveillance indisponible ne devient pas un dataset inactif : le score de l'unité
-reste incomplet, tandis que les **cellules mensuelles déjà reçues restent visibles**.
-L'affichage « Rapports disponibles par source » et la feuille Excel
-`Reporting_Disponible` distinguent les comptes mensuels et hebdomadaires reçus des
-totaux combinés. Seuls ces totaux et les scores concernés restent indisponibles ;
-une erreur hebdomadaire n'efface plus les colonnes mensuelles. Si la préparation
-combinée échoue, les seules cellules mensuelles du favori rattachées aux UID de datasets
-sélectionnés sont conservées comme données partielles, sans réintroduire le tertiaire.
-
-Les colonnes sont rattachées par identifiant DXID, y compris lorsque DHIS2 remplace
-un libellé provisoire par le vrai nom du dataset. Les datasets d'un autre type de
-période que mensuel ou hebdomadaire sont signalés et exclus de cette sélection,
-pour qu'un favori mixte ne bloque pas le chargement des sources compatibles.
-
-La source combinée
-mensuelle et hebdomadaire alimente désormais **tous les tableaux** : complétude,
-promptitude, analyse comparative et qualité. Les anciennes colonnes de reporting du
-favori sont remplacées avant les calculs, afin de ne compter aucun dataset deux fois ;
-ses autres indicateurs restent disponibles. La qualité réutilise cette synthèse
-seulement pour les mêmes mois, datasets et semaines. Une période qualité indépendante
-dispose de son propre choix de semaines. Changer les semaines recalcule les indicateurs
-sans relancer les requêtes M/M-1 déjà reçues.
+les rapports et le compte des datasets à 95 %. La synthèse des autres onglets est
+réutilisée seulement pour les mêmes mois et exactement la même sélection de datasets.
 
 Les deux actions existantes restent séparées :
 
