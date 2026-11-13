@@ -177,6 +177,10 @@ def get_data(favori_id, period=None, cache_user=None, ou_dimension=None):
 def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None):
     return get_data(favori_id, period=period, cache_user=cache_user, ou_dimension=ou_dimension)
 
+def get_quality_dataset_catalog(cache_user=None):
+    return [{"id": f"Data{number:07d}", "displayName": f"Dataset {number}", "periodType": "Monthly"}
+            for number in range(10)]
+
 def get_organisation_catalog(cache_user=None):
     from geography import build_geography_catalog
     country = {"id": "CountryAAAA", "displayName": "Pays test", "level": 1}
@@ -230,6 +234,11 @@ def app_fixture_source(replacements=None):
             ):
                 fixture.args.kwonlyargs.append(ast.arg(arg='unit_ids'))
                 fixture.args.kw_defaults.append(ast.Constant(value=None))
+            if node.name == 'get_quality_reporting_data' and not any(
+                argument.arg == 'dataset_ids' for argument in fixture.args.args + fixture.args.kwonlyargs
+            ):
+                fixture.args.kwonlyargs.append(ast.arg(arg='dataset_ids'))
+                fixture.args.kw_defaults.append(ast.Constant(value=None))
             return fixture
 
         def visit_Expr(self, node):
@@ -244,6 +253,8 @@ def app_fixture_source(replacements=None):
     source = ('import streamlit as st\n'
               'if "quality_detail_level" not in st.session_state:\n'
               '    st.session_state["quality_detail_level"] = "Zones de santé"\n'
+              'if "quality_dataset_scope" not in st.session_state:\n'
+              '    st.session_state["quality_dataset_scope"] = "Datasets du rapport sélectionné"\n'
               + ast.unparse(transformed) + '\nst.session_state["_test_export_frame"] = df_tab5_export.copy()\n')
     # AppTest écrit son fichier temporaire avec l'encodage système de Windows.
     return source.encode("ascii", errors="backslashreplace").decode("ascii")

@@ -94,9 +94,17 @@ les métriques Analytics de niveau 2 et le barème DPS ; les zones utilisent le 
 et le barème ZS. Les jointures
 utilisent les IDs DHIS2, y compris en présence de noms identiques.
 
-Pour les mêmes mois, le tableau réutilise les réponses Analytics déjà chargées
-pour tous les datasets du rapport sélectionné : taux, rapports réels et nombre
-de datasets à complétude ≥95 %. Seules les métriques de reporting identifiées
+Le choix **Datasets du tableau qualité** utilise par défaut **Tous les datasets
+DHIS2** : le catalogue complet accessible au compte connecté, y compris les
+datasets absents du rapport sélectionné. **Choisir les datasets** permet une
+sélection personnalisée par UID ; **Datasets du rapport sélectionné** conserve
+le périmètre du favori. Aucun dataset n'est ajouté ou exclu selon son nom.
+Si le catalogue est indisponible, un message le précise sans remplacer
+silencieusement la sélection par celle du rapport.
+
+Pour les mêmes mois et la même sélection de datasets, le tableau réutilise les
+réponses Analytics déjà chargées : taux, rapports réels et nombre de datasets à
+complétude ≥95 %. Seules les métriques de reporting identifiées
 par DHIS2 alimentent ces calculs. Un indicateur générique, même nommé « Actual
 reports » ou indisponible, ne modifie pas ces chiffres. Une zone peut être
 sélectionnée dans la province ou le pays déjà chargé, sans relancer une seconde
@@ -105,7 +113,7 @@ pour l'unité concernée ; un véritable refus de données de reporting reste si
 Les ID exacts et un rattachement non ambigu sont obligatoires ; un zéro créé en
 l'absence de toute donnée brute n'est pas réutilisé comme mesure.
 
-Si les mois ou les zones demandés ne sont pas disponibles dans cette synthèse,
+Si les datasets, les mois ou les zones demandés ne sont pas disponibles dans cette source,
 Analytics DHIS2 complète seulement les métriques manquantes, pour le périmètre
 et la période choisis. Si le favori ne demande que les taux, cette requête complète
 les cinq métriques nécessaires :
@@ -113,7 +121,8 @@ rapports réels, attendus, reçus à temps, taux de complétude et taux de promp
 Les indicateurs génériques ne sont pas assimilés à ces comptes. Les trois comptes
 servent aux taux pondérés ; la moyenne historique de complétude et promptitude,
 avec sa note /20, reste distincte du score qualité /100. Les autres onglets gardent
-la sélection du favori. Les datasets entièrement vides pour une unité sont ignorés
+la sélection du favori. La sélection de datasets est indiquée dans le contexte
+de l'export Excel. Les datasets entièrement vides pour une unité sont ignorés
 pour cette unité ; une valeur manquante dans un dataset actif reste indisponible.
 
 Les données de déclaration existantes sont réutilisées seulement si leurs unités,
@@ -368,9 +377,11 @@ L'application ne relance pas automatiquement un POST qui a dépassé le délai :
 DHIS2 peut encore être en train de calculer l'analyse.
 
 Le tableau reprend la base **ec72828**, avec le délai minimal de 900 secondes,
-les sauvegardes par zone et le bouton de reprise. Les datasets évalués sont ceux
-du favori DHIS2 choisi. Le sélecteur ajouté ensuite sur tout le catalogue et
-l'avertissement sur « 1y-Surveillance » sont retirés.
+les sauvegardes par zone et le bouton de reprise. Le tableau qualité peut évaluer
+tout le catalogue DHIS2 accessible, une sélection personnalisée ou les datasets
+du favori. Les paramètres des règles de validation restent indépendants de cette
+sélection ; les violations reçues sont conservées et leurs ratios sont recalculés
+avec les rapports des datasets choisis.
 
 Le chargement des indicateurs Analytics est réparti **par unité explicite et par
 lots de 15 métriques au maximum**, soit trois datasets avec leurs cinq mesures.
