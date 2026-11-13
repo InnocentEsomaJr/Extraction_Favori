@@ -148,8 +148,7 @@ class QualityDatasetCatalogAppTests(unittest.TestCase):
         app.session_state['dhis2_pass'] = 'fixture-password'
         app.session_state['filter_level_main'] = 'Province'
         app.session_state['filter_province_main'] = 'ProvinceAAA'
-        # Le prefixe des fixtures preserve les anciens tests du favori ; cette
-        # selection explicite verifie le mode par defaut de la production.
+        # Les scénarios historiques restent en mode favori dans la fixture commune.
         app.session_state['quality_dataset_scope'] = 'Tous les datasets DHIS2'
         return app
 
@@ -179,20 +178,20 @@ class QualityDatasetCatalogAppTests(unittest.TestCase):
         return frame
 
     def choose_external_dataset(self, app):
-        self.widget(app, 'selectbox', 'Datasets du tableau qualité').select('Choisir les datasets')
-        self.run_app(app)
-        self.widget(app, 'multiselect', 'Choisir les datasets à évaluer').set_value(['Data0000002'])
+        self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').set_value(['Data0000002'])
         self.run_app(app)
 
     def test_all_accessible_datasets_contribute_even_when_absent_from_the_favorite(self):
         app = self.new_app()
         with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
             self.run_app(app)
-            scope = self.widget(app, 'selectbox', 'Datasets du tableau qualité')
-            self.assertEqual(scope.value, 'Tous les datasets DHIS2')
-            self.assertEqual(scope.options, [
-                'Tous les datasets DHIS2', 'Datasets du rapport sélectionné', 'Choisir les datasets',
-            ])
+            datasets = self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité')
+            self.assertEqual(datasets.value, ['Data0000000', 'Data0000001', 'Data0000002'])
+            self.assertEqual(len(datasets.options), 3)
+            options = self.widget(app, 'expander', 'Options des datasets')
+            self.assertFalse(options.proto.expanded)
+            self.assertEqual(options.selectbox[0].label, 'Datasets du tableau qualité')
+            self.assertFalse(any(widget.label == datasets.label for widget in options.multiselect))
             frame = self.assert_metrics(app, {
                 'ZS A': [35, 87.5, 70, 2, 78.8],
                 'ZS B': [35, 87.5, 80, 2, 83.8],
@@ -212,6 +211,68 @@ class QualityDatasetCatalogAppTests(unittest.TestCase):
             for unit in ['ZoneAAAAAAA', 'ZoneBBBBBBB']:
                 requested = {item for query in queries if query['unit'] == unit for item in query['items']}
                 self.assertTrue(all_items.issubset(requested))
+
+    def test_all_ninety_seven_catalogue_ids_are_selected_by_default(self):
+        source = dashboard_test.app_fixture_source({
+            'get_quality_dataset_catalog': '''
+def get_quality_dataset_catalog(cache_user=None):
+    return [{"id": f"Data{number:07d}", "displayName": f"Dataset {number}", "periodType": "Monthly"}
+            for number in range(97)]
+''',
+            'get_quality_reporting_data': '''
+def get_quality_reporting_data(favori_id, period=None, cache_user=None, ou_dimension=None,
+                               unit_ids=None, dataset_ids=None):
+    st.session_state["_catalog_requested_dataset_ids"] = dataset_ids
+    return get_data(favori_id, period=period, cache_user=cache_user, ou_dimension=ou_dimension)
+''',
+        })
+        # Retire le défaut historique de la fixture pour vérifier celui de la production.
+        historical_scope = (
+            'if "quality_dataset_scope" not in st.session_state:\n'
+            '    st.session_state["quality_dataset_scope"] = "Datasets du rapport sélectionné"\n'
+        ).encode('ascii', errors='backslashreplace').decode('ascii')
+        self.assertIn(historical_scope, source)
+        source = source.replace(historical_scope, '', 1)
+        app = AppTest.from_string(source, default_timeout=45)
+        app.session_state['connected'] = True
+        app.session_state['dhis2_user'] = 'fixture-quality-catalog-' + self._testMethodName
+        app.session_state['dhis2_pass'] = 'fixture-password'
+        # Une ancienne sélection personnalisée masquée par le mode « Tous »
+        # ne doit pas remplacer les 97 choix lors de la migration de l'interface.
+        app.session_state['quality_dataset_account'] = ('https://fixture.invalid', app.session_state['dhis2_user'])
+        app.session_state['quality_selected_dataset_ids'] = ['Data0000002']
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+        expected_ids = [f'Data{number:07d}' for number in range(97)]
+        datasets = self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité')
+        self.assertEqual(datasets.value, expected_ids)
+        self.assertEqual(len(datasets.options), 97)
+        self.assertEqual(app.session_state['_catalog_requested_dataset_ids'], tuple(expected_ids))
+        self.assertEqual(app.session_state['quality_dataset_scope'], 'Tous les datasets DHIS2')
+
+    def test_removing_and_restoring_a_chip_updates_numeric_exports(self):
+        app = self.new_app()
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('Réseau interdit')):
+            self.run_app(app)
+            initial = self.frame(app)
+            self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').set_value([
+                'Data0000000', 'Data0000001',
+            ])
+            self.run_app(app)
+            self.assert_metrics(app, {
+                'ZS A': [30, 100, 86.67, 2, 93.3],
+                'ZS B': [15, 75, 70, 1, 72.5],
+            })
+            context = app.session_state['_catalog_export_context'].astype(str).to_string(index=False)
+            self.assertIn('Data0000000', context)
+            self.assertIn('Data0000001', context)
+            self.assertNotIn('Data0000002', context)
+            self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').set_value([
+                'Data0000000', 'Data0000001', 'Data0000002',
+            ])
+            self.run_app(app)
+            pd.testing.assert_frame_equal(self.frame(app), initial)
+            self.assertNotIn('_catalog_validation_posts', app.session_state)
 
     def test_custom_dataset_recomputes_reporting_and_preserves_validation_comparisons(self):
         app = self.new_app()
@@ -281,7 +342,7 @@ class QualityDatasetCatalogAppTests(unittest.TestCase):
             self.assertTrue(self.frame(app)[[TOTAL_COL, 'Règles violées (M)']].isna().all().all())
 
             queries = list(app.session_state['_catalog_analytics_queries'])
-            self.widget(app, 'multiselect', 'Choisir les datasets à évaluer').set_value([])
+            self.widget(app, 'multiselect', 'Datasets évalués pour le score qualité').set_value([])
             self.run_app(app)
             empty_selection = self.frame(app)
             self.assertTrue(empty_selection[self.metric_columns].isna().all().all())

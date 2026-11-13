@@ -7,6 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import io
 import os
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from categorisation import (
@@ -1855,7 +1856,14 @@ if df_raw is not None:
         if df_tab1.empty:
             st.warning("Aucune zone de santé à afficher avec ce filtre.")
         else:
-            st.dataframe(df_tab1.head(15).style.format(na_rep='—'), use_container_width=True)
+            st.dataframe(
+                df_tab1.head(15).style.format(
+                    {column: lambda value: str(value).removesuffix('.0')
+                     for column in df_tab1.select_dtypes(include='number').columns},
+                    na_rep='—',
+                ),
+                use_container_width=True,
+            )
         df_tab1_export = df_tab1.copy()
 
     # --- ONGLET 2 : COMPLÉTUDE ---
@@ -2179,16 +2187,27 @@ if df_raw is not None:
             ["Automatique", "DPS", "ZS"],
             help="Automatique utilise le niveau DHIS2 : province = DPS, zone de santé = ZS."
         )
-        quality_dataset_scope = st.selectbox(
-            "Datasets du tableau qualité",
-            ["Tous les datasets DHIS2", "Datasets du rapport sélectionné", "Choisir les datasets"],
-            key='quality_dataset_scope',
-            help="Le catalogue contient tous les datasets accessibles avec votre compte DHIS2.",
-        )
+        def reset_quality_dataset_selection():
+            st.session_state.pop('quality_selected_dataset_ids', None)
+
+        def mark_quality_dataset_selection():
+            st.session_state['quality_dataset_scope'] = 'Choisir les datasets'
+
+        with st.expander("Options des datasets"):
+            quality_dataset_scope = st.selectbox(
+                "Datasets du tableau qualité",
+                ["Tous les datasets DHIS2", "Datasets du rapport sélectionné", "Choisir les datasets"],
+                key='quality_dataset_scope', on_change=reset_quality_dataset_selection,
+                help="Le catalogue contient tous les datasets accessibles avec votre compte DHIS2.",
+            )
         dataset_account_context = (base_url, st.session_state.get('dhis2_user'))
         if st.session_state.get('quality_dataset_account') != dataset_account_context:
             st.session_state['quality_dataset_account'] = dataset_account_context
             st.session_state.pop('quality_selected_dataset_ids', None)
+        if st.session_state.get('quality_dataset_chip_version') != 1:
+            if quality_dataset_scope != 'Choisir les datasets':
+                st.session_state.pop('quality_selected_dataset_ids', None)
+            st.session_state['quality_dataset_chip_version'] = 1
         quality_dataset_ids = None
         quality_dataset_filter = quality_dataset_scope
         if quality_dataset_scope != 'Datasets du rapport sélectionné':
@@ -2197,8 +2216,13 @@ if df_raw is not None:
             except Exception:
                 dataset_catalog = None
             dataset_options = [dataset['id'] for dataset in dataset_catalog or []]
+            dataset_names = {dataset['id']: dataset['displayName'] for dataset in dataset_catalog or []}
+            name_counts = Counter(dataset_names.values())
             dataset_labels = {
-                dataset['id']: f"{dataset['displayName']} [{dataset['id']}]"
+                dataset['id']: (
+                    f"{dataset['displayName']} [{dataset['id']}]"
+                    if name_counts[dataset['displayName']] > 1 else dataset['displayName']
+                )
                 for dataset in dataset_catalog or []
             }
             if dataset_catalog is None:
@@ -2208,20 +2232,18 @@ if df_raw is not None:
                 )
             elif not dataset_options:
                 st.info("Aucun dataset accessible dans le catalogue DHIS2 avec ce compte.")
-            if quality_dataset_scope == 'Choisir les datasets':
-                if 'quality_selected_dataset_ids' in st.session_state:
-                    st.session_state['quality_selected_dataset_ids'] = [
-                        identifier for identifier in st.session_state['quality_selected_dataset_ids']
-                        if identifier in dataset_options
-                    ]
-                quality_dataset_ids = tuple(st.multiselect(
-                    "Choisir les datasets à évaluer", dataset_options,
-                    default=dataset_options if 'quality_selected_dataset_ids' not in st.session_state else None,
-                    format_func=lambda identifier: dataset_labels[identifier],
-                    key='quality_selected_dataset_ids',
-                ))
-            else:
-                quality_dataset_ids = tuple(dataset_options)
+            if 'quality_selected_dataset_ids' in st.session_state:
+                st.session_state['quality_selected_dataset_ids'] = [
+                    identifier for identifier in st.session_state['quality_selected_dataset_ids']
+                    if identifier in dataset_options
+                ]
+            quality_dataset_ids = tuple(st.multiselect(
+                "Datasets évalués pour le score qualité", dataset_options,
+                default=dataset_options if 'quality_selected_dataset_ids' not in st.session_state else None,
+                format_func=lambda identifier: dataset_labels[identifier],
+                key='quality_selected_dataset_ids', on_change=mark_quality_dataset_selection,
+                help="Tous les datasets accessibles sont sélectionnés au départ. Retirez ou ajoutez ceux à évaluer.",
+            ))
             if dataset_options and not quality_dataset_ids:
                 st.info("Sélectionnez au moins un dataset pour afficher les indicateurs de qualité.")
             st.caption(
@@ -2229,7 +2251,7 @@ if df_raw is not None:
                 "Les datasets sans données pour une unité sont exclus uniquement des calculs de cette unité."
             )
             quality_dataset_filter += (
-                ' : ' + '; '.join(dataset_labels[uid] for uid in quality_dataset_ids)
+                ' : ' + '; '.join(f"{dataset_names[uid]} [{uid}]" for uid in quality_dataset_ids)
                 if quality_dataset_ids else ' (aucun dataset sélectionné)'
             )
         with st.expander("Consulter les barèmes de catégorisation"):

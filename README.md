@@ -94,11 +94,13 @@ les métriques Analytics de niveau 2 et le barème DPS ; les zones utilisent le 
 et le barème ZS. Les jointures
 utilisent les IDs DHIS2, y compris en présence de noms identiques.
 
-Le choix **Datasets du tableau qualité** utilise par défaut **Tous les datasets
-DHIS2** : le catalogue complet accessible au compte connecté, y compris les
-datasets absents du rapport sélectionné. **Choisir les datasets** permet une
-sélection personnalisée par UID ; **Datasets du rapport sélectionné** conserve
-le périmètre du favori. Aucun dataset n'est ajouté ou exclu selon son nom.
+La liste **Datasets évalués pour le score qualité** affiche directement les
+datasets sélectionnés sous forme d'étiquettes. Tous les datasets accessibles
+au compte connecté sont cochés au départ, y compris ceux absents du rapport.
+Retirer ou ajouter une étiquette recalcule les indicateurs selon la sélection.
+Les noms identiques sont distingués par leur UID. Le panneau replié **Options
+des datasets** permet de tout resélectionner ou de revenir aux datasets du
+rapport. Aucun dataset n'est ajouté ou exclu selon son nom.
 Si le catalogue est indisponible, un message le précise sans remplacer
 silencieusement la sélection par celle du rapport.
 
