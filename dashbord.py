@@ -33,7 +33,7 @@ from validation_detail_view import (
 from geography import build_geography_catalog, labels_for_units, resolve_hierarchy, zone_catalog
 from scoped_analytics import analytics_to_reporting_frame, build_analytics_query, build_quality_reporting_query
 from reporting_loader import fetch_reporting_chunks, format_reporting_error
-from reporting_availability import mask_failed_reporting_units, mask_failed_reporting_cells
+from reporting_availability import mask_failed_reporting_units, mask_failed_reporting_cells, select_reporting_source
 from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_categorisation
 from validation_api import fetch_validation_analysis
 from dhis_auth import check_dhis2_credentials
@@ -1838,14 +1838,7 @@ if df_raw is not None:
         if df_tab1.empty:
             st.warning("Aucune zone de santé à afficher avec ce filtre.")
         else:
-            st.dataframe(
-                df_tab1.head(15).style.format(
-                    {column: lambda value: str(value).removesuffix('.0')
-                     for column in df_tab1.select_dtypes(include='number').columns},
-                    na_rep='—',
-                ),
-                use_container_width=True,
-            )
+            st.dataframe(df_tab1.head(15).style.format(na_rep='—'), use_container_width=True)
         df_tab1_export = df_tab1.copy()
 
     # --- ONGLET 2 : COMPLÉTUDE ---
@@ -2204,39 +2197,42 @@ if df_raw is not None:
         quality_source_description = 'Synthèse des onglets Complétude, Promptitude et Analyse Comparative'
         if validation_dates_valid and not validation_zones_df.empty:
             same_reporting_months = validation_period_id == period_id
-            quality_metrics = (
-                metrics_from_dashboard_summary(df_synth, target_df, validation_zones_df)
-                if same_reporting_months else
-                aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
-            )
+            quality_reporting_source = select_reporting_source(target_df) if same_reporting_months else pd.DataFrame()
+            if 'Organisation unit ID' in quality_reporting_source:
+                quality_reporting_source = quality_reporting_source.loc[
+                    quality_reporting_source['Organisation unit ID'].isin(validation_zones_df['Zone_ID'])
+                ].copy()
+            if not same_reporting_months:
+                quality_metrics = aggregate_validation_metrics(pd.DataFrame(), validation_zones_df)
+            elif 'reporting_columns' in quality_reporting_source.attrs:
+                quality_metrics = metrics_from_reporting_source(quality_reporting_source, validation_zones_df)
+            else:
+                quality_metrics = metrics_from_dashboard_summary(df_synth, quality_reporting_source, validation_zones_df)
+            quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
+            if 'reporting_columns' in quality_reporting_source.attrs:
+                quality_source_description = 'Analytics DHIS2 — datasets du rapport sélectionné'
             quality_metric_columns = [
                 'Complétude_Globale', 'Promptitude_Globale', 'Actual_Reports', 'Nombre_Datasets_95',
             ]
-            quality_reporting_source = target_df.loc[
-                target_df['Organisation unit ID'].isin(validation_zones_df['Zone_ID'])
-            ].copy() if same_reporting_months else pd.DataFrame()
             if quality_metrics[quality_metric_columns].isna().any().any():
-                same_reporting_scope = same_reporting_months and validation_ou_dimension == ou_dimension
-                certified_reporting_columns = [
-                    column for column in target_df.attrs.get('reporting_columns', []) if column in target_df
-                ]
-                certified_reporting_source = target_df[
-                    ['Organisation unit', 'Organisation unit ID'] + certified_reporting_columns
-                ]
-                if same_reporting_scope and has_complete_reporting_metrics(certified_reporting_source):
-                    quality_reporting_source = certified_reporting_source
-                else:
-                    quality_reporting_source = get_quality_reporting_data(
+                covered_ids = set(quality_reporting_source.get('Organisation unit ID', pd.Series(dtype=object)))
+                if not (
+                    same_reporting_months
+                    and set(validation_zones_df['Zone_ID']).issubset(covered_ids)
+                    and has_complete_reporting_metrics(quality_reporting_source)
+                ):
+                    quality_reporting_source = select_reporting_source(get_quality_reporting_data(
                         id_final, period=validation_period_id, cache_user=current_user_for_cache,
                         ou_dimension=validation_ou_dimension,
                         unit_ids=tuple(validation_zones_df['Zone_ID']),
-                    )
-                if quality_reporting_source is None:
-                    quality_reporting_source = pd.DataFrame()
+                    ))
                 extra_metrics = metrics_from_reporting_source(quality_reporting_source, validation_zones_df)
-                quality_metrics = quality_metrics.set_index('Zone_ID').combine_first(
-                    extra_metrics.set_index('Zone_ID')
-                ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
+                if 'reporting_columns' in quality_reporting_source.attrs:
+                    quality_metrics = extra_metrics
+                else:
+                    quality_metrics = quality_metrics.set_index('Zone_ID').combine_first(
+                        extra_metrics.set_index('Zone_ID')
+                    ).reindex(validation_zones_df['Zone_ID']).rename_axis('Zone_ID').reset_index()
                 quality_metrics = mask_failed_reporting_units(quality_metrics, quality_reporting_source)
                 quality_source_description = (
                     'Synthèse affichée complétée par Analytics DHIS2' if same_reporting_months else

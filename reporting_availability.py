@@ -3,10 +3,79 @@
 import pandas as pd
 
 from reporting_metrics import clean_ou_id
+from scoped_analytics import METRIC_LABELS
 
 
 _ID_COLUMNS = ['Organisation unit ID', 'Zone_ID']
 _LABEL_COLUMNS = {'Organisation unit', 'Zone de santé', 'Zone', 'Province', 'Pays'}
+
+
+def select_reporting_source(frame):
+    """Projette les seules métriques certifiées sans lever un refus de reporting.
+
+    Le contrat Analytics identifie les colonnes de reporting et leurs DX. Un
+    échec explicitement rattaché à un indicateur générique peut être écarté de
+    cette source ; un échec de dataset ou non identifiable reste indisponible.
+    Sans ce contrat, la copie conserve le comportement historique prudent.
+    Les valeurs reçues, y compris les zéros et cellules absentes, restent telles
+    quelles. Les avertissements et diagnostics de chargement sont conservés.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        return pd.DataFrame()
+    certified = frame.attrs.get('reporting_columns')
+    if not isinstance(certified, (list, tuple, set)):
+        return frame.copy()
+    certified = {column for column in certified if isinstance(column, str)}
+    retained = {*_ID_COLUMNS, *_LABEL_COLUMNS, *certified}
+    result = frame.loc[:, [column for column in frame if column in retained]].copy()
+    result.attrs['reporting_columns'] = [column for column in result if column in certified]
+
+    labels = frame.attrs.get('reporting_item_labels')
+    labels = labels if isinstance(labels, dict) else {}
+    per_unit = frame.attrs.get('failed_metrics_by_unit')
+    per_unit = per_unit if isinstance(per_unit, dict) else {}
+    grouped_failures = {}
+    for unit, items in per_unit.items():
+        identifier = clean_ou_id(unit)
+        if identifier:
+            grouped_failures.setdefault(identifier, []).append(items)
+    failed = frame.attrs.get('failed_units') or []
+    if not isinstance(failed, (list, tuple, set)):
+        failed = [failed]
+    failed_ids = list(dict.fromkeys(
+        [identifier for unit in failed if (identifier := clean_ou_id(unit))]
+        + list(grouped_failures)
+    ))
+    reporting_failures, reporting_failed_units = {}, []
+    for identifier in failed_ids:
+        groups = grouped_failures.get(identifier)
+        unknown = not groups
+        relevant = []
+        for items in groups or []:
+            if isinstance(items, str):
+                items = [items]
+            if not isinstance(items, (list, tuple, set)) or not items:
+                unknown = True
+                continue
+            for item in items:
+                if not isinstance(item, str) or not item:
+                    unknown = True
+                    continue
+                label = labels.get(item)
+                _, separator, metric = item.rpartition('.')
+                is_reporting = bool(separator and metric in METRIC_LABELS)
+                known_label = isinstance(label, str) and bool(label.strip())
+                if is_reporting and known_label and label in certified:
+                    relevant.append(item)
+                elif is_reporting or not known_label or label in certified:
+                    unknown = True
+        if unknown or relevant:
+            reporting_failed_units.append(identifier)
+            if relevant:
+                reporting_failures[identifier] = list(dict.fromkeys(relevant))
+    result.attrs['failed_units'] = reporting_failed_units
+    result.attrs['failed_metrics_by_unit'] = reporting_failures
+    return result
 
 
 def _label(value):

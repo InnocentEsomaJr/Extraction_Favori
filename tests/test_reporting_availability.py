@@ -1,11 +1,15 @@
 """Un échec de chargement n'est ni un zéro ni une moyenne partielle."""
 
 import unittest
+from copy import deepcopy
 
 import pandas as pd
 
-from reporting_availability import mask_failed_reporting_cells, mask_failed_reporting_units
-from scoped_analytics import analytics_to_reporting_frame
+from quality_score import metrics_from_reporting_source
+from reporting_availability import (
+    mask_failed_reporting_cells, mask_failed_reporting_units, select_reporting_source,
+)
+from scoped_analytics import METRIC_LABELS, analytics_to_reporting_frame
 
 
 class ReportingAvailabilityTests(unittest.TestCase):
@@ -228,6 +232,179 @@ class ReportingCellAvailabilityTests(unittest.TestCase):
         result = mask_failed_reporting_units(total, source)
         self.assertTrue(pd.isna(result.loc[0, 'Reports_Actual']))
         self.assertEqual(result.loc[1, 'Reports_Actual'], 0)
+
+
+class ReportingSourceSelectionTests(unittest.TestCase):
+    def source(self):
+        labels = {
+            f'MonthlyAAAA.{metric}': f'Mensuel {suffix}'
+            for metric, suffix in METRIC_LABELS.items()
+        }
+        # Ce libellé ressemble à un compte, mais son DX n'est pas du reporting.
+        labels['IndicatorAA'] = 'Indicateur Actual reports'
+        values = {
+            'REPORTING_RATE': 90, 'REPORTING_RATE_ON_TIME': 80,
+            'ACTUAL_REPORTS': 90, 'ACTUAL_REPORTS_ON_TIME': 80, 'EXPECTED_REPORTS': 100,
+        }
+        rows = []
+        for identifier, zero in [('ZoneAAAAAAA', False), ('ZoneBBBBBBB', True)]:
+            for metric, value in values.items():
+                rows.append([identifier, f'MonthlyAAAA.{metric}',
+                             value if not zero or metric == 'EXPECTED_REPORTS' else 0])
+            rows.append([identifier, 'IndicatorAA', 999])
+        frame = analytics_to_reporting_frame({
+            'headers': [{'name': name} for name in ['ou', 'dx', 'value']],
+            'rows': rows,
+        }, labels)
+        frame['Organisation unit'] = ['Même nom', 'Même nom']
+        frame.attrs.update({
+            'reporting_status': 'partial', 'reporting_warnings': ['Diagnostic conservé'],
+            'quality_source': 'Source courante', 'successful_units': ['ZoneAAAAAAA', 'ZoneBBBBBBB'],
+        })
+        return frame
+
+    def targets(self):
+        return pd.DataFrame([
+            {'Zone_ID': identifier, 'Zone': 'Même nom'}
+            for identifier in ['ZoneAAAAAAA', 'ZoneBBBBBBB', 'ZoneCCCCCCC']
+        ])
+
+    def metrics(self, source):
+        metrics = metrics_from_reporting_source(source, self.targets())
+        return mask_failed_reporting_units(metrics, source).set_index('Zone_ID')
+
+    def test_known_generic_failure_keeps_healthy_reporting_and_observed_zeros(self):
+        source = self.source()
+        source.attrs.update({
+            'failed_units': ['ZoneAAAAAAA'],
+            'failed_metrics_by_unit': {'ZoneAAAAAAA': ['IndicatorAA']},
+        })
+        selected = select_reporting_source(source)
+        self.assertNotIn('Indicateur Actual reports', selected)
+        self.assertEqual(selected.attrs['failed_units'], [])
+        self.assertEqual(selected.attrs['failed_metrics_by_unit'], {})
+        metrics = self.metrics(selected)
+        self.assertEqual(metrics.loc['ZoneAAAAAAA'].tolist(), [90, 80, 90, 0])
+        self.assertEqual(metrics.loc['ZoneBBBBBBB'].tolist(), [0, 0, 0, 0])
+        self.assertTrue(metrics.loc['ZoneCCCCCCC'].isna().all())
+        self.assertEqual(selected.attrs['reporting_warnings'], ['Diagnostic conservé'])
+        self.assertEqual(selected.attrs['quality_source'], 'Source courante')
+
+    def test_reporting_failure_remains_strict_for_its_uid_despite_homonyms(self):
+        source = self.source()
+        source.attrs.update({
+            'failed_units': ['ZoneAAAAAAA', 'ZoneBBBBBBB'],
+            'failed_metrics_by_unit': {
+                'ZoneAAAAAAA': ['IndicatorAA'],
+                'ZoneBBBBBBB': ['IndicatorAA', 'MonthlyAAAA.ACTUAL_REPORTS'],
+            },
+        })
+        selected = select_reporting_source(source)
+        self.assertEqual(selected.attrs['failed_units'], ['ZoneBBBBBBB'])
+        self.assertEqual(selected.attrs['failed_metrics_by_unit'], {
+            'ZoneBBBBBBB': ['MonthlyAAAA.ACTUAL_REPORTS'],
+        })
+        metrics = self.metrics(selected)
+        self.assertEqual(metrics.loc['ZoneAAAAAAA'].tolist(), [90, 80, 90, 0])
+        self.assertTrue(metrics.loc['ZoneBBBBBBB'].isna().all())
+        self.assertTrue(metrics.loc['ZoneCCCCCCC'].isna().all())
+
+    def test_metric_only_reporting_failure_still_marks_its_unit(self):
+        source = self.source()
+        source.attrs['failed_metrics_by_unit'] = {' ZoneAAAAAAA ': ['MonthlyAAAA.EXPECTED_REPORTS']}
+        selected = select_reporting_source(source)
+        self.assertEqual(selected.attrs['failed_units'], ['ZoneAAAAAAA'])
+        self.assertTrue(self.metrics(selected).loc['ZoneAAAAAAA'].isna().all())
+
+    def test_unknown_or_ambiguous_failure_metadata_remains_strict(self):
+        cases = [
+            {}, {'ZoneAAAAAAA': []}, {'ZoneAAAAAAA': None},
+            {'ZoneAAAAAAA': ['UnmappedAAA']},
+            {'ZoneAAAAAAA': ['UnmappedAAA.ACTUAL_REPORTS']},
+            {'ZoneAAAAAAA': ['IndicatorAA', None]},
+        ]
+        for failures in cases:
+            with self.subTest(failures=failures):
+                source = self.source()
+                source.attrs.update({
+                    'failed_units': ['ZoneAAAAAAA'], 'failed_metrics_by_unit': failures,
+                })
+                selected = select_reporting_source(source)
+                self.assertEqual(selected.attrs['failed_units'], ['ZoneAAAAAAA'])
+                self.assertEqual(selected.attrs['failed_metrics_by_unit'], {})
+                self.assertTrue(self.metrics(selected).loc['ZoneAAAAAAA'].isna().all())
+
+    def test_missing_or_conflicting_labels_do_not_clear_a_failure(self):
+        for labels in [{}, {'IndicatorAA': 'Mensuel Actual reports'}]:
+            with self.subTest(labels=labels):
+                source = self.source()
+                source.attrs.update({
+                    'failed_units': 'ZoneAAAAAAA',
+                    'failed_metrics_by_unit': {'ZoneAAAAAAA': 'IndicatorAA'},
+                    'reporting_item_labels': labels,
+                })
+                selected = select_reporting_source(source)
+                self.assertEqual(selected.attrs['failed_units'], ['ZoneAAAAAAA'])
+                self.assertTrue(self.metrics(selected).loc['ZoneAAAAAAA'].isna().all())
+
+    def test_absent_reporting_values_are_preserved_and_never_become_zero(self):
+        source = self.source()
+        source[source.attrs['reporting_columns']] = float('nan')
+        selected = select_reporting_source(source)
+        self.assertTrue(selected[selected.attrs['reporting_columns']].isna().all().all())
+        self.assertTrue(self.metrics(selected).isna().all().all())
+        self.assertEqual(selected.attrs['failed_units'], [])
+
+    def test_successfully_absent_dataset_does_not_erase_active_dataset_values(self):
+        source = self.source()
+        for metric, suffix in METRIC_LABELS.items():
+            column = f'Inactif {suffix}'
+            source[column] = float('nan')
+            source.attrs['reporting_columns'].append(column)
+            source.attrs['reporting_item_labels'][f'InactiveAAA.{metric}'] = column
+        selected = select_reporting_source(source)
+        self.assertEqual(self.metrics(selected).loc['ZoneAAAAAAA'].tolist(), [90, 80, 90, 0])
+        self.assertTrue(selected[[f'Inactif {suffix}' for suffix in METRIC_LABELS.values()]].isna().all().all())
+
+    def test_missing_uid_is_not_replaced_by_a_homonymous_label(self):
+        source = self.source().drop(columns='Organisation unit ID')
+        selected = select_reporting_source(source)
+        self.assertTrue(self.metrics(selected).isna().all().all())
+
+    def test_legacy_source_without_certification_is_copied_conservatively(self):
+        source = self.source()
+        source.attrs = {'failed_units': ['ZoneAAAAAAA']}
+        selected = select_reporting_source(source)
+        pd.testing.assert_frame_equal(selected, source)
+        self.assertEqual(selected.attrs, source.attrs)
+        self.assertIsNot(selected, source)
+        self.assertIn('Indicateur Actual reports', selected)
+        self.assertTrue(self.metrics(selected).loc['ZoneAAAAAAA'].isna().all())
+
+    def test_empty_certification_has_no_numeric_reporting_evidence(self):
+        source = self.source()
+        source.attrs['reporting_columns'] = []
+        selected = select_reporting_source(source)
+        self.assertEqual(selected.columns.tolist(), ['Organisation unit', 'Organisation unit ID'])
+        self.assertTrue(self.metrics(selected).isna().all().all())
+
+    def test_projection_does_not_mutate_source_or_loading_metadata(self):
+        source = self.source()
+        source.attrs.update({
+            'failed_units': ['ZoneAAAAAAA'],
+            'failed_metrics_by_unit': {'ZoneAAAAAAA': ['IndicatorAA']},
+        })
+        before, attrs_before = source.copy(deep=True), deepcopy(source.attrs)
+        selected = select_reporting_source(source)
+        pd.testing.assert_frame_equal(source, before)
+        self.assertEqual(source.attrs, attrs_before)
+        self.assertEqual(selected['Organisation unit ID'].tolist(), source['Organisation unit ID'].tolist())
+        self.assertEqual(selected['Organisation unit'].tolist(), ['Même nom', 'Même nom'])
+        self.assertEqual(selected.attrs['successful_units'], attrs_before['successful_units'])
+        empty = select_reporting_source(source.iloc[:0])
+        self.assertTrue(empty.empty)
+        self.assertEqual(empty.columns.tolist(), selected.columns.tolist())
+        self.assertTrue(select_reporting_source(None).empty)
 
 
 if __name__ == '__main__':

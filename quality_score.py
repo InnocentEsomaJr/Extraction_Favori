@@ -157,6 +157,8 @@ def metrics_from_reporting_source(source_df, targets):
     records = []
     for target in empty['Zone_ID']:
         rows = source_df.loc[source_ids.eq(target)].copy()
+        # Ces calculs utilisent les cellules ; les diagnostics restent sur la source.
+        rows.attrs = {}
         if rows.empty:
             records.append(empty.loc[empty['Zone_ID'].eq(target)].iloc[0].to_dict())
             continue
