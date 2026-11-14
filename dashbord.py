@@ -40,6 +40,10 @@ from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_c
 from validation_api import fetch_validation_analysis
 from dhis_auth import check_dhis2_credentials
 from validation_filters import date_range_months, monthly_bounds, reference_month
+from reporting_periods import (
+    MONTH_NAMES, PERIODICITIES, analytics_periods, coverage_months,
+    period_options, select_period_range, selection_bounds,
+)
 from validation_details import (
     DISPLAY_COLUMNS as VIOLATION_COLUMNS, build_validation_details, detail_export_frame,
     filter_validation_details, style_importance, validation_detail_identifiers,
@@ -546,6 +550,7 @@ def to_excel_dashboard_report(
     df_violations=None,
     df_validation_context=None,
     df_previous_violations=None,
+    df_reporting_context=None,
 ):
     """Exporte un rapport Excel commenté avec colorations conditionnelles."""
     style_context = style_context or {}
@@ -648,6 +653,11 @@ def to_excel_dashboard_report(
             writer.sheets['Contexte_Validation'].set_column(0, 0, 34)
             writer.sheets['Contexte_Validation'].set_column(1, 1, 95)
             writer.sheets['Contexte_Validation'].freeze_panes(1, 0)
+        if df_reporting_context is not None:
+            df_reporting_context.to_excel(writer, index=False, sheet_name='Contexte_Periode')
+            writer.sheets['Contexte_Periode'].set_column(0, 0, 28)
+            writer.sheets['Contexte_Periode'].set_column(1, 1, 85)
+            writer.sheets['Contexte_Periode'].freeze_panes(1, 0)
         for name in ['Resultats_Regles', 'Baremes_Categorisation']:
             sheet = writer.sheets[name]
             sheet.freeze_panes(1, 1)
@@ -1631,32 +1641,67 @@ with st.sidebar:
     st.divider()
     st.subheader("📅 Sélection de la Période")
     annee_choisie = st.selectbox("Choisir l'année :", ["2026", "2025", "2024", "2023"], index=1)
-
-    mois_liste = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
-    mois_dict = {m: str(i+1).zfill(2) for i, m in enumerate(mois_liste)}
-
-    col_m1, col_m2 = st.columns(2)
-    with col_m1: mois_debut = st.selectbox("Mois début :", mois_liste, index=0)
-    with col_m2: mois_fin = st.selectbox("Mois fin :", mois_liste, index=0)
-
-    idx_start, idx_end = mois_liste.index(mois_debut), mois_liste.index(mois_fin)
-
-    # Valeurs par défaut pour éviter des variables non définies.
-    selection_mois = [f"{annee_choisie}{mois_dict[mois_debut]}"]
-    period_id = selection_mois[0]
-    prev_idx = idx_start - 1 if idx_start > 0 else 11
-    prev_year = annee_choisie if idx_start > 0 else str(int(annee_choisie)-1)
-    selection_mois_prev = [f"{prev_year}{mois_dict[mois_liste[prev_idx]]}"]
-
-    if idx_start <= idx_end:
-        selection_mois = [f"{annee_choisie}{mois_dict[mois_liste[i]]}" for i in range(idx_start, idx_end + 1)]
-        period_id = ";".join(selection_mois)
+    if st.session_state.get('reporting_periodicity') not in PERIODICITIES:
+        st.session_state.pop('reporting_periodicity', None)
+    reporting_periodicity = st.selectbox("Périodicité", PERIODICITIES, key='reporting_periodicity')
+    reporting_options = period_options(reporting_periodicity, annee_choisie)
+    if reporting_periodicity == 'Mensuel':
+        mois_liste = list(MONTH_NAMES)
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            mois_debut = st.selectbox("Mois début :", mois_liste, index=0)
+        with col_m2:
+            mois_fin = st.selectbox("Mois fin :", mois_liste, index=0)
+        first_period = reporting_options[mois_liste.index(mois_debut)].id
+        last_period = reporting_options[mois_liste.index(mois_fin)].id
+    elif reporting_periodicity == 'Annuel':
+        first_period = last_period = reporting_options[0].id
     else:
-        st.error("Le mois de début doit être avant le mois de fin.")
+        period_kind, period_key = {
+            'Trimestriel': ('Trimestre', 'quarter'),
+            'Semestriel': ('Semestre', 'half'),
+            'Hebdomadaire': ('Semaine', 'week'),
+        }[reporting_periodicity]
+        option_ids = [period.id for period in reporting_options]
+        option_labels = {period.id: period.label for period in reporting_options}
+        first_key, last_key = f'reporting_{period_key}_start', f'reporting_{period_key}_end'
+        for key in (first_key, last_key):
+            if st.session_state.get(key) not in option_ids:
+                st.session_state.pop(key, None)
+        first_period = st.selectbox(f"{period_kind} début :", option_ids, format_func=option_labels.get, key=first_key)
+        last_period = st.selectbox(f"{period_kind} fin :", option_ids, format_func=option_labels.get, key=last_key)
+    try:
+        selected_reporting_periods = select_period_range(
+            reporting_periodicity, annee_choisie, first_period, last_period,
+        )
+    except ValueError as error:
+        st.error(str(error))
         st.session_state.pop('categorisation_result', None)
         st.session_state.pop('validation_job', None)
         st.session_state.pop('show_report_preview', None)
         st.stop()
+    period_id = ';'.join(analytics_periods(selected_reporting_periods))
+    # Les dates libres de validation restent initialisées sur des mois entiers.
+    selection_mois = coverage_months(selected_reporting_periods)
+    reporting_start_date, reporting_end_date = selection_bounds(selected_reporting_periods)
+    reporting_period_label = (
+        f"{selected_reporting_periods[0].label} à {selected_reporting_periods[-1].label} {annee_choisie}"
+        if reporting_periodicity == 'Mensuel' else
+        f"{selected_reporting_periods[0].label}"
+        + (f" → {selected_reporting_periods[-1].label}" if len(selected_reporting_periods) > 1 else '')
+        + (f" {annee_choisie}" if reporting_periodicity in ('Trimestriel', 'Semestriel') else '')
+    )
+    st.caption(f"Période retenue : {reporting_period_label}")
+    if reporting_periodicity == 'Hebdomadaire':
+        st.caption("Semaines ISO du lundi au dimanche, sans limite de quatre semaines ni report automatique.")
+    df_reporting_context = pd.DataFrame([
+        {'Paramètre': key, 'Valeur': value} for key, value in {
+            'Périodicité': reporting_periodicity,
+            'Périodes DHIS2': period_id,
+            'Date de début': reporting_start_date.isoformat(),
+            'Date de fin': reporting_end_date.isoformat(),
+        }.items()
+    ])
 
 # --- 4. FILTRES PAYS / PROVINCE / ZONE ET CHARGEMENT AU NIVEAU ZS ---
 current_user_for_cache = (
@@ -1846,7 +1891,7 @@ if df_raw is not None:
     # --- ONGLET 1 : BASE DE DONNÉES ---
     with tab1:
         st.header("Présentation des données brutes")
-        st.write(f"Période affichée : **{mois_debut} à {mois_fin} {annee_choisie}**")
+        st.write(f"Période affichée : **{reporting_period_label}**")
         df_tab1 = target_df.copy()
         if 'Organisation unit ID' in df_tab1.columns:
             df_tab1 = df_tab1.drop(columns=['Organisation unit ID'])
@@ -2926,6 +2971,7 @@ if df_raw is not None:
             df_violations=df_violations_export,
             df_validation_context=df_validation_context_export,
             df_previous_violations=df_previous_violations_export,
+            df_reporting_context=df_reporting_context,
         )
         export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         export_name = f"rapport_dashboard_commente_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"

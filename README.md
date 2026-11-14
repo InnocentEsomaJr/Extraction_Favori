@@ -10,6 +10,37 @@ Application Streamlit pour analyser la performance SNIS (DHIS2) avec:
 
 Le script principal est: `dashbord.py`.
 
+## Périodicités du filtre général
+
+La barre latérale propose **Mensuel**, **Trimestriel**, **Semestriel**, **Annuel**
+et **Hebdomadaire**. Le mode mensuel reste sélectionné au départ.
+
+| Périodicité | Périodes proposées |
+| --- | --- |
+| Mensuel | Mois de début et de fin inclus dans l'année choisie |
+| Trimestriel | T1 : janvier–mars ; T2 : avril–juin ; T3 : juillet–septembre ; T4 : octobre–décembre |
+| Semestriel | S1 : janvier–juin ; S2 : juillet–décembre |
+| Annuel | Toute l'année choisie |
+| Hebdomadaire | Semaines ISO du lundi au dimanche, avec semaine de début et de fin incluses |
+
+Les périodes fixes utilisent les [identifiants natifs de DHIS2](https://docs.dhis2.org/archive/en/2.30/developer/html/webapi_date_perid_format.html).
+Les semaines affichent leurs dates exactes, y compris lorsqu'elles chevauchent
+deux années. Aucune limite de quatre semaines ni report automatique n'est appliqué.
+DHIS2 agrège les données de la période demandée ; les taux ne sont pas moyennés
+localement. Un intervalle inversé bloque le chargement avant tout nouvel appel.
+
+Ces filtres concernent les quatre premiers onglets. Les règles de validation
+gardent leurs dates libres, leur parent, leur groupe et les actions M/M-1.
+Leurs dates initiales couvrent les mois entiers intersectant la sélection
+générale ; elles restent modifiables. En hebdomadaire, les valeurs des semaines
+ne sont pas utilisées comme indicateurs mensuels du tableau qualité : celui-ci
+conserve sa propre requête selon les dates de l'analyse. M-1 reste le mois
+précédant la date de début, sans devenir la semaine ou le trimestre précédent.
+
+L'Excel ajoute une feuille **Contexte_Periode** avec la périodicité, les IDs
+DHIS2 et les bornes exactes du filtre général. La feuille **Contexte_Validation**
+continue à décrire séparément les dates et le périmètre de l'analyse des règles.
+
 ## 1. Fonctionnalités
 
 Le dashboard est organisé en 5 onglets:
