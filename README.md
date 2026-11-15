@@ -335,6 +335,19 @@ et ferme l'aperçu : l'analyse des violations doit être relancée. Cette actual
 ne purge pas le cache de données des autres sessions. Une sélection de mois inversée
 interrompt le chargement et retire les anciens résultats jusqu'à correction.
 
+## Historique des règles de validation dans GitHub
+
+L'onglet de catégorisation ajoute **Historique des règles de validation** :
+enregistrer une extraction datée, la retrouver par mois, puis **Vérifier les
+corrections de cette extraction** sur ses dates d'origine. Le comparatif affiche
+les violations persistantes, corrigées, nouvelles ou non vérifiables, regroupées
+par zone, province/DPS ou pays. Les résultats M/M-1 du filtre actuel sont conservés.
+
+La sauvegarde nécessite un secret `GITHUB_HISTORY_TOKEN` dans Streamlit.
+La [configuration et le mode d'emploi](docs/HISTORIQUE_VALIDATION.md) précisent les
+permissions du jeton, les fichiers immuables et les conditions de comparaison.
+Sans ce secret, le téléchargement JSON de l'extraction reste disponible.
+
 ## 2. Export de rapport
 
 Depuis la **sidebar**:

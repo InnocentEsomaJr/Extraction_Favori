@@ -40,6 +40,7 @@ from categorisation_view import VIEW_SORT_OPTIONS, VIEW_STATUS_OPTIONS, filter_c
 from validation_api import fetch_validation_analysis
 from dhis_auth import check_dhis2_credentials
 from validation_filters import date_range_months, monthly_bounds, reference_month
+from validation_history_ui import clear_history_session, render_history_panel
 from reporting_periods import (
     MONTH_NAMES, PERIODICITIES, analytics_periods, coverage_months,
     period_options, select_period_range, selection_bounds,
@@ -1584,6 +1585,7 @@ with st.sidebar:
     logout_button = col_disc.button("Se déconnecter", use_container_width=True)
 
     if logout_button:
+        clear_history_session()
         for key in ["connected", "dhis2_user", "dhis2_pass", "dhis2_user_input", "dhis2_password_input", "categorisation_result", "validation_job", "data_revision", "show_report_preview", "validation_defaults_context"]:
             st.session_state.pop(key, None)
         st.cache_resource.clear()
@@ -1596,6 +1598,7 @@ with st.sidebar:
         else:
             ok, error_msg = test_dhis2_credentials(base_url, user_input, password_input)
             if ok:
+                clear_history_session()
                 st.cache_resource.clear()
                 st.session_state["connected"] = True
                 st.session_state["dhis2_user"] = user_input
@@ -1878,6 +1881,7 @@ if df_raw is not None:
     df_tab5_export = pd.DataFrame()
     df_violations_export = None
     df_previous_violations_export = None
+    history_needs_rerun = False
     df_validation_context_export = None
     validation_applied_label = None
     df_tab1_export = pd.DataFrame()
@@ -2417,7 +2421,9 @@ if df_raw is not None:
         if job and job.get('status') == 'running':
             job = recover_validation_job(job, request_targets, validation_months, validation_reference_months)
             st.session_state['validation_job'] = job
-        job_busy = bool(job and job.get('status') == 'running')
+        job_busy = bool(job and job.get('status') == 'running') or (
+            st.session_state.get('validation_history_job', {}).get('status') == 'running'
+        )
         current_action, correction_action = st.columns(2)
         with current_action:
             run_current_analysis = st.button(
@@ -2442,7 +2448,7 @@ if df_raw is not None:
                 "Analyse interrompue. Les réponses déjà reçues sont conservées et affichées. "
                 "Une requête interrompue sans réponse reste indisponible ; elle n'est pas renvoyée automatiquement."
             )
-            resume_analysis = st.button("Reprendre les zones restantes")
+            resume_analysis = st.button("Reprendre les zones restantes", disabled=job_busy)
         st.caption(
             "Les trois actions suivent le pays, la province, la zone et les dates sélectionnés. "
             "Chaque réponse est conservée avant de passer à la zone suivante."
@@ -2456,6 +2462,9 @@ if df_raw is not None:
                 current_batch=saved_validation.get('current_batch') if action == 'M-1' else None,
             )
             job['id'] = uuid4().hex
+            job['current_extraction_id'] = (
+                saved_validation.get('current_extraction_id', uuid4().hex) if action == 'M-1' else uuid4().hex
+            )
             job['analysed_at'] = saved_validation['analysed_at'] if action == 'M-1' else datetime.now(KINSHASA_TZ).isoformat(timespec='seconds')
             job['rule_metadata'] = dict(saved_validation['rule_metadata']) if action == 'M-1' else {}
             job['unit_metadata'] = dict(saved_validation['unit_metadata']) if action == 'M-1' else {}
@@ -2572,6 +2581,7 @@ if df_raw is not None:
                 rows_cat = build_quality_rows(quality_metrics, validation_zones_df, comparison_rows)
                 st.session_state['categorisation_result'] = {
                     'context': validation_context, 'checkpoint_key': checkpoint_key,
+                    'current_extraction_id': job.get('current_extraction_id', job['id']),
                     'data': rows_cat, 'current_batch': current_batch,
                     'violations': violations_details, 'previous_violations': previous_details,
                     'current_raw': current_raw, 'current_assigned': current_assigned,
@@ -2875,6 +2885,18 @@ if df_raw is not None:
                     st.text(f"{left_value} {violation['Opérateur']} {right_value}")
                     st.text(str(violation['Détails']))
 
+        history_needs_rerun = render_history_panel(
+            saved=(saved_validation if saved_validation and saved_validation.get('context') == validation_context else None),
+            source_url=base_url, account=st.session_state.get('dhis2_user', ''),
+            targets=request_targets, geography=organisation_catalog,
+            start_date=validation_start_date, end_date=validation_end_date,
+            parent_id=validation_parent_id, parent_name=validation_parent_label,
+            group_id=target_group_id, group_name=selected_vr_name, cache_user=current_user_for_cache,
+            read_config=_read_config_value, fetch_validation=get_validation_results,
+            get_client=get_dhis2_client, get_metadata=get_validation_detail_metadata,
+            current_busy=bool(job and job.get('status') == 'running'),
+        )
+
     # --- MENU SIDEBAR : EXTRACTION COMMENTEE ---
     with st.sidebar:
         st.divider()
@@ -3068,7 +3090,7 @@ if df_raw is not None:
                     df_previous_violations_export.style.format({'Valeur gauche': '{:g}', 'Valeur droite': '{:g}'}, na_rep='')
                     .map(style_importance, subset=['Importance']), use_container_width=True, hide_index=True,
                 )
-    if validation_needs_rerun:
+    if validation_needs_rerun or history_needs_rerun:
         active_job = st.session_state.get('validation_job')
         if active_job and active_job.get('status') == 'running':
             active_job['auto_continue'] = True
